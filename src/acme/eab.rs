@@ -1,0 +1,245 @@
+//! RFC 8555 §7.3.4 bootstrap using the account key already saved in the journal.
+//! All subsequent account/order operations remain in instant-acme.
+use super::{Result, crypto::CRYPTO, http::Http, state::read_private};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use bytes::Bytes;
+use http::{Request, header};
+use http_body_util::{BodyExt, Full};
+use rustls_pki_types::PrivatePkcs8KeyDer;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::path::Path;
+
+pub use moon_naive_core::config::EabCredentials as Credentials;
+
+pub fn load_credentials(path: &Path) -> Result<Credentials> {
+    let value: Credentials = crate::acme::state::load_toml(path, 32768)?;
+    value.validate()?;
+    Ok(value)
+}
+
+/// Import the JSON export produced by gcloud once. Runtime configuration only
+/// reads TOML. A temporary private inode is linked into place without replacing
+/// any existing output, so interrupted imports cannot publish a partial file.
+pub fn import_gcloud(input: &Path, output: &Path) -> Result<()> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Export {
+        key_id: String,
+        b64_mac_key: String,
+    }
+    let value: Export = serde_json::from_slice(&read_private(input, 32768)?)
+        .map_err(|_| "invalid private gcloud EAB export")?;
+    let value = Credentials {
+        key_id: value.key_id,
+        b64_mac_key: value.b64_mac_key,
+    };
+    value.validate()?;
+    let text = toml::to_string(&value)?;
+    super::state::write_private_new(output, text.as_bytes())
+}
+fn encoded(value: &Value) -> Result<String> {
+    Ok(URL_SAFE_NO_PAD.encode(serde_json::to_vec(value)?))
+}
+pub async fn register(
+    http: &Http,
+    directory: &str,
+    key_der: &[u8],
+    contact: &str,
+    credentials: &Credentials,
+) -> Result<String> {
+    let directory = http.json("GET", directory, None, None).await?;
+    let account_url = directory["newAccount"]
+        .as_str()
+        .ok_or("ACME newAccount missing")?;
+    let nonce_url = directory["newNonce"]
+        .as_str()
+        .ok_or("ACME newNonce missing")?;
+    let key = CRYPTO
+        .key_provider
+        .load_key(PrivatePkcs8KeyDer::from(key_der.to_vec()))?;
+    let jwk = serde_json::to_value(key.as_jwk())?;
+    let protected = encoded(&json!({"alg":"HS256","kid":credentials.key_id,"url":account_url}))?;
+    let payload = encoded(&jwk)?;
+    let signature = CRYPTO
+        .hmac
+        .load_key(&credentials.mac()?)
+        .sign(format!("{protected}.{payload}").as_bytes());
+    let binding = json!({"protected":protected,"payload":payload,"signature":URL_SAFE_NO_PAD.encode(signature)});
+    let payload = encoded(&json!({"termsOfServiceAgreed":true,
+        "contact":[format!("mailto:{}",contact.trim_start_matches("mailto:"))],"externalAccountBinding":binding}))?;
+    // Retry only explicit badNonce. Ambiguous responses return to the durable
+    // manager, which first looks up the same key before trying EAB again.
+    for _ in 0..3 {
+        let nonce = http
+            .request(
+                Request::builder()
+                    .method("HEAD")
+                    .uri(nonce_url)
+                    .body(Full::new(Bytes::new()))?,
+            )
+            .await?;
+        if !nonce.status().is_success() {
+            return Err("ACME nonce request failed".into());
+        }
+        let nonce = nonce
+            .headers()
+            .get("Replay-Nonce")
+            .and_then(|v| v.to_str().ok())
+            .ok_or("ACME nonce missing")?;
+        let protected = encoded(&json!({"alg":"ES256","jwk":jwk,"nonce":nonce,"url":account_url}))?;
+        let signature = key.sign(format!("{protected}.{payload}").as_bytes())?;
+        let response = http.request(Request::builder().method("POST").uri(account_url)
+            .header(header::CONTENT_TYPE,"application/jose+json")
+            .body(Full::new(Bytes::from(serde_json::to_vec(&json!({"protected":protected,"payload":payload,"signature":URL_SAFE_NO_PAD.encode(signature)}))?)))?).await?;
+        let status = response.status();
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let data: Value = serde_json::from_slice(&response.into_body().collect().await?.to_bytes())
+            .map_err(|_| "malformed ACME account response")?;
+        if status.is_success() {
+            if data["status"] != "valid" {
+                return Err("ACME account is not valid".into());
+            }
+            let location = location.ok_or("ACME account Location missing")?;
+            let uri: http::Uri = location.parse()?;
+            if uri.scheme_str() != Some("https")
+                || uri.host().is_none()
+                || uri.authority().is_some_and(|a| a.as_str().contains('@'))
+            {
+                return Err("invalid ACME account Location".into());
+            }
+            return Ok(location);
+        }
+        if data["type"] != "urn:ietf:params:acme:error:badNonce" {
+            return Err("ACME EAB account registration failed".into());
+        }
+    }
+    Err("ACME nonce retry limit exceeded".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::http_server;
+    use super::*;
+    use boring::{bn::BigNum, ecdsa::EcdsaSig, pkey::PKey};
+    use http::Response;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+    #[test]
+    fn private_gcloud_import_is_validated_atomic_and_never_overwrites() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("export.json");
+        let output = root.path().join("eab.toml");
+        std::fs::write(
+            &input,
+            serde_json::to_vec(&json!({
+                "name":"projects/test/locations/global/externalAccountKeys/test",
+                "keyId":"test-key-id", "b64MacKey":URL_SAFE_NO_PAD.encode([0x42;32])
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&input, std::fs::Permissions::from_mode(0o600)).unwrap();
+        import_gcloud(&input, &output).unwrap();
+        assert_eq!(
+            std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let value = load_credentials(&output).unwrap();
+        assert_eq!(value.key_id, "test-key-id");
+        assert_eq!(value.mac().unwrap(), [0x42; 32]);
+        let before = std::fs::read(&output).unwrap();
+        assert!(import_gcloud(&input, &output).is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), before);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+        assert!(load_credentials(&input).is_err()); // JSON is import-only.
+        std::fs::set_permissions(&input, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(import_gcloud(&input, &root.path().join("other.toml")).is_err());
+        assert!(!root.path().join("other.toml").exists());
+        std::fs::set_permissions(&input, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(
+            &input,
+            br#"{"keyId":"test-key-id","b64MacKey":"invalid-private-value!"}"#,
+        )
+        .unwrap();
+        assert!(import_gcloud(&input, &root.path().join("other.toml")).is_err());
+        assert!(!root.path().join("other.toml").exists());
+    }
+    #[tokio::test]
+    async fn eab_is_bound_to_durable_account_key_and_retries_only_bad_nonce() {
+        let (_, der) = CRYPTO.key_provider.generate_key().unwrap();
+        let public = PKey::private_key_from_pkcs8(der.secret_pkcs8_der())
+            .unwrap()
+            .ec_key()
+            .unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server=http_server({
+            let attempts=attempts.clone();
+            move |request| {
+                let attempts=attempts.clone();let public=public.clone();
+                async move {
+                    let origin=format!("http://{}",request.headers()["host"].to_str().unwrap());
+                    if request.uri().path()=="/directory" {
+                        return Response::new(Full::new(Bytes::from(serde_json::to_vec(&json!({"newAccount":format!("{origin}/account"),"newNonce":format!("{origin}/nonce")})).unwrap())));
+                    }
+                    if request.uri().path()=="/nonce" {
+                        assert_eq!(request.method(),"HEAD");
+                        return Response::builder().header("Replay-Nonce","test-nonce").body(Full::new(Bytes::new())).unwrap();
+                    }
+                    assert_eq!(request.uri().path(),"/account");
+                    assert_eq!(request.headers()[header::CONTENT_TYPE],"application/jose+json");
+                    let jws:Value=serde_json::from_slice(request.body()).unwrap();
+                    let decode=|s:&Value|URL_SAFE_NO_PAD.decode(s.as_str().unwrap()).unwrap();
+                    let header:Value=serde_json::from_slice(&decode(&jws["protected"])).unwrap();
+                    let payload:Value=serde_json::from_slice(&decode(&jws["payload"])).unwrap();
+                    assert_eq!(header["nonce"],"test-nonce");assert_eq!(header["url"],format!("{origin}/account"));
+                    let sig=decode(&jws["signature"]);
+                    assert!(EcdsaSig::from_private_components(BigNum::from_slice(&sig[..32]).unwrap(),BigNum::from_slice(&sig[32..]).unwrap()).unwrap()
+                        .verify(&boring::sha::sha256(format!("{}.{}",jws["protected"].as_str().unwrap(),jws["payload"].as_str().unwrap()).as_bytes()),&public).unwrap());
+                    let binding=&payload["externalAccountBinding"];
+                    let protected:Value=serde_json::from_slice(&decode(&binding["protected"])).unwrap();
+                    assert_eq!(protected,json!({"alg":"HS256","kid":"test-kid","url":format!("{origin}/account")}));
+                    assert_eq!(serde_json::from_slice::<Value>(&decode(&binding["payload"])).unwrap(),header["jwk"]);
+                    let expected=boring::hash::hmac_sha256(&[0x42;32],format!("{}.{}",binding["protected"].as_str().unwrap(),binding["payload"].as_str().unwrap()).as_bytes()).unwrap();
+                    assert_eq!(decode(&binding["signature"]),expected);
+                    assert_eq!(payload["contact"],json!(["mailto:operator@example.dev"]));
+                    if attempts.fetch_add(1,Ordering::Relaxed)==0 {
+                        Response::builder().status(400).body(Full::new(Bytes::from_static(br#"{"type":"urn:ietf:params:acme:error:badNonce"}"#))).unwrap()
+                    } else {
+                        Response::builder().status(201).header(header::LOCATION,"https://acme.example.dev/account/1").body(Full::new(Bytes::from_static(br#"{"status":"valid"}"#))).unwrap()
+                    }
+                }
+            }
+        }).await;
+        let credentials = Credentials {
+            key_id: "test-kid".into(),
+            b64_mac_key: URL_SAFE_NO_PAD.encode([0x42; 32]),
+        };
+        let http = Http::new(None, Duration::from_secs(2))
+            .unwrap()
+            .with_loopback_http();
+        assert_eq!(
+            register(
+                &http,
+                &format!("{}/directory", server.url),
+                der.secret_pkcs8_der(),
+                "operator@example.dev",
+                &credentials
+            )
+            .await
+            .unwrap(),
+            "https://acme.example.dev/account/1"
+        );
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+    }
+}

@@ -1,0 +1,21 @@
+#!/sbin/openrc-run
+name="moon-naive"
+description="H2/H3 proxy and automatic DNS-01 certificate manager"
+command="/usr/local/bin/moon-naive"
+command_args="serve /etc/moon-naive/config.toml"
+command_user="moon-naive:moon-naive"
+directory="/"
+supervisor="supervise-daemon"
+pidfile="/run/${RC_SVCNAME}.pid"
+respawn_delay=10
+respawn_max=0
+stopsig="TERM"
+retry="TERM/360/KILL/5"
+umask=0077
+output_log="/var/log/moon-naive/server.log"
+error_log="/var/log/moon-naive/server.log"
+
+depend() {
+    need net
+    use dns
+}

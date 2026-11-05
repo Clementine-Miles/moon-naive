@@ -1,0 +1,136 @@
+# moon-naive 唯一配置示例（schema 2；兼容旧 schema 1/2）。
+# 推荐：moon-naive config init /etc/moon-naive/config.toml
+# 命令创建 0600 私有文件，拒绝覆盖；请以服务用户执行，父目录需预先存在。
+# 填好下面的基础字段后：moon-naive check /etc/moon-naive/config.toml
+# 然后：moon-naive serve /etc/moon-naive/config.toml
+# serve 自动申请首张证书、验证后监听、续期和热加载；无需 certbot/cron。
+# 所有占位账号/密钥都必须替换。不要把填好密钥的配置提交到 Git。
+
+# 你的代理/网站域名；只填主机名，不带 https://、端口或路径。
+# 先在 DNS 中配置 A 指向 VPS IPv4；只有 IPv6 确实可达才配置 AAAA。
+# 不要把反代源站指回这个域名，否则会形成回源循环。
+domain = "proxy.example.dev"
+# schema_version 默认 2；state_dir 默认 /var/lib/moon-naive。
+# state_dir 是自动生成的账户/证书/续期状态，必须持久保存，不能当缓存删除。
+# state_dir = "/var/lib/moon-naive"
+
+[[proxy.users]]
+username = "REPLACE_WITH_USERNAME"
+# 独立随机密码，至少 16 字节，建议 32 字符以上；增加用户重复 [[proxy.users]]。
+password = "REPLACE_WITH_A_LONG_RANDOM_PASSWORD"
+
+[website]
+# 一行设置整个站点的固定反代：可用 http://127.0.0.1:8080 或真实 HTTPS 源站。
+# 自动设置回源 Host；HTTPS 的 SNI/证书校验使用源站主机名，不跳过验证。
+# 只接受 scheme + 主机 + 可选端口（末尾 / 可省）；不接受账号、子路径、query。
+# 网站的跳转/Cookie/绝对链接不会被自动改写，请确保源站适合通过该域名访问。
+origin = "http://127.0.0.1:8080"
+
+[acme]
+issuer = "google"                    # GTS；省略 issuer 的兼容默认值仍为 letsencrypt。
+environment = "production"           # 正式受信证书；测试改 staging 并换用测试 EAB。
+contact = "operator@example.dev"      # 联系邮箱，不是 Google API key。
+dns_zone = "example.dev"              # Porkbun 托管的 zone，不是 proxy.example.dev。
+# 阅读并接受所选 CA 的条款后手动改为 true；false 时仅能做离线结构校验。
+# GTS 当前 directory 公布的条款：https://pki.goog/GTS-SA.pdf
+accept_terms = false
+# 默认 enabled=true、challenge="dns-01"、dns_provider="porkbun"，无需重复填写。
+# DNS-01 不要求开放 80；程序仅管理挑战 TXT，不替你改 A/AAAA、NS 或 CAA。
+# 域名需实际使用 Porkbun DNS，并在控制台启用此域名的 API access。
+# 若已有 CAA 限制，需允许 pki.goog；.dev 的浏览器 HSTS 不会信任 staging 证书。
+
+[acme.dns_credentials]
+# https://porkbun.com/account/api 生成密钥，两项都需要；不是 secretkey。
+# 密钥应允许目标域名的 NS 读取和 TXT 创建/读取/删除。
+apikey = "pk1_REPLACE_ME"
+secretapikey = "sk1_REPLACE_ME"
+
+[acme.eab]
+# GTS 首次注册账户专用；与 Porkbun API 是两套凭据，不是证书 PEM 或 Google API key。
+# 在已配置 Google Cloud 项目/权限的机器执行（不需要在 VPS 长期安装 gcloud）：
+#   gcloud services enable publicca.googleapis.com
+#   gcloud publicca external-account-keys create --format=json
+# 将返回的 keyId -> key_id、b64MacKey -> b64_mac_key，保持 base64url 原文。
+# 正式 EAB 要确保没有 publicca staging endpoint override；详见配置指南。
+# EAB 须在生成后 7 天内用于首次注册，且只能注册一个账户；续期复用持久账户。
+# staging 与 production 的 EAB 不能混用；不要为每次续期生成新 EAB。
+key_id = "REPLACE_WITH_GTS_EAB_KEY_ID"
+# 以下仅为可解析的公开测试占位值，不能用于 GTS；必须换成真实 b64MacKey。
+b64_mac_key = "dGVzdC10ZXN0LXRlc3QtdGVzdA"
+
+# ── 可选项：以下均为默认值或扩展示例；需要时取消对应行的注释 ──
+# 取消表头与需要的字段即可，其余字段自动使用默认值，勿创建重复 TOML 表。
+#
+# [listener]
+# tcp = "0.0.0.0:443"          # TLS TCP；默认监听 IPv4，按需用 [::]:443。
+# udp = "0.0.0.0:443"          # QUIC/H3；同时开放防火墙 TCP/UDP 443。
+# h1 = true                   # 仅网站/无 ALPN 回退，不开放 H1 通用代理。
+# h2 = true                   # H2/H3 必须开启，不支持禁用。
+# h3 = true
+# http_redirect = "0.0.0.0:80" # 默认不开启；可选 HTTP 308 跳转，需另开放 TCP 80。
+#
+# VPS已支持BBR时，可取消下面三行注释。check-transport会读回实际TCP算法及窗口。
+# [transport]
+# tcp_congestion = "bbr"     # 监听前、入站及出站设置；内核缺失则拒绝启动。省略时为system。
+# quic_congestion = "bbr2"   # quiche BBRv2，Linux自动采用高精度pacing。省略时为cubic。
+# 不需要手动配置timerfd，也不强制固定TCP收发缓冲；程序不修改主机sysctl/qdisc。
+#
+# [limits]
+# max_streams = 100
+# max_connections = 128
+# max_early_data_bytes = 65536         # 认证/拨号期间有界缓冲，不是 TLS 0-RTT。
+# max_buffer_bytes_per_stream = 262144
+# H2初始流窗口取上面两项的较小值；H3可在实际读取后增长至本项上限。
+# 提高max_early_data_bytes也会提高认证前缓存额度；只在测得窗口瓶颈时调整。
+# max_total_receive_bytes = 67108864   # H2/H3 接收窗口预算，不是进程 RSS 上限。
+# connect_timeout_secs = 15
+# idle_timeout_secs = 600     # 无应用数据进展的最长空闲期，不是连接总寿命；按业务静默期调整。
+# 高丢包可能延迟数据进展；保留上面的连接/流/缓冲上限，不发送假保活或无限延长超时。
+# graceful_timeout_secs = 300          # 修改后同步服务管理器的停止期限。
+#
+# [traffic]
+# initial_records = 16        # 只能选 8 或 16，仍需客户端认证协商。
+# sparse_padding = true      # 不生成空闲假流量；详见 docs/PROTOCOL.md。
+#
+# 以下网站参数添加到上方已有的 [website] 表，不要再次写 [website]：
+# compression_level = 5       # 0..6；0 禁用动态 gzip；请求/响应 no-transform 均尊重。
+# max_request_body_bytes = 67108864
+# connect_timeout_secs = 5
+# read_timeout_secs = 30      # 长时间无数据的 SSE 可调大，并由真实源站发送心跳。
+# write_timeout_secs = 30
+# upstream_idle_secs = 60
+# dns_ttl_secs = 60
+#
+# 以下续期参数添加到上方已有的 [acme] 表：
+# renew_before_secs = 2592000 # 30 天窗口；支持 CA 的 ARI，续期时间持久化。
+# retry_initial_secs = 60
+# retry_max_secs = 21600
+# request_timeout_secs = 30
+# operation_timeout_secs = 900
+# poll_interval_secs = 5
+#
+# 多源站/多路径：删除上方 website.origin 后使用以下表，不能同时启用简写和路由表。
+# [[website.upstreams]]
+# name = "app"
+# origins = ["https://origin.example.net"]
+# host_header = "origin.example.net" # 高级模式按需显式指定；默认保留访问网站的 Host。
+# http2 = true
+# # tls_server_name = "origin.example.net" # 默认使用每个 origin 的主机名。
+# # ca_file = "/etc/moon-naive/origin-ca.pem" # 仅私有 CA 需要，始终校验证书。
+# [[website.routes]]
+# path_prefix = "/"
+# upstream = "app"
+# strip_prefix = false
+#
+# 可选出站下一跳；省略为直连，配置后失败不会回退直连。
+# HTTPS 下一跳的 CA/TLS 上下文在启动预检时加载一次；修改信任根后重启服务。
+# CPU 指令集由运行时自动检测；不必添加 AVX/AES 开关，可用 status 查看能力。
+# [proxy.upstream]
+# kind = "https"              # http、https 或 socks5；仅 https 自带 TLS。
+# address = "upstream.example.net:443"
+# username = "upstream-user"  # 无认证时与 password 一起省略。
+# password = "upstream-password"
+#
+# 完整配置、GTS EAB/staging、Cloudflare/LE、旧配置迁移见 docs/CONFIGURATION.md。
+# schema 2 主文件权限必须为 0600；服务用户需拥有文件及可写的 state_dir（0700）。
+# 新修订4客户端须单独准备；本示例不能使官方 NaïveProxy 客户端直接兼容。
