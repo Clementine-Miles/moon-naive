@@ -141,9 +141,51 @@ fn audit_native() -> Result<()> {
         &format!("dependency graph audit=passed\nnative compilation=not performed\n{tree}"),
     )
 }
+fn tested_suite(args: &[&str]) -> Result<()> {
+    let report = capture(&root(), "cargo", args)?;
+    let passed: usize = report
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("test result: ok. ")?
+                .split_whitespace()
+                .next()?
+                .parse::<usize>()
+                .ok()
+        })
+        .sum();
+    print!("{report}");
+    check(passed > 0, "critical suite ran zero passing tests")
+}
+fn test_suites(isolated: bool) -> Result<()> {
+    if isolated {
+        tested_suite(&[
+            "test",
+            "--locked",
+            "--test",
+            "acme_pebble",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+        ])
+    } else {
+        for args in [
+            vec!["test", "--locked", "-p", "moon-naive-core", "--lib"],
+            vec!["test", "--locked", "-p", "moon-naive", "--lib", "acme::"],
+            vec!["test", "--locked", "-p", "moon-naive", "--lib", "net::"],
+            vec!["test", "--locked", "--test", "cli"],
+        ] {
+            tested_suite(&args)?;
+        }
+        Ok(())
+    }
+}
+
 fn verify(target: Option<&str>) -> Result<()> {
     let root = root();
     audit::sources()?;
+    if target.is_none() {
+        test_suites(false)?;
+    }
     for mut args in [
         vec![
             "fmt",
@@ -290,6 +332,8 @@ fn main() -> ExitCode {
     let args: Vec<_> = env::args().skip(1).collect();
     let result = match args.as_slice() {
         [cmd] if cmd == "verify" => verify(None),
+        [cmd] if cmd == "test" => test_suites(false),
+        [cmd] if cmd == "test-isolated" => test_suites(true),
         [cmd,target] if cmd=="verify"=>verify(Some(target)),
         [cmd] if cmd == "audit-native" => audit_native(),
         [cmd, binary] if cmd == "check-elf" => release::check_elf(Path::new(binary)),
@@ -297,7 +341,7 @@ fn main() -> ExitCode {
         [cmd,output] if cmd=="source"=>release::source(Path::new(output)),
         [cmd,binary] if cmd=="platform-smoke"=>release::platform_smoke(Path::new(binary),None),
         [cmd,binary,ca] if cmd=="platform-smoke"=>release::platform_smoke(Path::new(binary),Some(Path::new(ca))),
-        _ => Err("usage: cargo xtask verify [target] | audit-native | check-elf <binary> | dist <binary> <output-dir> | source <output-dir> | platform-smoke <binary> [ca-bundle]".into()),
+        _ => Err("usage: cargo xtask test | test-isolated | verify [target] | audit-native | check-elf <binary> | dist <binary> <output-dir> | source <output-dir> | platform-smoke <binary> [ca-bundle]".into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

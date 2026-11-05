@@ -116,7 +116,7 @@ cargo xtask source dist
 cargo xtask dist out/musl/moon-naive dist
 ```
 
-`verify` 执行格式、Clippy、Release 构建及 CLI 冒烟检查；项目测试已移除。`source` / `dist` 生成确定性的 tar.gz 和 SHA-256，拒绝覆盖同名产物。源码文件清单依赖 Git；无 Git 元数据的解包副本需先建立基线。vendor 文件始终按校验清单收集。
+`verify` 执行关键测试套件、格式、Clippy、Release 构建及 CLI 冒烟检查。`source` / `dist` 生成确定性的 tar.gz 和 SHA-256，拒绝覆盖同名产物。源码文件清单依赖 Git；无 Git 元数据的解包副本需先建立基线。vendor 文件始终按校验清单收集。
 
 `check-elf` / `dist` 使用 Rust 检查静态 x86_64 ELF，不需要 file/readelf。`platform-smoke` 是可选 Docker 运行检查，不能代表完整服务验收。验证结果与限制见[验证记录](VERIFICATION.md)。
 
@@ -141,3 +141,12 @@ cargo build --release --locked -p moon-naive
 库目录需包含 libssl.a、libcrypto.a（或放在其 lib 子目录），头文件目录需包含 openssl/。仅复用由当前锁定 boring-sys 5.2.0、相同补丁、目标架构和 C 运行库构建的产物；GNU 与 musl 不可混用。不要设置 ASSUME_PATCHED 绕过来源要求。仍需 libclang 生成 Rust 绑定和系统链接器。此模式避免调用 CMake，但 Cargo 的传递构建依赖仍保留 cmake crate。
 
 本机已用当前构建出的匹配库验证该模式，并将 CMAKE 指向不存在的路径以确认没有调用它；未验证跨平台预编译包。
+
+
+## 本轮恢复修复的运维影响
+
+H3 内部桥接失败时，当前请求失败且不自动重放；后续请求可触发重建。重建最多等待 3 秒，连续尝试间隔至少 1 秒，等待人数不超过 `limits.max_streams`。停止接收服务后禁止创建新桥接代际。
+
+ACME 已完成订单的证书若已过期或进入更新窗口，先验证身份、密钥、用途和信任链，再持久化退役及至少一小时的冷却时间。验证错误继续保留订单供排查，不盲目重新签发。磁盘写入不确定时仍需重启后恢复。新 `retired_order` 日志字段不受旧版本支持；不要通过删除日志来降级，否则会丢失 DNS 清理状态。证书私钥不会写入退役摘要。
+
+账户日志、DNS/EAB 凭据仍要求所有者专用权限；文件读取拒绝符号链接最终组件、FIFO、过大和非私有文件。父目录必须由可信管理员控制。本轮尚未实现独立进程和发布目录权限分离，现有 `serve` 仍内嵌控制线程，ECH 外层证书仍需按原流程管理。不要把这些局部修复当成完整权限隔离部署方案。

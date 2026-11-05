@@ -21,6 +21,6 @@
 | [licenses](../licenses/) | 第三方许可文本 |
 | [docs](./) | 使用、设计、限制与历史摘要 |
 
-项目自身的 tests、抓包实验和 HANDOFF 文件已删除。vendor 中的公开测试夹具属于受校验的上游快照，不能直接清理。target、reports、dist 为生成目录，不属于运行依赖。
+第一方单元、传输及隔离 ACME 测试已恢复；`tests/` 保存 CLI 和 Pebble 集成测试。HANDOFF 和外部抓包工具未恢复。vendor 中的公开测试夹具属于受校验的上游快照，不能直接清理。target、reports、dist 为生成目录，不属于运行依赖。
 
 构建入口见[工具说明](../tools/README.md)，运行模型见[架构](ARCHITECTURE.md)。

@@ -113,6 +113,7 @@ mod tests {
     async fn concurrent_failure_has_one_replacement_and_bounded_retention() {
         let slot = Arc::new(Generations::new(32));
         let builds = Arc::new(AtomicUsize::new(0));
+        let mut previous: Option<std::sync::Weak<AtomicBool>> = None;
         for _ in 0..64 {
             let mut tasks = tokio::task::JoinSet::new();
             for _ in 0..16 {
@@ -129,19 +130,17 @@ mod tests {
                 });
             }
             let first = tasks.join_next().await.unwrap().unwrap();
+            if let Some(old) = previous.take() {
+                assert!(old.upgrade().is_none());
+            }
             while let Some(next) = tasks.join_next().await {
                 assert!(Arc::ptr_eq(&first, &next.unwrap()));
             }
             assert_eq!(Arc::strong_count(&first), 2);
             first.store(false, Ordering::Relaxed);
-            let old = Arc::downgrade(&first);
+            previous = Some(Arc::downgrade(&first));
             drop(first);
             tokio::time::advance(Duration::from_secs(1)).await;
-            // Next iteration replaces the sole cached generation; there is no history list.
-            let mut state = slot.state.lock().await;
-            state.current = None;
-            drop(state);
-            assert!(old.upgrade().is_none());
         }
         assert_eq!(builds.load(Ordering::Relaxed), 64);
     }
