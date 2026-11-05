@@ -41,8 +41,8 @@ hickory-proto = { version = "=0.26.1", default-features = false, features = ["st
 x509-parser = { version = "0.18", default-features = false }
 socket2 = { version = "=0.6.5", features = ["all"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1.1.5", features = ["time"] }
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.5", features = ["time", "fs"] }
 
 [lints]
 workspace = true

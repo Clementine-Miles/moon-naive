@@ -111,3 +111,57 @@ async fn http_rejects_cleartext_limits_body_and_cancels_deadline() {
         assert!(http.request(request).await.is_err());
     }
 }
+
+#[test]
+fn completed_order_retirement_persists_cooldown_account_and_dns_ownership() {
+    use super::state::{Lease, Order};
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let state = State::open(root.path(), &"b".repeat(64)).unwrap();
+    let mut journal = Journal {
+        account_key: vec![42],
+        order: Some(Order {
+            url: "https://ca.invalid/order/1".into(),
+            key_pem: "test-only-key".into(),
+            csr: vec![1],
+        }),
+        leases: vec![Lease {
+            name: "_acme-challenge.example.test".into(),
+            value: "fixture".into(),
+            marker: "owned".into(),
+            record_id: None,
+            borrowed: false,
+        }],
+        ..Journal::default()
+    };
+    state.save(&journal).unwrap();
+    journal.retire_completed(100, 99, 200).unwrap();
+    state.save(&journal).unwrap();
+    let restored = state.load().unwrap().unwrap();
+    assert!(restored.order.is_none());
+    assert_eq!(restored.next_attempt, 3700);
+    assert_eq!(restored.account_key, [42]);
+    assert_eq!(restored.leases[0].marker, "owned");
+    assert_eq!(restored.retired_order.unwrap().not_after, 99);
+}
+
+#[test]
+fn secret_reader_checks_opened_file_and_rejects_fifo_without_blocking() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("secret");
+    std::fs::write(&path, b"fixture").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let file = super::state::open_private(&path, 64).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(super::state::validate_private(&file, 64).is_err());
+    let fifo = root.path().join("fifo");
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &fifo,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        0,
+    )
+    .unwrap();
+    assert!(read_private(&fifo, 64).is_err());
+}

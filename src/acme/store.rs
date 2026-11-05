@@ -46,16 +46,8 @@ fn write_new(path: &Path, data: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 fn read_bounded(path: &Path, max: usize) -> io::Result<Vec<u8>> {
-    let meta = fs::symlink_metadata(path)?;
-    if !meta.is_file() || meta.len() > max as u64 {
-        return Err(invalid("invalid state file"));
-    }
-    #[cfg(unix)]
-    if meta.permissions().mode() & 0o077 != 0 {
-        return Err(invalid("state file is not private"));
-    }
     let mut out = Vec::new();
-    File::open(path)?
+    super::state::open_private(path, max)?
         .take(max as u64 + 1)
         .read_to_end(&mut out)?;
     if out.is_empty() || out.len() > max {
@@ -84,7 +76,11 @@ impl WriterLock {
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
         options.mode(0o600);
+        options.custom_flags(
+            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+        );
         let file = options.open(path)?;
+        super::state::validate_private(&file, 1024)?;
         file.try_lock().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::WouldBlock,

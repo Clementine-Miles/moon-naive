@@ -375,11 +375,24 @@ impl<P: DnsProvider> Manager<P> {
                 .to_vec(),
         };
         self.phase = "certificate-validation";
-        let bundle = self.validator.verify(candidate, now())?;
+        let bundle = match self.validator.download(candidate, now(), self.window)? {
+            certificate::Download::Usable(bundle) => bundle,
+            certificate::Download::Obsolete(lifetime) => {
+                self.phase = "completed-certificate-obsolete";
+                self.journal.retire_completed(
+                    now(),
+                    lifetime.not_after,
+                    now()
+                        .saturating_add(self.max_retry)
+                        .max(self.http.retry_after.load(Ordering::Relaxed)),
+                )?;
+                // No new order until retirement and cooldown are durable. A failed
+                // save suspends this manager; restart reconciles the old journal.
+                self.persist()?;
+                return Ok(Tick::RetryScheduled);
+            }
+        };
         let lifetime = bundle.lifetime();
-        if lifetime.renew_at(self.window) <= now() {
-            return Err("CA issued certificate already due for renewal".into());
-        }
         self.phase = "certificate-install";
         if let Err(failure) = self.store.install(&bundle) {
             if failure == StoreFailure::CommitUncertain {

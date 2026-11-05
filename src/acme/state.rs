@@ -20,6 +20,8 @@ pub struct Journal {
     #[serde(default)]
     pub account_id: Option<String>,
     pub order: Option<Order>,
+    #[serde(default)]
+    pub retired_order: Option<RetiredOrder>,
     pub leases: Vec<Lease>,
     pub next_attempt: u64,
     pub failures: u32,
@@ -30,6 +32,34 @@ pub struct Journal {
     #[serde(default)]
     pub last_failure_phase: Option<String>,
 }
+/// One bounded diagnostic record; obsolete certificate private keys are discarded.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetiredOrder {
+    pub url_sha256: String,
+    pub retired_at: u64,
+    pub not_after: u64,
+    pub reason: String,
+}
+impl Journal {
+    pub fn retire_completed(&mut self, now: u64, not_after: u64, retry_at: u64) -> Result<()> {
+        let order = self.order.take().ok_or("no completed order to retire")?;
+        self.retired_order = Some(RetiredOrder {
+            url_sha256: boring::sha::sha256(order.url.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+            retired_at: now,
+            not_after,
+            reason: "completed-certificate-obsolete".into(),
+        });
+        self.next_attempt = retry_at.max(now.saturating_add(3600));
+        self.last_failure_phase = Some("completed-certificate-obsolete".into());
+        // Account identity and DNS leases must survive this transition.
+        Ok(())
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Order {
@@ -51,16 +81,37 @@ pub struct State {
     name: String,
     _lock: File,
 }
-pub fn read_private(path: &Path, limit: usize) -> Result<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path)?;
+/// Validate the descriptor actually read. Parent directories must remain trusted;
+/// NOFOLLOW protects the final component, NONBLOCK prevents FIFO open stalls.
+pub(super) fn open_private(path: &Path, limit: usize) -> std::io::Result<File> {
+    let fd = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    let file = File::from(fd);
+    validate_private(&file, limit)?;
+    Ok(file)
+}
+pub(super) fn validate_private(file: &File, limit: usize) -> std::io::Result<()> {
+    let metadata = file.metadata()?;
     if !metadata.is_file()
         || metadata.permissions().mode() & 0o077 != 0
         || metadata.len() > limit as u64
     {
-        return Err("state/secret file must be a bounded private regular file (0600)".into());
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "expected bounded private regular file",
+        ));
     }
+    Ok(())
+}
+pub fn read_private(path: &Path, limit: usize) -> Result<Vec<u8>> {
     let mut data = Vec::new();
-    File::open(path)?
+    open_private(path, limit)?
         .take(limit as u64 + 1)
         .read_to_end(&mut data)?;
     if data.is_empty() || data.len() > limit {
@@ -96,7 +147,11 @@ impl State {
             .create(true)
             .truncate(false)
             .mode(0o600)
+            .custom_flags(
+                (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+            )
             .open(&lock_path)?;
+        validate_private(&lock, 1024)?;
         lock.try_lock()
             .map_err(|_| "another ACME manager owns this state")?;
         Ok(Self {

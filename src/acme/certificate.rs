@@ -86,6 +86,12 @@ impl CertificateSlot {
     }
 }
 
+/// An obsolete download is validated for retirement only, never for installation.
+pub enum Download {
+    Usable(VerifiedBundle),
+    Obsolete(Lifetime),
+}
+
 pub struct Validator {
     domain: String,
     roots: Vec<X509>,
@@ -117,6 +123,24 @@ impl Validator {
             },
         })
     }
+    pub fn download(&self, candidate: Candidate, now: u64, window: u64) -> Result<Download> {
+        if candidate.chain_pem.len() > 1024 * 1024 || candidate.key_pem.len() > 64 * 1024 {
+            return Err("certificate material exceeds limit".into());
+        }
+        let chain = X509::stack_from_pem(&candidate.chain_pem)?;
+        let leaf = chain.first().ok_or("empty certificate chain")?;
+        let life = lifetime(leaf)?;
+        // A past-time check is only used to establish that an obsolete result
+        // belongs to this identity/key/trust chain. It cannot yield usable material.
+        let checked_at = now.min(life.not_after.saturating_sub(1));
+        let verified = self.verify(candidate, checked_at)?;
+        if life.renew_at(window) <= now {
+            Ok(Download::Obsolete(life))
+        } else {
+            Ok(Download::Usable(verified))
+        }
+    }
+
     pub fn verify(&self, candidate: Candidate, now: u64) -> Result<VerifiedBundle> {
         if candidate.chain_pem.len() > 1024 * 1024 || candidate.key_pem.len() > 64 * 1024 {
             return Err("certificate material exceeds limit".into());
@@ -341,6 +365,28 @@ mod tests {
             validator
                 .verify(leaf(&ca, &key, true, true), super::super::now())
                 .is_ok()
+        );
+        let later = super::super::now() + 86401;
+        assert!(matches!(
+            validator
+                .download(leaf(&ca, &key, true, true), later, 3600)
+                .unwrap(),
+            Download::Obsolete(_)
+        ));
+        assert!(
+            validator
+                .download(leaf(&ca, &key, false, true), later, 3600)
+                .is_err()
+        );
+        assert!(
+            validator
+                .download(leaf(&ca, &key, true, false), later, 3600)
+                .is_err()
+        );
+        assert!(
+            validator
+                .verify(leaf(&ca, &key, true, true), later)
+                .is_err()
         );
         assert!(
             validator
