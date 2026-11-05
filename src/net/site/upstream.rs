@@ -91,6 +91,9 @@ impl Pool {
                 + 1,
         })
     }
+    pub fn selection(&self) -> usize {
+        self.next.fetch_add(1, Ordering::Relaxed) % self.origins.len()
+    }
     pub fn len(&self) -> usize {
         self.origins.len()
     }
@@ -106,10 +109,9 @@ impl Pool {
     }
     pub async fn peer(
         &self,
-        attempt: usize,
+        start: usize,
         config: &Website,
     ) -> pingora_core::Result<(usize, HttpPeer)> {
-        let start = self.next.fetch_add(1, Ordering::Relaxed);
         let mut index = start % self.origins.len();
         for n in 0..self.origins.len() {
             let candidate = (start + n) % self.origins.len();
@@ -151,17 +153,22 @@ impl Pool {
                 addresses,
             ));
         }
-        let addresses = &cache.as_ref().expect("resolved addresses").1;
-        let address = addresses[(start + attempt) % addresses.len()];
-        if address.port() == self.frontend.port()
-            && (address.ip() == self.frontend.ip()
-                || address.ip().is_loopback()
-                || origin.host.eq_ignore_ascii_case(&self.node_domain))
-        {
-            return Err(pingora_core::Error::new_up(
-                pingora_core::ErrorType::ConnectError,
-            ));
-        }
+        let addresses: Vec<_> = cache
+            .as_ref()
+            .expect("resolved addresses")
+            .1
+            .iter()
+            .copied()
+            .filter(|address| {
+                !(address.port() == self.frontend.port()
+                    && (address.ip() == self.frontend.ip()
+                        || address.ip().is_loopback()
+                        || origin.host.eq_ignore_ascii_case(&self.node_domain)))
+            })
+            .collect();
+        let address = *addresses
+            .first()
+            .ok_or_else(|| pingora_core::Error::new_up(pingora_core::ErrorType::ConnectError))?;
         let sni = self
             .config
             .tls_server_name
@@ -170,6 +177,11 @@ impl Pool {
             .to_owned();
         let mut peer = HttpPeer::new(address, origin.tls, sni);
         peer.group_key = self.group;
+        peer.options.custom_l4 = Some(Arc::new(ResolvedConnector {
+            addresses,
+            algorithm: self.tcp_congestion,
+            deadline: Duration::from_secs(config.connect_timeout_secs),
+        }));
         let algorithm = self.tcp_congestion;
         peer.options.upstream_tcp_sock_tweak_hook = Some(Arc::new(move |socket| {
             super::super::congestion::apply_connecting(socket, algorithm).map_err(|e| {
@@ -237,5 +249,64 @@ pub(super) fn clean_response(header: &mut pingora_http::ResponseHeader) {
         if !upgrade || !["connection", "upgrade"].contains(&name) {
             header.remove_header(name);
         }
+    }
+}
+
+/// Only configured origins reach this connector. Do not apply the public-target
+/// policy here: explicitly configured private website origins are supported.
+#[derive(Debug)]
+struct ResolvedConnector {
+    addresses: Vec<SocketAddr>,
+    algorithm: moon_naive_core::config::TcpCongestion,
+    deadline: Duration,
+}
+#[async_trait::async_trait]
+impl pingora_core::connectors::L4Connect for ResolvedConnector {
+    async fn connect(
+        &self,
+        _addr: &pingora_core::protocols::l4::socket::SocketAddr,
+    ) -> pingora_core::Result<pingora_core::protocols::l4::stream::Stream> {
+        let socket = tokio::time::timeout(
+            self.deadline,
+            super::super::egress::connect_candidates(
+                self.addresses.clone(),
+                Arc::default(),
+                self.algorithm,
+            ),
+        )
+        .await
+        .map_err(|_| pingora_core::Error::new_up(pingora_core::ErrorType::ConnectTimedout))?
+        .map_err(|_| pingora_core::Error::new_up(pingora_core::ErrorType::ConnectError))?;
+        Ok(socket.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pingora_core::upstreams::peer::Peer;
+    #[tokio::test]
+    async fn one_origin_retains_all_candidates_before_any_request_is_sent() {
+        let config = Config::parse(include_str!("../../../config.example.toml")).unwrap();
+        let pool = Pool::load(&config.website.upstreams[0], &config).unwrap();
+        let refused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = refused.local_addr().unwrap();
+        drop(refused);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = listener.local_addr().unwrap();
+        *pool.origins[0].addresses.lock().await =
+            Some((Instant::now() + Duration::from_secs(60), vec![dead, live]));
+        let (index, peer) = pool.peer(pool.selection(), &config.website).await.unwrap();
+        assert_eq!(index, 0);
+        let stream = peer
+            .options
+            .custom_l4
+            .as_ref()
+            .unwrap()
+            .connect(peer.address())
+            .await
+            .unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        drop((stream, accepted));
     }
 }

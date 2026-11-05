@@ -70,7 +70,10 @@ pub(crate) async fn connect(prepared: Prepared<'_>) -> Result<(Stream, Reply), u
         pool,
     } = prepared;
     let peers = upstream::Pool::load(pool, config).map_err(|_| 502u16)?;
-    let (_, mut peer) = peers.peer(0, &config.website).await.map_err(|_| 502u16)?;
+    let (_, mut peer) = peers
+        .peer(peers.selection(), &config.website)
+        .await
+        .map_err(|_| 502u16)?;
     peer.options.alpn = pingora_core::protocols::ALPN::H1;
     let connector = Connector::<()>::new(None);
     let (session, _) = connector

@@ -49,13 +49,17 @@ impl Origin {
         if addresses.len() > 32 {
             return Err(fail());
         }
-        let addr = addresses
+        let addresses: Vec<_> = addresses
             .into_iter()
-            .find(|a| allows_ip(a.ip(), &self.egress.own))
-            .ok_or_else(fail)?;
+            .filter(|a| allows_ip(a.ip(), &self.egress.own))
+            .collect();
+        let addr = *addresses.first().ok_or_else(fail)?;
         let mut peer = HttpPeer::new(addr, self.tls, self.authority.host.clone());
         peer.group_key = self.user as u64 + 1;
-        peer.options.custom_l4 = Some(Arc::new(Connector(self.egress.clone())));
+        peer.options.custom_l4 = Some(Arc::new(Connector {
+            egress: self.egress.clone(),
+            addresses,
+        }));
         peer.options.verify_cert = true;
         peer.options.verify_hostname = true;
         if self.tls {
@@ -73,7 +77,10 @@ impl Origin {
         Ok(Box::new(peer))
     }
 }
-struct Connector(Egress);
+struct Connector {
+    egress: Egress,
+    addresses: Vec<std::net::SocketAddr>,
+}
 impl std::fmt::Debug for Connector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("CheckedEgress")
@@ -83,13 +90,11 @@ impl std::fmt::Debug for Connector {
 impl L4Connect for Connector {
     async fn connect(
         &self,
-        addr: &pingora_core::protocols::l4::socket::SocketAddr,
+        _addr: &pingora_core::protocols::l4::socket::SocketAddr,
     ) -> pingora_core::Result<L4> {
-        let target = Authority::parse(&addr.to_string())
-            .map_err(|_| pingora_core::Error::new(pingora_core::ErrorType::ConnectError))?;
         let stream: outbound::Stream = self
-            .0
-            .dial(&target)
+            .egress
+            .dial_candidates(self.addresses.clone())
             .await
             .map_err(|_| pingora_core::Error::new(pingora_core::ErrorType::ConnectError))?;
         Ok(L4::from(VirtualSocketStream::new(Box::new(stream))))

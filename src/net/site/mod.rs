@@ -560,9 +560,13 @@ impl ProxyHttp for Router {
         if let Some(origin) = &self.forward {
             return origin.peer(&self.config).await;
         }
-        let (origin, mut peer) = self.pools[ctx.pool.expect("routed request")]
-            .peer(ctx.attempt, &self.config)
-            .await?;
+        let pool = &self.pools[ctx.pool.expect("routed request")];
+        let selection = if ctx.attempt == 0 {
+            pool.selection()
+        } else {
+            (ctx.origin + 1) % pool.len()
+        };
+        let (origin, mut peer) = pool.peer(selection, &self.config).await?;
         if s.req_header().headers.contains_key("upgrade") {
             peer.options.alpn = pingora_core::protocols::ALPN::H1;
         }

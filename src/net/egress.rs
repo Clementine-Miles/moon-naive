@@ -91,6 +91,30 @@ impl Egress {
         if addresses.is_empty() {
             return Err(403);
         }
+        self.dial_addresses_inner(addresses).await
+    }
+    /// Already resolved concrete candidates; revalidate policy without DNS lookup.
+    pub async fn dial_candidates(&self, addresses: Vec<SocketAddr>) -> Result<Stream, u16> {
+        if addresses.is_empty() || addresses.len() > 32 {
+            return Err(502);
+        }
+        #[cfg(test)]
+        if self.test_target.is_some() {
+            let target = Authority::parse(&addresses[0].to_string()).map_err(|_| 502u16)?;
+            return self.dial(&target).await;
+        }
+        let addresses = addresses
+            .into_iter()
+            .filter(|a| allows_ip(a.ip(), &self.own))
+            .collect::<Vec<_>>();
+        if addresses.is_empty() {
+            return Err(403);
+        }
+        tokio::time::timeout(self.timeout, self.dial_addresses_inner(addresses))
+            .await
+            .map_err(|_| 504u16)?
+    }
+    async fn dial_addresses_inner(&self, addresses: Vec<SocketAddr>) -> Result<Stream, u16> {
         if let Some(upstream) = &self.upstream {
             let proxy = &upstream.authority;
             let proxy_addresses = tokio::net::lookup_host((proxy.host.as_str(), proxy.port))
@@ -128,7 +152,7 @@ impl Egress {
 
 /// At most two in-flight connects. Alternate families and stagger the second
 /// attempt; dropping this future cancels the sockets together with admission.
-async fn connect_candidates(
+pub(super) async fn connect_candidates(
     addresses: Vec<SocketAddr>,
     stats: Arc<Stats>,
     algorithm: moon_naive_core::config::TcpCongestion,
@@ -180,6 +204,28 @@ async fn connect_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn candidate_fallback_in_both_address_family_orders() {
+        let algorithm = moon_naive_core::config::TcpCongestion::System;
+        for (bad, good) in [("[::1]:0", "127.0.0.1:0"), ("127.0.0.1:0", "[::1]:0")] {
+            let refused = tokio::net::TcpListener::bind(bad).await.unwrap();
+            let dead = refused.local_addr().unwrap();
+            drop(refused);
+            let listener = tokio::net::TcpListener::bind(good).await.unwrap();
+            let live = listener.local_addr().unwrap();
+            let stats = Arc::new(Stats::default());
+            let socket = tokio::time::timeout(
+                Duration::from_secs(2),
+                connect_candidates(vec![dead, live], stats.clone(), algorithm),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(socket.peer_addr().unwrap(), live);
+            assert_eq!(stats.dials.load(Ordering::Relaxed), 2);
+        }
+    }
+
     #[tokio::test]
     async fn single_candidate_keeps_socket_policy_and_errors() {
         let open = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
