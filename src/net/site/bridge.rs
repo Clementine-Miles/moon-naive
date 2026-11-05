@@ -31,6 +31,7 @@ use tokio::{
 };
 
 pub(super) struct Bridge {
+    health: watch::Receiver<bool>,
     sender: h2::client::SendRequest<Bytes>,
     client: JoinHandle<()>,
     server: JoinHandle<()>,
@@ -41,7 +42,45 @@ impl Drop for Bridge {
         self.server.abort();
     }
 }
+/// Validate before forwarding DATA to the shared H2 connection. A mismatch
+/// resets only this stream and must not reach its connection-level parser.
+struct BodyLength(Option<u64>);
+impl BodyLength {
+    fn new(request: &RequestHeader) -> Result<Self> {
+        let value = request
+            .headers
+            .get("content-length")
+            .map(|v| -> Result<u64> { Ok(v.to_str()?.parse()?) })
+            .transpose()?;
+        Ok(Self(value))
+    }
+    fn data(&mut self, bytes: usize) -> Result<()> {
+        if let Some(remaining) = &mut self.0 {
+            *remaining = remaining
+                .checked_sub(u64::try_from(bytes)?)
+                .ok_or("bridge content length exceeded")?;
+        }
+        Ok(())
+    }
+    fn finish(&self) -> Result<()> {
+        if self.0.is_some_and(|remaining| remaining != 0) {
+            Err("bridge content length incomplete".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct DriverHealth(watch::Sender<bool>);
+impl Drop for DriverHealth {
+    fn drop(&mut self) {
+        self.0.send_replace(false);
+    }
+}
 impl Bridge {
+    pub fn healthy(&self) -> bool {
+        *self.health.borrow() && !self.client.is_finished() && !self.server.is_finished()
+    }
     pub async fn new(proxy: Arc<Proxy>, max_streams: u32) -> Result<Self> {
         let (client, server) = tokio::io::duplex(64 * 1024);
         let server: pingora_core::protocols::Stream = Box::new(L4::from(VirtualSocketStream::new(
@@ -66,10 +105,15 @@ impl Bridge {
         );
         let (sender, connection) = client?;
         let mut connection_server = server?;
+        let (health_send, health) = watch::channel(true);
+        let client_health = DriverHealth(health_send.clone());
+        let server_health = DriverHealth(health_send);
         let client = tokio::spawn(async move {
+            let _health = client_health;
             let _ = connection.await;
         });
         let server = tokio::spawn(async move {
+            let _health = server_health;
             let mut tasks = tokio::task::JoinSet::new();
             let (_send, stop) = watch::channel(false);
             let digest = Arc::new(Digest::default());
@@ -85,6 +129,7 @@ impl Bridge {
             // Dropping JoinSet aborts requests when the memory connection ends.
         });
         Ok(Self {
+            health,
             sender,
             client,
             server,
@@ -94,10 +139,32 @@ impl Bridge {
         &self,
         request: RequestHeader,
         end: bool,
+        input: mpsc::Receiver<Input>,
+        output: mpsc::Sender<HttpTask>,
+        wake: Arc<Notify>,
+    ) -> Result<()> {
+        let mut health = self.health.clone();
+        if !self.healthy() {
+            return Err("bridge generation terminated".into());
+        }
+        tokio::select! {
+            biased;
+            _ = health.changed() => Err("bridge generation terminated".into()),
+            result = self.exchange_inner(request, end, input, output, wake) => result,
+        }
+    }
+    async fn exchange_inner(
+        &self,
+        request: RequestHeader,
+        end: bool,
         mut input: mpsc::Receiver<Input>,
         output: mpsc::Sender<HttpTask>,
         wake: Arc<Notify>,
     ) -> Result<()> {
+        let mut length = BodyLength::new(&request)?;
+        if end {
+            length.finish()?;
+        }
         let uri: http::Uri = if request.method == http::Method::CONNECT {
             request
                 .headers
@@ -132,6 +199,10 @@ impl Bridge {
                 wake.notify_one();
                 match event {
                     Input::Data(mut bytes) => {
+                        if let Err(error) = length.data(bytes.len()) {
+                            body.send_reset(h2::Reason::PROTOCOL_ERROR);
+                            return Err(error);
+                        }
                         while !bytes.is_empty() {
                             body.reserve_capacity(bytes.len());
                             let capacity = std::future::poll_fn(|cx| body.poll_capacity(cx))
@@ -144,10 +215,18 @@ impl Bridge {
                         }
                     }
                     Input::Trailers(headers) => {
+                        if let Err(error) = length.finish() {
+                            body.send_reset(h2::Reason::PROTOCOL_ERROR);
+                            return Err(error);
+                        }
                         body.send_trailers(headers)?;
                         return Ok::<_, crate::acme::Error>(());
                     }
                 }
+            }
+            if let Err(error) = length.finish() {
+                body.send_reset(h2::Reason::PROTOCOL_ERROR);
+                return Err(error);
             }
             body.send_data(Bytes::new(), true)?;
             Ok(())
@@ -223,7 +302,99 @@ async fn complete_exchange(
 #[cfg(test)]
 mod completion_tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn terminated_driver_is_replaced_without_replaying_post() {
+        use super::super::{Site, generation::Generations};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = moon_naive_core::config::Config::parse(
+            &include_str!("../../../config.example.toml")
+                .replace("127.0.0.1:8080", &addr.to_string()),
+        )
+        .unwrap();
+        let site = Site::load(&config).unwrap();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = requests.clone();
+        let origin = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    bytes.push(socket.read_u8().await.unwrap());
+                    if bytes.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                assert!(bytes.starts_with(b"POST "));
+                seen.fetch_add(1, Ordering::Relaxed);
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let generations = Generations::new(8);
+        let mut previous: Option<std::sync::Weak<Bridge>> = None;
+        for _ in 0..3 {
+            let bridge = generations
+                .get(Bridge::healthy, || Bridge::new(site.proxy.clone(), 8))
+                .await
+                .unwrap();
+            if let Some(old) = previous.take() {
+                assert!(old.upgrade().is_none());
+            }
+            let mut request = RequestHeader::build("POST", b"/", None).unwrap();
+            request
+                .insert_header("host", config.domain.clone())
+                .unwrap();
+            let (input, receive) = mpsc::channel(2);
+            drop(input);
+            let (send, mut output) = mpsc::channel(8);
+            let exchange = bridge.exchange(request, true, receive, send, Arc::new(Notify::new()));
+            let consume = async {
+                let mut status = None;
+                while let Some(task) = output.recv().await {
+                    if let HttpTask::Header(header, _) = task {
+                        status = Some(header.status);
+                    }
+                }
+                assert_eq!(status, Some(http::StatusCode::OK));
+            };
+            let (result, ()) = tokio::join!(exchange, consume);
+            result.unwrap();
+            bridge.client.abort();
+            while !bridge.client.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            assert!(!bridge.healthy());
+            previous = Some(Arc::downgrade(&bridge));
+            drop(bridge);
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        }
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
+        generations.close();
+        origin.abort();
+    }
     use std::{future::pending, time::Duration};
+
+    #[test]
+    fn content_length_rejects_overflow_underflow_and_invalid_values() {
+        let mut request = RequestHeader::build("POST", b"/", None).unwrap();
+        request.insert_header("content-length", "3").unwrap();
+        let mut length = BodyLength::new(&request).unwrap();
+        assert!(length.finish().is_err());
+        length.data(2).unwrap();
+        assert!(length.data(2).is_err());
+        length.data(1).unwrap();
+        length.finish().unwrap();
+        for invalid in ["-1", "abc", "18446744073709551616"] {
+            request.insert_header("content-length", invalid).unwrap();
+            assert!(BodyLength::new(&request).is_err());
+        }
+    }
 
     #[tokio::test]
     async fn failed_upload_cancels_pending_response_and_releases_its_state() {

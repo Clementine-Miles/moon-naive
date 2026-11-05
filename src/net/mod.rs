@@ -341,6 +341,7 @@ impl App {
                         &origin,
                         user,
                         self.egress.clone(),
+                        &self.site,
                     )?);
                     if sites.len() >= 128
                         && let Some(old) = sites.keys().next().cloned()
@@ -550,6 +551,13 @@ impl Network {
                     let tls=tls.clone();let app=app.clone();let stop=shutdown.clone();
                     tasks.spawn(async move {let _permit=permit;let _=h2::serve(socket,app,tls,stop).await;Ok(false)});
                 }
+            }
+        }
+        app.site.stop_bridge();
+        {
+            let sites = app.forwards.lock().unwrap_or_else(|e| e.into_inner());
+            for site in sites.values() {
+                site.stop_bridge();
             }
         }
         // Shared shutdown receiver tells both drivers to stop accepting streams.

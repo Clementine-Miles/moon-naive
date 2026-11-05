@@ -1,6 +1,7 @@
 //! Shared Pingora website engine. H2 enters directly; H3 uses a bounded memory bridge.
 mod bridge;
 mod forward;
+mod generation;
 mod upstream;
 pub(super) mod websocket;
 use super::{Head, Reply, Result};
@@ -28,7 +29,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::{Notify, OnceCell, mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 // Client-supplied forwarding identity is discarded before trusted values are added.
 const FORWARDED_HEADERS: &[&str] = &[
@@ -179,7 +180,7 @@ fn valid_h1_framing(raw: &[u8]) -> bool {
 type Proxy = HttpProxy<Router>;
 pub(crate) struct Site {
     proxy: Arc<Proxy>,
-    bridge: OnceCell<bridge::Bridge>,
+    bridge: generation::Generations<bridge::Bridge>,
     max_streams: u32,
     #[cfg(test)]
     stats: Arc<WebStats>,
@@ -273,7 +274,7 @@ impl Site {
         proxy.server_options = Some(options);
         Ok(Self {
             proxy: Arc::new(proxy),
-            bridge: OnceCell::new(),
+            bridge: generation::Generations::new(config.limits.max_streams),
             max_streams: config.limits.max_streams as u32,
             #[cfg(test)]
             stats,
@@ -284,6 +285,7 @@ impl Site {
         origin: &str,
         user: usize,
         egress: super::egress::Egress,
+        website: &Self,
     ) -> Result<Self> {
         let router = Router {
             config: config.website.clone(),
@@ -300,13 +302,18 @@ impl Site {
             upstream_keepalive_pool_size: 16,
             ..ServerConf::default()
         });
+        let mut bridge = generation::Generations::new(config.limits.max_streams);
+        bridge.share_shutdown(&website.bridge);
         Ok(Self {
             proxy: Arc::new(pingora_proxy::http_proxy(&conf, router)),
-            bridge: OnceCell::new(),
+            bridge,
             max_streams: config.limits.max_streams as u32,
             #[cfg(test)]
             stats: Arc::default(),
         })
+    }
+    pub fn stop_bridge(&self) {
+        self.bridge.close();
     }
     pub async fn h1(
         &self,
@@ -349,7 +356,9 @@ impl Site {
             let result: Result<()> = async {
                 let bridge = site
                     .bridge
-                    .get_or_try_init(|| bridge::Bridge::new(site.proxy.clone(), site.max_streams))
+                    .get(bridge::Bridge::healthy, || {
+                        bridge::Bridge::new(site.proxy.clone(), site.max_streams)
+                    })
                     .await?;
                 bridge
                     .exchange(
