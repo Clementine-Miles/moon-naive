@@ -1,6 +1,6 @@
 # 单文件配置、自动证书与迁移
 
-只维护一份 [config.example.toml](../config.example.toml)。三个旧示例已合并；内含中文说明、基础字段和可取消注释的高级参数。`schema_version` 默认2，仍兼容旧1/2；配置更新需要重启，证书续期和热更新自动完成。
+只维护一份 [config.example.toml](../config.example.toml)。模板包含基础字段和高级参数。`schema_version` 默认2，仍兼容旧1/2；配置更新需要重启，证书续期和热更新自动完成。
 
 ## 最短使用流程
 
@@ -82,7 +82,7 @@ H1 拒绝 CL+TE、重复/逗号合并 Content-Length、重复/非单一 chunked 
 
 `[transport] quic_congestion = "bbr2"` 使用 quiche BBRv2 与 pacing；`tcp_congestion = "bbr"` 在入站、代理拨号和网站上游 socket 上设置并读回内核 BBR。内核不支持则拒绝启动，程序不改 sysctl/qdisc，不声称内核 bbr 一定是 BBRv2。省略 transport 的兼容默认值为 cubic/system。Fast Open和0-RTT在实现中禁用；`fast_open`、`zero_rtt`旧字段已删除，运行配置拒绝它们。使用 `moon-naive config migrate old.toml new.toml` 可清除旧false字段；true或非布尔值拒绝迁移。
 
-0.6.0进一步在TCP监听前设置BBR，使尚未被accept的子连接也继承该策略。保留内核管理的收发缓冲，没有用固定SO_SNDBUF/SO_RCVBUF关闭自动调整。Linux的QUIC驱动用一个timerfd等待quiche给出的发送期限，避免毫秒计时器限制微秒级pacing；UDP阻塞时等待可写事件，64包处理额度用完后主动续调度。两种拥塞控制独立工作，均不新增空闲假流量或扩大认证前接收额度。
+程序在TCP监听前设置BBR，使尚未被accept的子连接也继承该策略。保留内核管理的收发缓冲，没有用固定SO_SNDBUF/SO_RCVBUF关闭自动调整。Linux的QUIC驱动用一个timerfd等待quiche给出的发送期限，避免毫秒计时器限制微秒级pacing；UDP阻塞时等待可写事件，64包处理额度用完后主动续调度。两种拥塞控制独立工作，均不新增空闲假流量或扩大认证前接收额度。
 
 `check-transport`额外输出新socket读回的`tcp_congestion_effective`，以及H2/H3初始流窗口、H3增长上限、连接窗口和总接收预算。`system`可能已经继承VPS启用的BBR；实际连接仍应使用`ss -tin`检查。H2初始流窗口是`min(max_early_data_bytes,max_buffer_bytes_per_stream)`，不会在认证后自动变成后者；H3根据实际读取增长，最高为后者。服务端接收窗口影响上传，客户端接收窗口影响下载。只提高服务端内存上限不能解除客户端窗口或公网瓶颈。
 
@@ -92,9 +92,9 @@ HTTP、SOCKS5 下一跳协议本身不提供 TLS；不能把本服务的入口�
 
 普通 HTTPS 正向代理的系统 CA bundle（可由 `SSL_CERT_FILE` 指定）在每个应用实例首次使用时加载并共享，更新系统根证书后重启服务。仍验证目标证书链和名称；不需要新增 TOML 字段。这与网站自己的 ACME 证书自动续期/热更新无关。
 
-0.6.0起，固定HTTPS下一跳的CA文件和TLS上下文在启动预检的阻塞工作线程上构建一次，所有目标隧道共享这份只读上下文；每次仍创建独立TLS连接并校验证书链和名称。配置了不可读或无效的下一跳CA时，本地预检直接失败。更新下一跳CA/系统根证书后需要重启，不再在每次代理建连时重读；网站ACME证书仍按原机制热更新。HTTP/SOCKS5下一跳不初始化TLS上下文。
+固定HTTPS下一跳的CA文件和TLS上下文在启动预检的阻塞工作线程上构建一次，所有目标隧道共享这份只读上下文；每次仍创建独立TLS连接并校验证书链和名称。配置了不可读或无效的下一跳CA时，本地预检直接失败。更新下一跳CA/系统根证书后需要重启，不再在每次代理建连时重读；网站ACME证书仍按原机制热更新。HTTP/SOCKS5下一跳不初始化TLS上下文。
 
-CPU加速自动使用部署主机的可用能力，无需增加TOML项。`moon-naive status` 或 `moon-naive check-transport /etc/moon-naive/config.toml` 输出架构、CPU能力和库的运行时分派方式。字节扫描采用memchr的AVX2/SSE2/通用路径，SHA-256与TLS分别保留sha2和BoringSSL的硬件检测；AVX-512检测为true不表示所有算法都会选用512位指令。说明与测量见[VPS-GUIDE.md](VPS-GUIDE.md#cpu-自动适配与延迟优化060)。
+CPU加速自动使用部署主机的可用能力，无需增加TOML项。`moon-naive status` 或 `moon-naive check-transport /etc/moon-naive/config.toml` 输出架构、CPU能力和库的运行时分派方式。字节扫描采用memchr的AVX2/SSE2/通用路径，SHA-256与TLS分别保留sha2和BoringSSL的硬件检测；AVX-512检测为true不表示所有算法都会选用512位指令。诊断命令见[部署指南](VPS-GUIDE.md#cpu-与传输诊断)。
 
 ## 兼容旧配置与安全合并
 
@@ -110,19 +110,13 @@ chown moon-naive:moon-naive /etc/moon-naive/config.v2.toml
 
 `moon-naive acme import-eab private-gcloud-export.json new-eab.toml` 仍可把 gcloud 导出转换为私有 TOML，随后将两个字段合并到主配置 `[acme.eab]`，或作为兼容文件引用。该命令不注册账户、不访问网络、不覆盖目标。Staging/production 使用分别申请的 EAB；`.dev` 浏览器需要 production 受信任证书。
 
-## 从 pinaive 迁移
+## 旧状态迁移
 
-1. 只构建/安装 `moon-naive`，停止旧 moon-naive-net 与独立 ACME 服务，更新 ExecStart 为 `moon-naive serve <config.toml>`。
-2. 更早的 JSON/纯文本凭据先转换为合法 TOML，再使用 config migrate 合并。不能仅修改扩展名。
-3. 配置目录、站点目录与 state_dir 的路径都允许自定义。可以继续指向原目录；若改为 /etc/moon-naive、/srv/moon-naive、/var/lib/moon-naive，先停旧进程，完整迁移并保持私有权限与服务用户可访问性。
-4. **保留整个旧 state_dir**，包括账户 journal、待清理 TXT、退避信息、证书 generations、CURRENT 和锁文件。更名不改变 journal namespace 或证书磁盘格式，已有账户无需重新绑定 EAB。不要清空状态以重试。
-5. 运行 check-config、check、status，确认本地设置，再启动单一服务。没有旧版实验闸门；安装步骤见 [VPS-GUIDE.md](VPS-GUIDE.md)。
-
-内部 ACME journal 继续使用 JSON，账户/订单/API 报文也遵循 ACME、Porkbun、Cloudflare 要求的 JSON；它们不是由用户编辑的运行配置。该兼容决定避免更名/配置格式调整导致账户或 DNS 清理状态丢失。历史 reports 和旧验证说明中的旧名保留原样，当前示例和命令均使用 moon-naive。
+升级时停止旧进程，保留完整 state_dir（账户、订单、TXT 清理日志和证书 CURRENT），调整所有者和权限后再启动。不要清空状态来重试签发。运行配置使用 TOML，内部 ACME journal 和 API 报文仍使用 JSON。
 
 ## 网站与反代
 
-网站仅支持固定源站反代。删除旧 `site_root`、`website.files`、`website.static_cache_secs` 字段；它们现在作为未知字段拒绝。必须配置 upstream 和 route，建议用 `/` 覆盖整个网站。源站不可达时返回普通 502，不回退到内置页面或本地文件。
+网站仅支持固定源站反代。删除旧 `site_root`、`website.files`、`website.static_cache_secs` 字段；它们现在作为未知字段拒绝。推荐填写 website.origin，由程序展开为固定 upstream 和 `/` 路由；高级配置再显式填写 upstreams/routes。源站不可达时返回普通 502，不回退到内置页面或本地文件。
 
 | 字段 | 默认 | 含义 |
 | --- | --- | --- |
@@ -180,7 +174,9 @@ strip_prefix = true
 # /api/users?limit=10 becomes /users?limit=10; unmatched paths return 404.
 ```
 
-## ECH（实验性接入，默认关闭）
+## ECH
+
+实验性接入，默认关闭。
 
 ```toml
 [ech]
@@ -210,26 +206,11 @@ retry = true
 TCP 与 QUIC 共用同一组 ECH 密钥，并在 ECH 解密后选择内部/公开名称证书。当前属于实验性服务端接入，不能称为完整无人值守 ECH。ECH 不隐藏服务器 IP、公开名称、包长、时序，也不替代内层 TLS 流量的 Padding。
 
 
-## moon-naive：与旧客户端不兼容
-
-当前采用认证协商的8/16条初期窗口及可选稀疏后段；满载读块停止附加填充，不生成空闲假流量或修改真实反代内容。预算、线格式与客户端要求见[PROTOCOL.md](PROTOCOL.md)。
-
-H1 和 TLS1.2 H2 继续提供网站。ECH 配置不决定代理记录格式；开启 ECH 也不能替代客户端证书验证。现有 TOML schema v2 与moon-naive内部认证域修订3 是不同层次。
-
-## RC4 压缩配置兼容
-
-无需新 TOML 字段。`website.compression_level` 仍控制 gzip，后端改为 Rust miniz_oxide；`0` 禁用前端动态压缩，可由真实源站提供预压缩内容。RC4 不再构建本地 Brotli/Zstandard 编码器，接受 gzip 的请求可回退到 gzip，`gzip;q=0` 不会触发 gzip，显式更偏好的 identity 保持原文。已有 Content-Encoding 的源站响应继续透传；这不是将源站的 Brotli/Zstandard 内容重新编码。新后端的 CPU、输出字节和压缩率可能变化，不能据此宣称指纹更好。
-
-## CONNECT填充协商
-
-可在同一配置文件追加`[traffic]`：`initial_records = 16`（只允许8或16）及`sparse_padding = true`。这是服务端选择偏好和允许范围；实际模式须由每条CONNECT的请求/响应证明共同确认。没有空闲假流量或反代Padding开关。完整算法及协议版本见[PROTOCOL.md](PROTOCOL.md)。
-
-
 ## 自动证书
 
 `moon-naive serve` 已集成自动 ACME：首次无有效证书时等待 DNS-01 签发，验证并安装后启动 H2/H3；随后自动续期和热更新，不再需要独立 ACME 服务。网络和控制面在同一进程的不同 runtime/线程运行。
 
-推荐 Porkbun 注册、实际由 Porkbun 权威 DNS 托管的 `.dev` 域名，使用 Google Trust Services（GTS）。配置见 [CONFIGURATION.md](CONFIGURATION.md)，部署见 [VPS-GUIDE.md](VPS-GUIDE.md)。`.dev` 浏览器访问需要正常受信任的 production 证书；staging 证书不会因此受信任。
+推荐 Porkbun 注册、实际由 Porkbun 权威 DNS 托管的 `.dev` 域名，使用 Google Trust Services（GTS）。部署见 [VPS-GUIDE.md](VPS-GUIDE.md)。`.dev` 浏览器访问需要正常受信任的 production 证书；staging 证书不会因此受信任。
 
 ### Porkbun 与 GTS
 
@@ -266,11 +247,11 @@ moon-naive acme cleanup /etc/moon-naive/config.toml
 
 `status` 本地重验已安装证书，不报告进程是否在运行。`check-ca` 只读 HTTPS directory，不创建账户或订单，不改 DNS。`once` 执行当前计划允许的一次协调，不强制提前续期；重试/无证书返回非零。`cleanup` 只重试 journal 记录的 DNS 清理。另有 `acme run` 供独立维护使用，不能与读取同一状态的 `serve` 同时运行。
 
-当前支持单机单域名、GTS/Porkbun 与 Let's Encrypt/Cloudflare。多 SAN/通配符、按需域名、分布式锁、多 CA 自动切换和 OCSP stapling 不在本版本范围。公网签发需要实际域名与私有凭据；本次本地测试不替代公网 CA/DNS 验收。
+当前支持单机单域名；Google/Let's Encrypt CA 与 Porkbun/Cloudflare DNS 独立选择。多 SAN/通配符、按需域名、分布式锁、多 CA 自动切换和 OCSP stapling 不在本版本范围。公网签发需要实际域名与私有凭据；本次本地测试不替代公网 CA/DNS 验收。
 
 ### GTS EAB 获取步骤与官方依据
 
-以下核对于2026-11-02：[Google Public CA 教程](https://cloud.google.com/certificate-manager/docs/public-ca-tutorial)、[Porkbun API 入门](https://porkbun.com/llms/guides/getting-started)、[Porkbun DNS API](https://porkbun.com/llms/dns)。还以只读 HTTPS GET 验证了 GTS production/staging directory，两者均返回 newNonce/newAccount/newOrder 和当前条款 https://pki.goog/GTS-SA.pdf；没有创建账户、订单或修改 DNS。运行时 API 基址仍为 `https://api.porkbun.com/api/json/v3`；JSON 凭据字段为 `apikey/secretapikey`，TXT 创建/检索/删除接口及所有权 notes 与当前实现对应。
+参考：[Google Public CA 教程](https://cloud.google.com/certificate-manager/docs/public-ca-tutorial)、[Porkbun API 入门](https://porkbun.com/llms/guides/getting-started)、[Porkbun DNS API](https://porkbun.com/llms/dns)。运行时 API 基址仍为 `https://api.porkbun.com/api/json/v3`；JSON 凭据字段为 `apikey/secretapikey`，TXT 创建/检索/删除接口及所有权 notes 与当前实现对应。
 
 在自己的管理机器登录 gcloud，选择 Google Cloud 项目并具备 Public CA External Account Key Creator（`roles/publicca.externalAccountKeyCreator`）等相应权限；启用 API 还需要该项目的服务启用权限。运行：
 
@@ -332,6 +313,6 @@ api_token = "REPLACE_WITH_SCOPED_API_TOKEN"
 
 ## instant-acme 账户实现
 
-ACME 协议请求（包括 EAB JWS、nonce 重试、订单和 ARI）统一由 instant-acme 处理，DNS 操作仍由内置 Porkbun 适配器完成，无 shell hooks。账户私钥在联网前持久化；遇到一次性 EAB 注册响应丢失，先用同一私钥查找既有账户，再决定是否注册。旧版仅保存 account_id/key 的日志仍可恢复。
+ACME 协议请求（包括 EAB JWS、nonce 重试、订单和 ARI）统一由 instant-acme 处理，DNS 操作由内置 Porkbun 或 Cloudflare 适配器完成，无 shell hooks。账户私钥在联网前持久化；遇到一次性 EAB 注册响应丢失，先用同一私钥查找既有账户，再决定是否注册。旧版仅保存 account_id/key 的日志仍可恢复。
 
-固定版本的 instant-acme 已随 vendor 提供。唯一 API 补丁允许使用已保存的私钥和 EAB 调用其原有注册实现，来源与差异见 vendor/instant-acme/MOON-PATCH.md。无需删除状态目录或重新申请 EAB。
+固定版本的 instant-acme 已随 vendor 提供。唯一 API 补丁允许使用已保存的私钥和 EAB 调用其原有注册实现，来源与差异见[接口补丁说明](../vendor/instant-acme/MOON-PATCH.md)。无需删除状态目录或重新申请 EAB。
