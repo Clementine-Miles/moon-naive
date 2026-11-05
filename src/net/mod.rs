@@ -6,7 +6,8 @@ mod h3;
 mod outbound;
 mod redirect;
 mod site;
-
+#[cfg(test)]
+mod tests;
 pub(crate) mod tls;
 mod tunnel;
 
@@ -176,6 +177,10 @@ pub(crate) enum Plan {
 }
 #[derive(Default)]
 pub struct Stats {
+    #[cfg(test)]
+    pub h3_driver_iterations: AtomicUsize,
+    #[cfg(test)]
+    pub h3_path_events: AtomicUsize,
     pub h2_connections: AtomicUsize,
     pub h3_connections: AtomicUsize,
     pub dials: AtomicUsize,

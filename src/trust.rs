@@ -58,3 +58,64 @@ pub(crate) fn system_ca_file() -> Option<PathBuf> {
     .find(|path| path.is_file())
     .map(Path::to_owned)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const CA: &[u8] = include_bytes!("../assets/le-staging-roots.crt");
+
+    #[tokio::test]
+    async fn roots_shared_across_clones_and_reloaded_for_new_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.crt");
+        std::fs::write(&path, CA).unwrap();
+        let roots = Roots::new(Some(path.clone()));
+        let clone = roots.clone();
+        let (a, b) = tokio::join!(roots.get(), clone.get());
+        let a = a.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&a, &b.unwrap().unwrap()));
+        std::fs::remove_file(&path).unwrap();
+        assert!(Arc::ptr_eq(&a, &roots.get().await.unwrap().unwrap()));
+        let next = Roots::new(Some(path.clone()));
+        assert!(next.get().await.is_err());
+        std::fs::write(&path, b"invalid or empty bundle").unwrap();
+        assert!(next.get().await.is_err());
+        std::fs::write(path, CA).unwrap();
+        let b = next.get().await.unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert_eq!(a[0].to_der().unwrap(), b[0].to_der().unwrap());
+    }
+
+    #[tokio::test]
+    async fn absent_bundle_leaves_tls_library_default_trust_enabled() {
+        assert!(Roots::new(None).get().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "release microbenchmark; run separately with --nocapture --test-threads=1"]
+    async fn benchmark_forward_trust_bundle() {
+        let path = system_ca_file().expect("benchmark requires system CA bundle");
+        let roots = Roots::new(Some(path.clone()));
+        let certs = roots.get().await.unwrap().unwrap();
+        let mut old = Vec::new();
+        let mut new = Vec::new();
+        for _ in 0..101 {
+            let start = std::time::Instant::now();
+            let bytes = std::fs::read(&path).unwrap();
+            let parsed = boring::x509::X509::stack_from_pem(&bytes).unwrap();
+            assert_eq!(parsed.len(), certs.len());
+            old.push(start.elapsed());
+            let start = std::time::Instant::now();
+            std::hint::black_box(roots.get().await.unwrap());
+            new.push(start.elapsed());
+        }
+        old.sort();
+        new.sort();
+        eprintln!(
+            "forward CA: old_read_parse={:?}/request new_cached={:?}/request (median, roots={}, samples=101)",
+            old[50],
+            new[50],
+            certs.len()
+        );
+    }
+}

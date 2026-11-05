@@ -9,6 +9,8 @@ pub mod manager;
 pub mod porkbun;
 pub mod state;
 pub mod store;
+#[cfg(test)]
+mod tests;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;

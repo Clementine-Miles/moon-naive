@@ -472,6 +472,159 @@ impl Config {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const SAMPLE: &str = include_str!("../../config.example.toml");
+
+    #[test]
+    fn minimal_single_file_defaults_and_partial_overrides() {
+        let c = Config::parse(SAMPLE).unwrap();
+        assert_eq!(c.schema_version, 2);
+        assert_eq!(c.state_dir, PathBuf::from("/var/lib/moon-naive"));
+        assert_eq!(c.listener.tcp, "0.0.0.0:443".parse().unwrap());
+        assert_eq!(c.listener.udp, c.listener.tcp);
+        assert!(c.listener.h1 && c.listener.h2 && c.listener.h3);
+        assert!(c.listener.http_redirect.is_none());
+        assert_eq!(c.limits.max_streams, 100);
+        assert_eq!(c.acme.dns_provider, "porkbun");
+        assert_eq!(c.acme.retry_max_secs, 21600);
+        assert_eq!(c.acme.environment, Environment::Production);
+        assert!(!c.acme.accept_terms); // Offline parsing never accepts terms on behalf of the user.
+        let c = Config::parse(&format!("{SAMPLE}\n[listener]\ntcp='127.0.0.1:8443'\nh1=false\n[limits]\nidle_timeout_secs=900\n")).unwrap();
+        assert_eq!(c.listener.tcp.port(), 8443);
+        assert_eq!(c.listener.udp.port(), 443);
+        assert!(!c.listener.h1);
+        assert_eq!(c.limits.idle_timeout_secs, 900);
+        assert_eq!(c.limits.max_streams, 100);
+    }
+    #[test]
+    fn transport_defaults_and_explicit_bbr_versions_are_unambiguous() {
+        let c = Config::parse(SAMPLE).unwrap();
+        assert_eq!(c.transport.quic_congestion, QuicCongestion::Cubic);
+        assert_eq!(c.transport.tcp_congestion, TcpCongestion::System);
+        let c = Config::parse(&format!(
+            "{SAMPLE}\n[transport]\nquic_congestion='bbr2'\ntcp_congestion='bbr'\n"
+        ))
+        .unwrap();
+        assert_eq!(c.transport.quic_congestion, QuicCongestion::Bbr2);
+        assert_eq!(c.transport.tcp_congestion, TcpCongestion::Bbr);
+        for transport in [
+            "backend='rustls-quinn'",
+            "quic_congestion='bbr'",
+            "quic_congestion='bbr3'",
+            "tcp_congestion='quic-bbr'",
+            "typo=true",
+        ] {
+            assert!(Config::parse(&format!("{SAMPLE}\n[transport]\n{transport}")).is_err());
+        }
+    }
+    #[test]
+    fn receive_window_budget_defaults_and_cannot_underfund_one_connection() {
+        let mut c = Config::parse(SAMPLE).unwrap();
+        assert_eq!(c.limits.max_total_receive_bytes, 64 * 1024 * 1024);
+        c.limits.max_total_receive_bytes = 1024;
+        assert!(c.validate().is_err());
+        c.limits.max_total_receive_bytes = 2 * 1024 * 1024 * 1024;
+        assert!(c.validate().is_err());
+    }
+    #[test]
+    fn google_directory_selection_and_porkbun_zone_boundaries() {
+        let mut c = Config::parse(SAMPLE).unwrap();
+        assert_eq!(
+            c.acme.directory(),
+            "https://dv.acme-v02.api.pki.goog/directory"
+        );
+        c.acme.environment = Environment::Staging;
+        assert_eq!(
+            c.acme.directory(),
+            "https://dv.acme-v02.test-api.pki.goog/directory"
+        );
+        c.domain = "example.dev".into();
+        assert!(c.validate().is_ok());
+        for domain in ["badexample.dev", "proxy.other.dev"] {
+            c.domain = domain.into();
+            assert!(c.validate().is_err());
+        }
+        c.domain = "proxy.example.dev".into();
+        c.acme.eab = None;
+        assert!(c.validate().is_err());
+        c.acme.eab_credentials_file = Some("relative.toml".into());
+        assert!(c.validate().is_err());
+    }
+    #[test]
+    fn offline_validation_checks_credentials_and_ca_without_exposing_secrets() {
+        let mut c = Config::parse(SAMPLE).unwrap();
+        c.acme.eab.as_mut().unwrap().b64_mac_key = "not!base64-secret".into();
+        assert_eq!(c.validate(), Err("invalid EAB base64url MAC key"));
+        assert!(!format!("{c:?}").contains("not!base64-secret"));
+        c.acme.eab = None;
+        c.acme.issuer = Issuer::Letsencrypt;
+        c.acme.dns_provider = "typo".into();
+        assert!(c.validate().is_err());
+        c.acme.dns_provider = "cloudflare".into();
+        c.acme.dns_credentials = Some(DnsCredentials {
+            api_token: Some("test-token".into()),
+            apikey: None,
+            secretapikey: None,
+        });
+        assert!(c.validate().is_err());
+        c.acme.dns_zone_id = Some("0123456789abcdef0123456789abcdef".into());
+        assert!(c.validate().is_ok());
+        for url in [
+            "http://ca.test/dir",
+            "https://",
+            "https://user:pass@ca.test/dir",
+            "https://ca.test:0/dir",
+        ] {
+            c.acme.directory_url = Some(url.into());
+            assert!(c.validate().is_err());
+        }
+    }
+    #[test]
+    fn omitted_issuer_preserves_legacy_letsencrypt_default() {
+        let c = Config::parse(&SAMPLE.replace("issuer = \"google\"", "")).unwrap();
+        assert_eq!(c.acme.issuer, Issuer::Letsencrypt);
+        assert_eq!(
+            c.acme.directory(),
+            "https://acme-v02.api.letsencrypt.org/directory"
+        );
+    }
+    #[test]
+    fn rejects_unknown_keys_retired_toggles_and_unbounded_settings() {
+        for extra in [
+            "[listener]\nh2=false",
+            "[listener]\nh3=false",
+            "[listener]\nfast_open=false",
+            "[listener]\nzero_rtt=true",
+            "[limits]\nmax_streams=0",
+            "[limits]\nmax_streams=99999",
+            "[limits]\nidle_timeout_sec=10",
+        ] {
+            assert!(
+                Config::parse(&format!("{SAMPLE}\n{extra}")).is_err(),
+                "{extra}"
+            );
+        }
+        for field in [
+            "unexpected=true",
+            "state_dir='relative'",
+            "state_dir=''",
+            "schema_version=99",
+            "credentials_file='/etc/users.toml'",
+        ] {
+            assert!(Config::parse(&format!("{field}\n{SAMPLE}")).is_err());
+        }
+        for field in [
+            "enabled=false",
+            "challenge='http-01'",
+            "challenge='tls-alpn-01'",
+        ] {
+            assert!(Config::parse(&SAMPLE.replace("[acme]", &format!("[acme]\n{field}"))).is_err());
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct Proxy {
@@ -643,5 +796,36 @@ impl TransportProfile {
     }
     pub fn quic_congestion(&self) -> QuicCongestion {
         self.quic_congestion
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    const SAMPLE: &str = include_str!("../../config.example.toml");
+    #[test]
+    fn shared_values_follow_config_and_connection_credit_is_capped() {
+        let config = Config::parse(SAMPLE).unwrap();
+        let profile = TransportProfile::from_config(&config).unwrap();
+        assert_eq!(profile.idle_timeout_ms(), 600_000);
+        assert_eq!(profile.max_streams(), 100);
+        assert_eq!(profile.stream_window(), 262_144);
+        assert_eq!(profile.connection_window(), 16 * 1024 * 1024);
+        let config = Config::parse(&format!("{SAMPLE}\n[limits]\nmax_streams=1\n")).unwrap();
+        assert_eq!(
+            TransportProfile::from_config(&config)
+                .unwrap()
+                .connection_window(),
+            262_144
+        );
+    }
+    #[test]
+    fn unsupported_transport_values_are_rejected() {
+        let mut config = Config::parse(SAMPLE).unwrap();
+        config.limits.idle_timeout_secs = u64::MAX;
+        assert!(TransportProfile::from_config(&config).is_err());
+        config.limits.idle_timeout_secs = 600;
+        config.limits.max_streams = usize::MAX;
+        assert!(TransportProfile::from_config(&config).is_err());
     }
 }

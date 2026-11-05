@@ -181,6 +181,8 @@ pub(crate) struct Site {
     proxy: Arc<Proxy>,
     bridge: OnceCell<bridge::Bridge>,
     max_streams: u32,
+    #[cfg(test)]
+    stats: Arc<WebStats>,
 }
 pub(super) enum Input {
     Data(Bytes),
@@ -273,6 +275,8 @@ impl Site {
             proxy: Arc::new(proxy),
             bridge: OnceCell::new(),
             max_streams: config.limits.max_streams as u32,
+            #[cfg(test)]
+            stats,
         })
     }
     pub(super) fn forward(
@@ -300,6 +304,8 @@ impl Site {
             proxy: Arc::new(pingora_proxy::http_proxy(&conf, router)),
             bridge: OnceCell::new(),
             max_streams: config.limits.max_streams as u32,
+            #[cfg(test)]
+            stats: Arc::default(),
         })
     }
     pub async fn h1(
@@ -372,6 +378,10 @@ impl Site {
             task,
             completion,
         }
+    }
+    #[cfg(test)]
+    pub fn stats(&self) -> &Arc<WebStats> {
+        &self.stats
     }
 }
 fn request_header(head: &Head) -> Result<RequestHeader> {

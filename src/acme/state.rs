@@ -195,3 +195,33 @@ pub fn write_private_new(destination: &Path, bytes: &[u8]) -> Result<()> {
     fs::remove_file(&temporary)?;
     result
 }
+
+#[cfg(test)]
+mod private_toml_tests {
+    use super::*;
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Token {
+        api_token: String,
+    }
+    #[test]
+    fn strict_toml_and_errors_never_include_secret_source() {
+        assert_eq!(
+            parse_toml::<Token>(b"api_token = 'private-value'")
+                .unwrap()
+                .api_token,
+            "private-value"
+        );
+        for input in [
+            b"{\"api_token\":\"private-value\"}".as_slice(),
+            b"api_token = 'private-value'\nextra = true",
+            b"api_token = 'private-value'\napi_token = 'duplicate-secret'",
+            b"api_token = 'private-value",
+            b"api_token = '\xff'",
+        ] {
+            let error = parse_toml::<Token>(input).err().unwrap().to_string();
+            assert!(!error.contains("private-value"));
+            assert!(!error.contains("duplicate-secret"));
+        }
+    }
+}

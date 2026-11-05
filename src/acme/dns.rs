@@ -337,3 +337,164 @@ pub async fn authoritative_txt(server: SocketAddr, name: &str, value: &str) -> R
     .await
     .map_err(|_| -> super::Error { "authoritative DNS query timed out".into() })?
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acme::tests::http_server;
+    use bytes::Bytes;
+    use http_body_util::Full;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[tokio::test]
+    async fn authoritative_txt_checks_transaction_before_tcp_and_validates_fallback() {
+        use hickory_proto::rr::{DNSClass, Record, rdata::TXT};
+        for case in 0..8 {
+            let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = tcp.local_addr().unwrap();
+            let udp = UdpSocket::bind(address).await.unwrap();
+            let server = tokio::spawn(async move {
+                let mut buffer = [0u8; 4096];
+                let (n, peer) = udp.recv_from(&mut buffer).await.unwrap();
+                let query = Message::from_vec(&buffer[..n]).unwrap();
+                assert!(!query.recursion_desired);
+                assert_eq!(query.queries.len(), 1);
+                let mut reply = Message::response(query.id, OpCode::Query);
+                reply.metadata.authoritative = true;
+                reply.add_queries(query.queries.clone());
+                reply.answers.push(Record::from_rdata(
+                    Name::from_ascii("_acme-challenge.example.test.").unwrap(),
+                    30,
+                    RData::TXT(TXT::new(vec!["test-".into(), "token".into()])),
+                ));
+                if case == 2 {
+                    reply.metadata.id = reply.id.wrapping_add(1);
+                }
+                if case == 3 {
+                    reply.metadata.op_code = OpCode::Update;
+                }
+                if case == 4 {
+                    reply.queries.clear();
+                }
+                if case == 5 {
+                    reply.metadata.authoritative = false;
+                }
+                if case == 6 {
+                    reply.answers[0].dns_class = DNSClass::CH;
+                }
+                reply.metadata.truncation = matches!(case, 1..=4 | 7);
+                udp.send_to(&reply.to_vec().unwrap(), peer).await.unwrap();
+                if case == 1 || case == 7 {
+                    let (mut stream, _) =
+                        tokio::time::timeout(Duration::from_secs(2), tcp.accept())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    let n = stream.read_u16().await.unwrap() as usize;
+                    stream.read_exact(&mut buffer[..n]).await.unwrap();
+                    assert_eq!(Message::from_vec(&buffer[..n]).unwrap().id, query.id);
+                    reply.metadata.truncation = case == 7;
+                    let bytes = reply.to_vec().unwrap();
+                    stream.write_u16(bytes.len() as u16).await.unwrap();
+                    stream.write_all(&bytes).await.unwrap();
+                } else {
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(50), tcp.accept())
+                            .await
+                            .is_err(),
+                        "invalid transaction triggered TCP fallback"
+                    );
+                }
+            });
+            assert_eq!(
+                authoritative_txt(address, "_acme-challenge.example.test", "test-token")
+                    .await
+                    .unwrap(),
+                case <= 1,
+                "case {case}"
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn uncertain_create_recovers_by_marker_and_preserves_foreign_txt() {
+        let foreign = json!({"id":"11111111111111111111111111111111","name":"_acme-challenge.example.test",
+            "type":"TXT","content":"foreign-value","comment":"another application"});
+        let records = Arc::new(Mutex::new(vec![foreign.clone()]));
+        let posts = Arc::new(AtomicUsize::new(0));
+        let server=http_server({let records=records.clone();let posts=posts.clone();move |request| {
+            let records=records.clone();let posts=posts.clone();async move {
+                let path=request.uri().path();
+                let mut status=200;
+                let result=if path.ends_with("/dns_records") {
+                    if request.method()==http::Method::POST {
+                        let mut record:Value=serde_json::from_slice(request.body()).unwrap();
+                        record["id"]=json!("22222222222222222222222222222222");
+                        records.lock().unwrap().push(record.clone());
+                        if posts.fetch_add(1,Ordering::Relaxed)==0 {status=500;}
+                        json!({"success":true,"result":record})
+                    } else {json!({"success":true,"result":*records.lock().unwrap(),"result_info":{"total_pages":1}})}
+                } else if request.method()==http::Method::DELETE {
+                    let id=path.rsplit('/').next().unwrap();
+                    records.lock().unwrap().retain(|record|record["id"]!=id);
+                    json!({"success":true,"result":{"id":id}})
+                } else {json!({"success":true,"result":{"name":"example.test","name_servers":["localhost"]}})};
+                http::Response::builder().status(status).body(Full::new(Bytes::from(serde_json::to_vec(&result).unwrap()))).unwrap()
+            }
+        }}).await;
+        let http = Http::new(None, Duration::from_secs(5))
+            .unwrap()
+            .with_loopback_http();
+        let make_provider = || {
+            let mut provider =
+                Cloudflare::new(http.clone(), &"a".repeat(32), "test-token".into()).unwrap();
+            provider.api_base = server.url.clone();
+            provider
+        };
+        let mut lease = Lease {
+            name: "_acme-challenge.example.test".into(),
+            value: "own-value".into(),
+            marker: "moon-naive-acme-test-unique".into(),
+            record_id: None,
+            borrowed: false,
+        };
+        let mut provider = make_provider();
+        assert!(provider.present(&mut lease).await.is_err()); // DNS write happened; response failed.
+        assert!(lease.record_id.is_none());
+        let mut recovered = make_provider();
+        recovered.present(&mut lease).await.unwrap();
+        assert_eq!(posts.load(Ordering::Relaxed), 1); // No duplicate POST after restart.
+        recovered.cleanup(&lease).await.unwrap();
+        recovered.cleanup(&lease).await.unwrap(); // Idempotent cleanup.
+        assert_eq!(*records.lock().unwrap(), [foreign]);
+        lease.value = "foreign-value".into();
+        lease.record_id = None;
+        recovered.present(&mut lease).await.unwrap();
+        assert!(lease.borrowed);
+        recovered.cleanup(&lease).await.unwrap();
+        assert_eq!(records.lock().unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn provider_retry_after_is_preserved() {
+        let server = http_server(|_| async {
+            http::Response::builder()
+                .status(429)
+                .header("Retry-After", "120")
+                .body(Full::new(Bytes::from_static(b"{}")))
+                .unwrap()
+        })
+        .await;
+        let http = Http::new(None, Duration::from_secs(5))
+            .unwrap()
+            .with_loopback_http();
+        let mut provider =
+            Cloudflare::new(http.clone(), &"a".repeat(32), "test-token".into()).unwrap();
+        provider.api_base = server.url.clone();
+        assert!(provider.api("GET", "", None).await.is_err());
+        assert!(http.retry_after.load(Ordering::Relaxed) >= crate::acme::now() + 119);
+    }
+}

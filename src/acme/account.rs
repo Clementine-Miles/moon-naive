@@ -97,3 +97,34 @@ impl AccountClient {
         Ok(account)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn account_key_must_be_durable_before_any_registration_request() {
+        let client = AccountClient {
+            http: Http::new(None, Duration::from_millis(100)).unwrap(),
+            contact: "operator@example.test".into(),
+            eab_file: None,
+            eab_inline: None,
+        };
+        let mut journal = Journal {
+            directory: "https://invalid.invalid/directory".into(),
+            ..Journal::default()
+        };
+        let mut persisted = false;
+        let result = client
+            .restore_or_create(&mut journal, |state| {
+                assert!(!state.account_key.is_empty());
+                assert!(state.account.is_none());
+                persisted = true;
+                Err("simulated disk failure".into())
+            })
+            .await;
+        assert!(persisted);
+        assert_eq!(result.err().unwrap().to_string(), "simulated disk failure");
+    }
+}

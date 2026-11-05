@@ -282,3 +282,170 @@ async fn socks(stream: &mut Stream, config: &ProxyUpstream, target: SocketAddr) 
     stream.read_exact(&mut rest).await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fragmented<'a> {
+        bytes: &'a [u8],
+        size: usize,
+        reads: usize,
+    }
+    impl AsyncRead for Fragmented<'_> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            this.reads += 1;
+            let n = this.size.min(this.bytes.len()).min(buf.remaining());
+            buf.put_slice(&this.bytes[..n]);
+            this.bytes = &this.bytes[n..];
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn fragmented_informational_headers_preserve_binary_tunnel_prefix() {
+        let wire = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nX: y\r\n\r\nHTTP/1.0 200 OK\r\n\r\n\x00\xffHTTP/1.1\r\n\r\ndata";
+        for size in [1, 2, 3, 4, 7, 64, 2048] {
+            let mut stream = Fragmented {
+                bytes: wire,
+                size,
+                reads: 0,
+            };
+            let mut payload = response(&mut stream).await.unwrap().to_vec();
+            stream.read_to_end(&mut payload).await.unwrap();
+            assert_eq!(&payload, b"\x00\xffHTTP/1.1\r\n\r\ndata", "chunk={size}");
+        }
+    }
+
+    #[tokio::test]
+    async fn response_limits_rejections_and_eof_remain_bounded() {
+        for wire in [
+            b"HTTP/1.1 407 Authentication required\r\n\r\n".as_slice(),
+            b"HTTP/1.1 101 Switching Protocols\r\n\r\n",
+            b"HTTP/2 200 OK\r\n\r\n",
+            b"HTTP/1.1 2xx Invalid\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\n",
+            b"",
+        ] {
+            assert!(response(&mut &wire[..]).await.is_err());
+        }
+        let final_head = b"HTTP/1.1 200 OK\r\nX: ";
+        for len in [32767, 32768, 32769] {
+            let mut wire = final_head.to_vec();
+            wire.resize(len - 4, b'a');
+            wire.extend_from_slice(b"\r\n\r\n");
+            assert_eq!(response(&mut wire.as_slice()).await.is_ok(), len <= 32768);
+        }
+        for count in [7, 8] {
+            let mut wire = b"HTTP/1.1 100 Continue\r\n\r\n".repeat(count);
+            wire.extend_from_slice(b"HTTP/1.1 200 OK\r\n\r\n");
+            assert_eq!(response(&mut wire.as_slice()).await.is_ok(), count < 8);
+        }
+        let mut wire = b"HTTP/1.1 100 Continue\r\nX: ".to_vec();
+        wire.resize(32760, b'a');
+        wire.extend_from_slice(b"\r\n\r\nHTTP/1.1 200 OK\r\n\r\n");
+        assert!(response(&mut wire.as_slice()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn large_header_uses_chunk_reads_instead_of_per_byte_reads() {
+        let mut wire = b"HTTP/1.1 200 OK\r\nX: ".to_vec();
+        wire.resize(8188, b'a');
+        wire.extend_from_slice(b"\r\n\r\n");
+        let mut stream = Fragmented {
+            bytes: &wire,
+            size: usize::MAX,
+            reads: 0,
+        };
+        assert!(response(&mut stream).await.unwrap().is_empty());
+        assert_eq!(stream.reads, 4);
+    }
+
+    #[tokio::test]
+    async fn response_delimiters_cross_vector_and_read_boundaries_without_losing_payload() {
+        for length in [30, 31, 32, 33, 63, 64, 65, 2047, 2048, 2049, 8192, 32768] {
+            let mut wire = b"HTTP/1.1 200 OK\r\nX: ".to_vec();
+            wire.resize(length - 4, b'a');
+            wire.extend_from_slice(b"\r\n\r\n");
+            let payload = b"\0\xff\r\n\r\nnext protocol";
+            wire.extend_from_slice(payload);
+            for size in [1, 15, 16, 31, 32, 2047, 2048, 2049] {
+                let mut stream = Fragmented {
+                    bytes: &wire,
+                    size,
+                    reads: 0,
+                };
+                let mut bytes = response(&mut stream).await.unwrap().to_vec();
+                stream.read_to_end(&mut bytes).await.unwrap();
+                assert_eq!(bytes, payload, "header={length}, fragment={size}");
+            }
+        }
+    }
+
+    /// Actual loopback TCP IO; old parser below is the pre-optimization byte loop.
+    #[tokio::test]
+    #[ignore = "release microbenchmark; run separately with --nocapture --test-threads=1"]
+    async fn benchmark_connect_response_reads() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let socket = TcpStream::connect(address).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        socket.set_nodelay(true).unwrap();
+        peer.set_nodelay(true).unwrap();
+        let mut stream = Stream::Plain(socket);
+        let mut wire = b"HTTP/1.1 200 OK\r\nX: ".to_vec();
+        wire.resize(8188, b'a');
+        wire.extend_from_slice(b"\r\n\r\n");
+        let mut old = Vec::new();
+        let mut new = Vec::new();
+        for _ in 0..31 {
+            peer.write_all(&wire).await.unwrap();
+            let start = std::time::Instant::now();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                header.push(stream.read_u8().await.unwrap());
+            }
+            old.push(start.elapsed());
+            assert_eq!(header, wire);
+            peer.write_all(&wire).await.unwrap();
+            let start = std::time::Instant::now();
+            assert!(response(&mut stream).await.unwrap().is_empty());
+            new.push(start.elapsed());
+        }
+        old.sort();
+        new.sort();
+        eprintln!(
+            "CONNECT response: old_byte_reads={:?} new_chunk_reads={:?} (median, 8192 header bytes, samples=31, loopback TCP)",
+            old[15], new[15]
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "release latency benchmark; run separately with --nocapture --test-threads=1"]
+    async fn benchmark_header_scan() {
+        const ITERATIONS: usize = 10_000;
+        for length in [128, 8192, 32768] {
+            let mut wire = b"HTTP/1.1 200 OK\r\nX: ".to_vec();
+            wire.resize(length - 4, b'a');
+            wire.extend_from_slice(b"\r\n\r\n");
+            let start = std::time::Instant::now();
+            for _ in 0..ITERATIONS {
+                let mut stream = Fragmented {
+                    bytes: std::hint::black_box(&wire),
+                    size: 2048,
+                    reads: 0,
+                };
+                assert!(std::hint::black_box(response(&mut stream).await.unwrap()).is_empty());
+            }
+            let nanos = start.elapsed().as_secs_f64() * 1_000_000_000. / ITERATIONS as f64;
+            eprintln!(
+                "PERF {{\"case\":\"header_scan\",\"bytes\":{length},\"iterations\":{ITERATIONS},\"ns_per_response\":{nanos}}}"
+            );
+        }
+    }
+}

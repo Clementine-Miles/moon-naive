@@ -433,3 +433,20 @@ fn h3_settings(
     // 0-RTT stays disabled. H2 applies the same profile in its driver.
     Ok(config)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exercise the actual boring/quiche ABI and link, not a dependency-tree
+    /// assertion. This does not open a listener or test a QUIC handshake.
+    #[test]
+    fn shared_profile_constructs_a_real_quiche_config() {
+        let config =
+            moon_naive_core::config::Config::parse(include_str!("../../config.example.toml"))
+                .unwrap();
+        let profile = TransportProfile::from_config(&config).unwrap();
+        let builder = boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls()).unwrap();
+        let _config = h3_settings(builder, &profile).unwrap();
+    }
+}
