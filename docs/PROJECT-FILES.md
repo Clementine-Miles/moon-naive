@@ -1,6 +1,6 @@
 # 项目结构与文件作用
 
-0.6.0：三个Cargo包，服务端代码集中在src，协议核心在core，构建工具在xtask。协议线格式保持dev.3修订4，客户端要求不变。
+0.7.0：三个Cargo包，服务端代码集中在src，协议核心在core，构建工具在tools/xtask。协议线格式保持dev.3修订4，客户端要求不变。
 
 ```text
 Cargo.toml / Cargo.lock
@@ -8,10 +8,8 @@ src/              主服务端库、CLI、运行时
   acme/           DNS-01、证书验证/持久化、续期
   net/            H2/H3、拨号、TLS、隧道
     site/         Pingora反代与高级协议
-    tests/        真实网络回归测试
 core/src/         配置、认证、记录codec、分流、策略与网站模型
-xtask/            审计、构建、打包、验证
-tests/           CLI与Pebble集成测试
+tools/xtask/      审计、构建、打包、验证
 assets/           公共staging CA证书
 config.example.toml  唯一中文单文件配置模板
 deploy/           systemd、OpenRC、构建容器
@@ -22,7 +20,7 @@ vendor/pingora/   固定上游与审计过的本地补丁
 
 | 文件 | 作用 |
 | --- | --- |
-| `.cargo/config.toml` | Cargo 使用 Git CLI 获取固定上游；不引用相邻 checkout。 |
+| `.cargo/config.toml` | Cargo Git 获取配置及 cargo xtask 命令别名。 |
 | `.dockerignore` | 排除构建缓存、私有配置、状态和凭据，避免进入 Docker build context。 |
 | `.gitignore` | 排除 target/dist/reports、运行状态和真实秘密文件。 |
 | `Cargo.lock` | 唯一依赖锁；固定 registry 版本及 Pingora/quiche/instant-acme Git revision。 |
@@ -70,7 +68,6 @@ vendor/pingora/   固定上游与审计过的本地补丁
 | `src/acme/porkbun.rs` | Porkbun v3 DNS-01 provider：zone/委派校验、TXT 所有权标记、创建不确定后的恢复和精确清理。 |
 | `src/acme/state.rs` | 私有 TOML 读取/脱敏解析、ACME 写前日志、0600/0700 权限、kernel 单写锁、原子 journal 保存和跨环境清理约束。 |
 | `src/acme/store.rs` | 证书generation、私有权限、writer锁、fsync、CURRENT原子提交与恢复。 |
-| `src/acme/tests.rs` | ACME/HTTP/EAB/provider/证书校验/持久恢复等单元与本地网络回归。 |
 | `src/cli.rs` | serve/check/check-config/check-transport/status/acme 子命令、config init和一次性配置迁移（含剔除旧false开关）、配置大小限制、信号注册。 |
 | `src/lib.rs` | 主服务端模块入口；不再导出未使用的TLS/ACME包装函数。 |
 | `src/main.rs` | 程序入口，由根 Cargo 包构建；统一 CLI、Tokio runtime 与脱敏退出。 |
@@ -87,25 +84,16 @@ vendor/pingora/   固定上游与审计过的本地补丁
 | `src/net/site/upstream.rs` | 管理员固定上游池、异步 DNS 缓存、HTTPS 身份校验、池隔离、轮询/被动冷却/有限回退。 |
 | `src/net/site/websocket.rs` | H2/H3 扩展 CONNECT 到固定网站 H1 Upgrade，校验握手并保留预读数据。 |
 | `src/net/tests.rs` | 真实 H2/H3 网络、认证/ACL、Padding/半关闭、早到数据、背压、取消、热换证等回归。 |
-| `src/net/tests/browser.rs` | 显式启用真实 Chromium，观察 Alt-Svc 后 H3 以及 UDP 不可达时 H2 回退。 |
-| `src/net/tests/evolution.rs` | H1 网站/无 ALPN/无拨号、单跳代理、H2/H3 转发、WebSocket、103/trailers 与跳转回归。 |
-| `src/net/tests/official.rs` | 显式启用的官方旧客户端 H2/H3 认证降级拒绝测试；默认 ignored，需 NAIVE_BIN。 |
-| `src/net/tests/capture.rs` | 显式启用的四种自签CA证书夹具，网站/认证失败/8或16条及稀疏填充/内层TLS、复用/空闲/大文件断言；支持实验UDP中继、传输计时、双工长通道及资源采样。 |
-| `src/net/tests/website.rs` | 反代/Range/gzip/实时变更、H1/H2 上游池复用、HTTPS 身份、失败回退、trailers 和取消测试。 |
 | `src/net/tls.rs` | BoringSSL与quiche配置、证书/ECH加载和热更新。 |
 | `src/net/tunnel.rs` | H2/H3 共用的拥有缓冲区的下载读取、上传解码、Padding 生命周期与双向空闲截止时间；保留背压、半关闭及取消语义。 |
 | `src/runtime.rs` | 整合单进程生命周期：预检、专用 ACME 线程、首次证书就绪门禁、双监听、systemd notify、排空与清理。 |
 | `src/trust.rs` | 定位各发行版 CA bundle；普通 HTTPS 正向代理按应用实例延迟加载/共享解析结果，含缓存回归和微基准；可用 SSL_CERT_FILE 指定。 |
-| `tests/acme_pebble.rs` | 需外部 Pebble/challtestsrv 的集成测试；首次自动签发后监听、真实 H2 网站、停止/续期/EAB 恢复。 |
-| `tests/cli.rs` | 实际二进制参数/配置/脱敏及首次签发中 SIGTERM 回归。 |
-| `xtask/Cargo.toml` | Rust 开发/验证/打包工具依赖；不是常驻服务依赖。 |
-| `xtask/build-support/musl-host-rustc.rs` | Alpine rustc wrapper：只把 host build script/proc-macro 改为动态 CRT，保留目标静态链接。 |
-| `xtask/src/audit.rs` | 固定 Git 来源审计、Cargo metadata、构建依赖图检查的辅助实现。 |
-| `xtask/src/main.rs` | verify/soak/audit-native/dist/source/test-artifacts/platform-smoke 调度与本地报告保存。 |
-| `xtask/src/release.rs` | Rust goblin ELF 检查、依赖/许可清单、tar/flate2 规范化归档与 SHA-256；三发行版固定镜像运行检查。 |
+| `tools/xtask/Cargo.toml` | Rust 开发/验证/打包工具依赖；不是常驻服务依赖。 |
+| `tools/xtask/build-support/musl-host-rustc.rs` | Alpine rustc wrapper：只把 host build script/proc-macro 改为动态 CRT，保留目标静态链接。 |
+| `tools/xtask/src/audit.rs` | 固定 Git 来源审计、Cargo metadata、构建依赖图检查的辅助实现。 |
+| `tools/xtask/src/main.rs` | verify/audit-native/check-elf/dist/source/platform-smoke 调度与本地报告保存。 |
+| `tools/xtask/src/release.rs` | Rust goblin ELF 检查、依赖/许可清单、tar/flate2 规范化归档与 SHA-256；三发行版固定镜像运行检查。 |
 
 未使用的control控制器/调度器、core隧道/ALPN模型和包装接口已删除；真实ACME Manager、事务存储与TLS热更新保留。原profile和limits文件分别归入config与policy。源码审计、打包与文档路径同步更新。
 
 不合并第三方vendor文件，不把所有网络模块拼成单文件；异步状态机、HTTP边界和证书事务仍有清晰职责。target/reports/dist与外部fd/zoxide/Chromium源码属于生成物或参考材料，不进入服务端运行依赖。
-
-`tools/packet-lab/`提供可选抓包、完整性分析和OpenGFW离线适配器源码；其Go/Python工具不参与生产服务端构建。`docs/packet-lab-results.json`记录本轮脱敏测量摘要。抓包、密钥、工具二进制和构建缓存不包含在源码包。

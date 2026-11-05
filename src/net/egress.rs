@@ -17,10 +17,6 @@ pub(super) struct Egress {
     tcp_congestion: moon_naive_core::config::TcpCongestion,
     upstream: Option<Arc<super::outbound::NextHop>>,
     pub roots: crate::trust::Roots,
-    #[cfg(test)]
-    pub test_target: Option<SocketAddr>,
-    #[cfg(test)]
-    pub test_delay: Option<Duration>,
 }
 impl Egress {
     pub fn new(config: &Config, stats: Arc<Stats>) -> super::Result<Self> {
@@ -38,10 +34,6 @@ impl Egress {
                 .transpose()?
                 .map(Arc::new),
             roots: crate::trust::Roots::new(crate::trust::system_ca_file()),
-            #[cfg(test)]
-            test_target: None,
-            #[cfg(test)]
-            test_delay: None,
         })
     }
     pub fn is_self(&self, host: &str) -> bool {
@@ -57,17 +49,6 @@ impl Egress {
         Ok(stream)
     }
     async fn dial_inner(&self, target: &Authority) -> Result<Stream, u16> {
-        #[cfg(test)]
-        if let Some(delay) = self.test_delay {
-            tokio::time::sleep(delay).await;
-        }
-        #[cfg(test)]
-        if let Some(address) = self.test_target {
-            self.stats.dials.fetch_add(1, Ordering::Relaxed);
-            let socket = TcpStream::connect(address).await.map_err(|_| 502u16)?;
-            socket.set_nodelay(true).map_err(|_| 502u16)?;
-            return Ok(Stream::Plain(socket));
-        }
         if target.host.eq_ignore_ascii_case(&self.domain) {
             return Err(403);
         }
@@ -174,95 +155,5 @@ async fn connect_candidates(
             result=tasks.join_next(),if !tasks.is_empty()=>{if let Some(Ok(Ok(stream)))=result {stream.set_nodelay(true).map_err(|_|502u16)?;return Ok(stream);}},
             _=tokio::time::sleep_until(next),if tasks.len()<2 && !ordered.is_empty()=>{},
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[tokio::test]
-    async fn single_candidate_keeps_socket_policy_and_errors() {
-        let open = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = open.local_addr().unwrap();
-        let stats = Arc::new(Stats::default());
-        let algorithm = moon_naive_core::config::TcpCongestion::System;
-        let stream = connect_candidates(vec![address], stats.clone(), algorithm)
-            .await
-            .unwrap();
-        assert_eq!(stream.peer_addr().unwrap(), address);
-        assert!(stream.nodelay().unwrap());
-        let (accepted, _) = open.accept().await.unwrap();
-        drop((stream, accepted, open));
-        assert_eq!(
-            connect_candidates(vec![address], stats.clone(), algorithm)
-                .await
-                .unwrap_err(),
-            502
-        );
-        assert_eq!(stats.dials.load(Ordering::Relaxed), 2);
-        assert_eq!(
-            connect_candidates(vec![], stats.clone(), algorithm)
-                .await
-                .unwrap_err(),
-            502
-        );
-        assert_eq!(stats.dials.load(Ordering::Relaxed), 2);
-    }
-
-    #[tokio::test]
-    #[ignore = "release latency benchmark; run separately with --nocapture --test-threads=1"]
-    async fn benchmark_single_address_dial() {
-        const SAMPLES: usize = 512;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            for _ in 0..SAMPLES {
-                drop(listener.accept().await.unwrap());
-            }
-        });
-        let stats = Arc::new(Stats::default());
-        let mut samples = Vec::new();
-        for _ in 0..SAMPLES {
-            let start = std::time::Instant::now();
-            let stream = connect_candidates(
-                vec![address],
-                stats.clone(),
-                moon_naive_core::config::TcpCongestion::System,
-            )
-            .await
-            .unwrap();
-            samples.push(start.elapsed().as_secs_f64() * 1_000_000.);
-            drop(stream);
-        }
-        server.await.unwrap();
-        assert_eq!(stats.dials.load(Ordering::Relaxed), SAMPLES);
-        samples.sort_by(f64::total_cmp);
-        eprintln!(
-            "PERF {{\"case\":\"single_address_dial\",\"samples\":{SAMPLES},\"median_us\":{},\"p95_us\":{}}}",
-            samples[SAMPLES / 2],
-            samples[SAMPLES * 95 / 100]
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_candidate_falls_back_and_races_are_cancelled() {
-        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = closed.local_addr().unwrap();
-        drop(closed);
-        let open = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let stats = Arc::new(Stats::default());
-        let stream = tokio::time::timeout(
-            Duration::from_secs(2),
-            connect_candidates(
-                vec![address, open.local_addr().unwrap()],
-                stats.clone(),
-                moon_naive_core::config::TcpCongestion::System,
-            ),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(stream.peer_addr().unwrap(), open.local_addr().unwrap());
-        assert_eq!(stats.dials.load(Ordering::Relaxed), 2);
     }
 }

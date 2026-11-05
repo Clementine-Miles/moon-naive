@@ -22,10 +22,14 @@ cargo build --release --locked -p moon-naive
 
 配置文件权限须为 `0600`，父目录须已存在。默认监听 TCP/UDP 443；首次运行自动申请证书，网站请求转发至配置的源站。
 
+## 开发工具
+
+构建使用 Cargo；审计和源码打包统一使用 `cargo xtask audit-native`、`cargo xtask source dist`。Rust 工具位于 `tools/xtask/`。BoringSSL 仍需要上述 C/C++ 工具链，普通构建无需 Python、Go 或 Docker；同平台重复构建可[复用 BoringSSL](docs/VPS-GUIDE.md#复用-boringssl避免重复调用-cmake)，避免再次调用 CMake。
+
 ## 文档
 
 - [配置与证书](docs/CONFIGURATION.md) · [VPS 部署](docs/VPS-GUIDE.md)
 - [协议](docs/PROTOCOL.md) · [架构](docs/ARCHITECTURE.md)
-- [验证范围与已知限制](docs/VERIFICATION.md) · [维护交接](HANDOFF.md)
+- [验证范围与已知限制](docs/VERIFICATION.md)
 
 本地测试不代表公网 CA 签发、长期稳定性或 DPI 不可识别。许可证：Apache-2.0。

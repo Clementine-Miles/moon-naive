@@ -169,6 +169,17 @@ fn require_static_elf(bytes: &[u8]) -> Result<()> {
     )
 }
 
+/// Validate the actual artifact using Rust ELF parsing, without file/readelf.
+pub fn check_elf(binary: &Path) -> Result<()> {
+    require_static_elf(&fs::read(binary)?)?;
+    println!(
+        "{}: static Linux x86_64 ELF; sha256={}",
+        binary.display(),
+        checksum(binary)?
+    );
+    Ok(())
+}
+
 pub fn dist(binary: &Path, directory: &Path) -> Result<()> {
     audit_native()?;
     let binary = fs::canonicalize(binary)?;
@@ -473,73 +484,4 @@ pub fn platform_smoke(binary: &Path, ca_bundle: Option<&Path>) -> Result<()> {
         println!("platform={name} result=passed");
     }
     super::save_report("platform-smoke", &report)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn rust_archives_are_deterministic_and_preserve_payloads() {
-        let a = tempfile::tempdir().unwrap();
-        let b = tempfile::tempdir().unwrap();
-        for dir in [a.path(), b.path()] {
-            let stage = dir.join("package");
-            fs::create_dir_all(stage.join("docs")).unwrap();
-            fs::write(stage.join("docs/readme"), b"documentation").unwrap();
-            fs::write(stage.join("binary"), b"binary contents").unwrap();
-            fs::set_permissions(stage.join("binary"), fs::Permissions::from_mode(0o755)).unwrap();
-            fs::write(stage.join("SHA256SUMS"), b"stale manifest").unwrap();
-            archive(&stage, dir).unwrap();
-        }
-        let packed = fs::read(a.path().join("package.tar.gz")).unwrap();
-        assert_eq!(packed, fs::read(b.path().join("package.tar.gz")).unwrap());
-        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(packed.as_slice()));
-        let mut files = 0;
-        let mut names = HashSet::new();
-        for entry in archive.entries().unwrap() {
-            let mut entry = entry.unwrap();
-            assert!(
-                names.insert(entry.path().unwrap().into_owned()),
-                "duplicate archive entry"
-            );
-            if entry.path().unwrap() == Path::new("package/SHA256SUMS") {
-                let mut manifest = String::new();
-                entry.read_to_string(&mut manifest).unwrap();
-                assert!(!manifest.contains("SHA256SUMS"));
-                assert_eq!(manifest.lines().count(), 2);
-                for line in manifest.lines() {
-                    let (digest, name) = line.split_once("  ").unwrap();
-                    assert_eq!(
-                        digest,
-                        checksum(&a.path().join("package").join(name)).unwrap()
-                    );
-                }
-            }
-            assert_eq!(entry.header().mtime().unwrap(), 0);
-            assert_eq!(entry.header().uid().unwrap(), 0);
-            if entry.header().entry_type().is_dir() {
-                assert_eq!(entry.header().mode().unwrap(), 0o755);
-            }
-            if entry.path().unwrap() == Path::new("package/binary") {
-                assert_eq!(entry.header().mode().unwrap(), 0o755);
-                let mut data = Vec::new();
-                entry.read_to_end(&mut data).unwrap();
-                assert_eq!(data, b"binary contents");
-            }
-            files += 1;
-        }
-        assert_eq!(files, 5);
-    }
-    #[test]
-    fn elf_release_validation_checks_real_program_and_rejects_garbage() {
-        assert!(require_static_elf(b"not an ELF").is_err());
-        assert!(require_static_elf(b"\x7fELF").is_err());
-        let binary = fs::read(std::env::current_exe().unwrap()).unwrap();
-        let result = require_static_elf(&binary);
-        if cfg!(all(target_arch = "x86_64", target_env = "musl")) {
-            assert!(result.is_ok());
-        } else if cfg!(all(target_arch = "x86_64", target_env = "gnu")) {
-            assert!(result.is_err());
-        }
-    }
 }

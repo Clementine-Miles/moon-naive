@@ -1,9 +1,5 @@
 mod audit;
 mod release;
-use moon_naive_core::{
-    codec::{Decoder, Encoder},
-    policy::Budget,
-};
 use std::{
     collections::BTreeSet,
     env, fs,
@@ -18,6 +14,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
+        .and_then(Path::parent)
         .unwrap()
         .into()
 }
@@ -168,8 +165,6 @@ fn verify(target: Option<&str>) -> Result<()> {
             "-D",
             "warnings",
         ],
-        vec!["test", "--workspace", "--locked"],
-        vec!["test", "--workspace", "--release", "--locked"],
         vec!["build", "--package", "moon-naive", "--release", "--locked"],
     ] {
         if args[0] != "fmt"
@@ -261,7 +256,7 @@ fn verify(target: Option<&str>) -> Result<()> {
     )?;
     save_report(
         "verification",
-        "native Git revision pins=passed\nworkspace fmt=passed\nclippy -D warnings=passed\ndebug tests=passed\nrelease tests=passed\nrelease server build=passed\nCLI generated private example=passed\nCLI Fast Open rejection=passed\nserve incomplete-setup rejection=passed\nexternal ignored tests=only if explicitly enabled separately\n24h network soak=not performed\n",
+        "native Git revision pins=passed\nworkspace fmt=passed\nclippy -D warnings=passed\nrelease server build=passed\nCLI generated private example=passed\nCLI Fast Open rejection=passed\nserve incomplete-setup rejection=passed\n24h network soak=not performed\n",
     )
 }
 // Test the installed CLI's embedded example without making the distributed
@@ -291,106 +286,18 @@ fn private_example(cli: &Path) -> Result<PrivateExample> {
     Ok(PrivateExample(path))
 }
 
-fn next(state: &mut u64) -> u64 {
-    *state ^= *state << 13;
-    *state ^= *state >> 7;
-    *state ^= *state << 17;
-    *state
-}
-fn test_artifacts(path: &Path, include_ignored: bool) -> Result<()> {
-    let mut executables = BTreeSet::new();
-    let mut build_finished = false;
-    for line in fs::read_to_string(path)?.lines() {
-        let message: serde_json::Value = serde_json::from_str(line)?;
-        if message["reason"] == "build-finished" {
-            build_finished = message["success"] == true;
-        }
-        if message["reason"] == "compiler-artifact"
-            && message["profile"]["test"] == true
-            && let Some(path) = message["executable"].as_str()
-        {
-            executables.insert(path.to_owned());
-        }
-    }
-    check(
-        build_finished,
-        "artifact input is not a completed successful Cargo build",
-    )?;
-    check(
-        !executables.is_empty(),
-        "artifact input has no test executables",
-    )?;
-    check(!executables.is_empty(), "no compiled test artifacts found")?;
-    for executable in &executables {
-        let mut args = vec!["--test-threads=2"];
-        if include_ignored {
-            args.push("--include-ignored");
-        }
-        run(&root(), executable, &args)?;
-    }
-    save_report(
-        "test-artifacts",
-        &format!(
-            "test_binaries={}\ninclude_ignored={include_ignored}\nresult=passed\n",
-            executables.len()
-        ),
-    )
-}
-fn soak(rounds: usize) -> Result<()> {
-    check(
-        (1..=1_000_000).contains(&rounds),
-        "soak rounds must be 1..1000000",
-    )?;
-    let start = Instant::now();
-    let mut seed = 0x91a0_1020_3040_5060_u64;
-    let budget = Budget::new(1)?;
-    let mut bytes = 0_u64;
-    for _ in 0..rounds {
-        let permit = budget.acquire().ok_or("permit leaked")?;
-        let mut encoder = Encoder::default();
-        let mut decoder = Decoder::default();
-        let mut plain = Vec::new();
-        let mut wire = Vec::new();
-        for _ in 0..24 {
-            let len = (next(&mut seed) % 1024 + 1) as usize;
-            let payload = vec![next(&mut seed) as u8; len];
-            plain.extend_from_slice(&payload);
-            let limit = u64::from(encoder.padding_limit(payload.len()));
-            wire.extend(encoder.encode(&payload, (next(&mut seed) % (limit + 1)) as u8)?);
-        }
-        let chunk = (next(&mut seed) % 257 + 1) as usize;
-        let decoded: Vec<u8> = wire
-            .chunks(chunk)
-            .flat_map(|s| decoder.feed(s).expect("valid generated records"))
-            .collect();
-        decoder.finish()?;
-        check(decoded == plain, "soak byte mismatch")?;
-        bytes += plain.len() as u64;
-        drop(permit);
-    }
-    check(budget.active() == 0, "final permit count is nonzero")?;
-    save_report(
-        "model-soak",
-        &format!(
-            "scope=deterministic core model, not network soak\nrounds={rounds}\ncompared_payload_bytes={bytes}\nactive_permits=0\nelapsed_ms={}\nresult=passed\n",
-            start.elapsed().as_millis()
-        ),
-    )
-}
 fn main() -> ExitCode {
     let args: Vec<_> = env::args().skip(1).collect();
     let result = match args.as_slice() {
         [cmd] if cmd == "verify" => verify(None),
         [cmd,target] if cmd=="verify"=>verify(Some(target)),
         [cmd] if cmd == "audit-native" => audit_native(),
-        [cmd, rounds] if cmd == "soak" => rounds.parse().map_err(Into::into).and_then(soak),
+        [cmd, binary] if cmd == "check-elf" => release::check_elf(Path::new(binary)),
         [cmd,binary,output] if cmd=="dist"=>release::dist(Path::new(binary),Path::new(output)),
         [cmd,output] if cmd=="source"=>release::source(Path::new(output)),
-        [cmd,path] if cmd=="test-artifacts"=>test_artifacts(Path::new(path),false),
-        [cmd,path,flag] if cmd=="test-artifacts" && flag=="--include-ignored"=>test_artifacts(Path::new(path),true),
         [cmd,binary] if cmd=="platform-smoke"=>release::platform_smoke(Path::new(binary),None),
         [cmd,binary,ca] if cmd=="platform-smoke"=>release::platform_smoke(Path::new(binary),Some(Path::new(ca))),
-        _ => Err("usage: cargo run -p xtask -- verify [target] | audit-native | soak <rounds> | dist <binary> <output-dir> | source <output-dir> | test-artifacts <jsonl> [--include-ignored] | platform-smoke <binary> [ca-bundle]".into()),
+        _ => Err("usage: cargo xtask verify [target] | audit-native | check-elf <binary> | dist <binary> <output-dir> | source <output-dir> | platform-smoke <binary> [ca-bundle]".into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

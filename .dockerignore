@@ -17,3 +17,6 @@ secrets
 **/*.secret
 # Public upstream test fixtures are part of the audited vendored snapshot.
 !vendor/pingora/**
+
+# instant-acme audit includes public upstream test fixtures too.
+!vendor/instant-acme/**

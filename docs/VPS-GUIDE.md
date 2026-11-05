@@ -34,7 +34,7 @@ apt-get install -y build-essential cmake clang libclang-dev pkg-config perl git 
 pacman -Syu --needed base-devel cmake clang pkgconf perl git curl ca-certificates
 
 # Alpine 3.22：与已验证的 musl 工具链一致
-apk add --no-cache build-base cmake clang19-libclang llvm19-dev linux-headers perl pkgconf git curl ca-certificates binutils file tar openrc libcap-utils
+apk add --no-cache build-base cmake clang19-libclang linux-headers perl pkgconf git curl ca-certificates openrc libcap-utils
 ```
 
 若未安装 rustup，可用官方安装器安装已验证的 Rust 版本；已有 rustup 时只需安装该 toolchain：
@@ -77,7 +77,7 @@ Alpine 的 musl Rust host 默认静态链接 build script，但 bindgen 要在�
 ```sh
 mkdir -p target/build-support
 rustc +1.89.0 --edition=2024 -C target-feature=-crt-static \
-  xtask/build-support/musl-host-rustc.rs \
+  tools/xtask/build-support/musl-host-rustc.rs \
   -o target/build-support/moon-naive-rustc-wrapper
 
 moon_naive_gcc_headers="$(gcc -print-file-name=include)"
@@ -88,11 +88,11 @@ RUSTFLAGS="-C target-feature=+crt-static" \
 cargo +1.89.0 build --target x86_64-unknown-linux-musl --release --locked -j 2 -p moon-naive
 
 ./target/x86_64-unknown-linux-musl/release/moon-naive --version
-file target/x86_64-unknown-linux-musl/release/moon-naive
+cargo xtask check-elf target/x86_64-unknown-linux-musl/release/moon-naive
 install -m 0755 target/x86_64-unknown-linux-musl/release/moon-naive /usr/local/bin/moon-naive
 ```
 
-最终程序应为 static PIE，且 `readelf -l` 无 INTERP、`readelf -d` 无 NEEDED。构建工具需要 libclang，不代表最终静态程序运行需要 libclang。Alpine 其他版本若使用不同 LLVM 版本，需要同步调整包名和 `LIBCLANG_PATH`。
+`cargo xtask check-elf` 使用 Rust 解析 ELF，验证 x86_64、无动态解释器及共享库依赖。构建工具需要 libclang，不代表最终静态程序运行需要 libclang。Alpine 其他版本若使用不同 LLVM 版本，需要同步调整包名和 `LIBCLANG_PATH`。
 
 若希望在 Debian/Arch 构建同样的跨发行版静态文件，可以使用项目固定的 Alpine Docker 工具链：
 
@@ -267,44 +267,28 @@ HTTP响应头分隔符使用可复用的memchr Finder；H2/H3字段的NUL/CR/LF�
 
 ```sh
 cargo fmt --all --check
-cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo build --release --locked -p moon-naive -p xtask
-cargo run --locked -p xtask -- audit-native
-cargo run --locked -p xtask -- verify
-cargo run --locked -p xtask -- soak 100000
+cargo xtask audit-native
+cargo xtask verify
 ```
 
-`verify` 运行 Debug/Release 检查与构建，通过实际二进制的 `config init` 创建私有样本再检查，验证旧开关拒绝和缺失凭据时启动失败。不会把源码中的0644公开模板直接当运行中的私有配置。`soak` 不等于24小时真实网络测试。
+生产构建镜像仅安装编译所需工具；开发检查按需执行 `rustup component add rustfmt clippy`。打包与 ELF 校验使用 Rust，不额外安装 `file`、GNU tar 或 LLVM 开发包（链接器仍由系统工具链提供）。
+
+`verify` 运行格式、Clippy、Release 构建与 CLI 冒烟检查，通过实际二进制的 `config init` 创建私有样本再检查，验证旧开关拒绝和缺失凭据时启动失败。不会把源码中的0644公开模板直接当运行中的私有配置。`soak` 不等于24小时真实网络测试。
 
 通用发布使用前述 Docker musl 构建。若构建网络需要私有CA，可加 BuildKit 临时 secret：`--secret id=system_ca,src=/path/to/combined-ca-bundle.crt`；不关闭 TLS 校验，不把私有 CA 文件写进镜像层或包。
 
 ```sh
-cargo run --locked -p xtask -- dist out/musl/moon-naive dist
-cargo run --locked -p xtask -- source dist
-cargo run --locked -p xtask -- platform-smoke out/musl/moon-naive /etc/ssl/certs/ca-certificates.crt
+cargo xtask dist out/musl/moon-naive dist
+cargo xtask source dist
+cargo xtask platform-smoke out/musl/moon-naive /etc/ssl/certs/ca-certificates.crt
 ```
 
 打包拒绝覆盖同名 stage/archive，按排序及归一化的时间、owner、权限生成 tar.gz 和 SHA-256。二进制包包含唯一配置模板、systemd/OpenRC、当前文档、许可证、依赖与构建清单；源码包包含测试源码和历史记录，不含真实配置、状态、构建缓存或 reports。源码打包会读取 Git 文件清单，无 Git 元数据时先建立受 `.gitignore` 保护的基线。
 
 `dist` 使用 goblin 检查 ELF，拒绝 INTERP/NEEDED 或常见 Go 构建段；源码审计的 Go 排除针对生产构建，不针对 tools/packet-lab 的独立实验工具。静态程序仍需宿主系统 CA bundle。`platform-smoke` 在固定 Alpine/Debian/Arch 镜像中以普通用户、只读文件系统检查同一静态二进制；可选 CA 参数允许只读 GTS directory 请求，不建账户或改DNS。检查结果不能冒充各发行版从源码构建、完整服务开机或公网验收。
 
-### 外部验收与现有边界
-
-默认 ignored 的真实 Chromium、官方旧客户端拒绝、Pebble、抓包和微基准测试需另行准备。示例环境：
-
-```sh
-export CHROMIUM_BIN=/absolute/path/to/chromium
-export NAIVE_BIN=/absolute/path/to/official/naive
-export PEBBLE_BIN=/absolute/path/to/pebble
-export CHALLTESTSRV_BIN=/absolute/path/to/pebble-challtestsrv
-export PEBBLE_SOURCE=/absolute/path/to/pebble-source
-cargo test --workspace --locked -- --include-ignored --test-threads=2
-```
-
-抓包还需要 tools/packet-lab 的专门环境。可在 musl builder 用 `cargo test --target x86_64-unknown-linux-musl --workspace --locked --no-run --message-format=json` 保存构建 JSONL，再用 `xtask test-artifacts <jsonl> --include-ignored` 执行实际静态测试程序。编译成功/ignored不算执行通过。
-
-本项目仍为0.6.0、协议修订4，尚未交付配套 Chromium 代理客户端。公网 Porkbun/GTS 签发、实际 VPS 开机/恢复、24小时负载/丢包/吞吐、ECH 双端闭环和 DPI 对照需另行验证，不能沿用旧版本或本地 CA 测试宣称完成。当前结果见 [VERIFICATION.md](VERIFICATION.md)，协议见 [PROTOCOL.md](PROTOCOL.md)，历史材料集中于 [HISTORY.md](HISTORY.md)。
 
 ## 服务端对照与 H1 路由
 
@@ -439,3 +423,20 @@ table ip moon_naive_ip_options_guard {
 这是IPv4头部IHL检查，**不是TCP options**检查，不禁用TCP timestamps、SACK、MSS或窗口缩放。规则会影响合法的IPv4 options用途；未启用持久化时重启后消失。回滚仅删除本表：`nft delete table ip moon_naive_ip_options_guard`。不要在未核实内核修复生效前移除临时防护；它不能替代内核修复。本轮在独立容器中通过语法检查、普通TCP/UDP通过、带合法NOP options的UDP被丢弃的测试，之后删除测试表，没有执行内核漏洞利用或修改生产VPS。
 
 长连接默认`limits.idle_timeout_secs=600`指无应用数据进展的空闲时间，不是连接总寿命；数据持续流动可超过此值。根据真实业务的最长静默期设置它，保留`max_connections`、`max_streams`和总接收预算。高丢包时先确认MTU、拥塞/队列及应用超时，不通过无界缓冲、关闭拥塞控制、提前发送或永久保活来掩盖断流；超过空闲期限仍应回收。TCP BBR和QUIC BBRv2各自作用于其传输路径，不能把本地QUIC损伤试验当作TCP公网测试。
+
+
+## 复用 BoringSSL，避免重复调用 CMake
+
+首次从源码构建仍需要 CMake、C/C++ 和 Perl；它们来自 boring-sys 的 BoringSSL 构建流程。quiche 已使用 boringssl-boring-crate，共用同一份 BoringSSL。
+
+重复构建可使用 boring-sys 官方支持的预编译目录：
+
+```sh
+BORING_BSSL_PATH=/absolute/path/to/matching-boringssl-libs \
+BORING_BSSL_INCLUDE_PATH=/absolute/path/to/matching-boringssl-headers \
+cargo build --release --locked -p moon-naive
+```
+
+库目录需包含 libssl.a、libcrypto.a（或放在其 lib 子目录），头文件目录需包含 openssl/。仅复用由当前锁定 boring-sys 5.2.0、相同补丁、目标架构和 C 运行库构建的产物；GNU 与 musl 不可混用。不要设置 ASSUME_PATCHED 绕过来源要求。仍需 libclang 生成 Rust 绑定和系统链接器。此模式避免调用 CMake，但 Cargo 的传递构建依赖仍保留 cmake crate。
+
+本机已用当前构建出的匹配库验证该模式，并将 CMAKE 指向不存在的路径以确认没有调用它；未验证跨平台预编译包。

@@ -1,3 +1,5 @@
+> 历史记录：本轮精简已移除项目测试和实验源码，本文的旧测试命令不再适用于当前目录。
+
 # 历史阶段记录
 
 以下原文按原路径合并；旧名称、命令与测试结果仅用于追溯，不作为当前版本部署说明。原文中的相对链接可能指向旧路径。当前用法见 VPS-GUIDE.md 和 CONFIGURATION.md，当前结果见 VERIFICATION.md。历史中的 ACME.md、RELEASING.md、SERVER-COMPARISON.md 及旧多份配置示例现已合并，不再作为独立文件提供。

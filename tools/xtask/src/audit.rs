@@ -124,9 +124,8 @@ fn no_go_sources() -> Result<()> {
     for directory in [
         "core",
         "src",
-        "tests",
-        "xtask/src",
-        "xtask/build-support",
+        "tools/xtask/src",
+        "tools/xtask/build-support",
         "deploy",
         "vendor",
     ] {
