@@ -54,12 +54,12 @@ workspace = true
 
 [workspace]
 resolver = "2"
-exclude = ["vendor/pingora", "vendor/pingora/*"]
+exclude = ["vendor/instant-acme", "vendor/pingora", "vendor/pingora/*"]
 members = ["core", "xtask"]
 default-members = ["."]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.89"
 license = "Apache-2.0"
@@ -93,3 +93,6 @@ pingora-pool = { path = "vendor/pingora/pingora-pool" }
 pingora-proxy = { path = "vendor/pingora/pingora-proxy" }
 pingora-runtime = { path = "vendor/pingora/pingora-runtime" }
 pingora-timeout = { path = "vendor/pingora/pingora-timeout" }
+
+[patch."https://github.com/djc/instant-acme.git"]
+instant-acme = { path = "vendor/instant-acme" }

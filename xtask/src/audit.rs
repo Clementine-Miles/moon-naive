@@ -57,6 +57,35 @@ pub fn sources() -> Result<()> {
             vendor_digest()?;
             continue;
         }
+        if name == "instant-acme" {
+            let matching = packages
+                .iter()
+                .filter(|p| p["name"] == name)
+                .collect::<Vec<_>>();
+            let directory = root().join("vendor/instant-acme").canonicalize()?;
+            check(
+                matching.len() == 1,
+                "instant-acme package missing or duplicated",
+            )?;
+            let package = matching[0];
+            check(
+                package["source"].is_null()
+                    && Path::new(
+                        package["manifest_path"]
+                            .as_str()
+                            .ok_or("manifest missing")?,
+                    )
+                    .canonicalize()?
+                    .starts_with(&directory),
+                "instant-acme must use audited local source",
+            )?;
+            check(
+                fs::read_to_string(directory.join("UPSTREAM_REVISION"))?.trim() == rev,
+                "instant-acme baseline revision mismatch",
+            )?;
+            digest_directory(&directory)?;
+            continue;
+        }
         let expected = format!("git+{url}?rev={rev}#{rev}");
         let matching = packages
             .iter()
@@ -108,6 +137,10 @@ fn no_go_sources() -> Result<()> {
 
 /// Validate every vendored file, including additions and fixtures ignored by Git.
 pub fn vendor_digest() -> Result<String> {
+    digest_directory(&root().join("vendor/instant-acme"))?;
+    digest_directory(&root().join("vendor/pingora"))
+}
+fn digest_directory(directory: &Path) -> Result<String> {
     fn walk(dir: &Path, files: &mut BTreeSet<std::path::PathBuf>) -> Result<()> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
@@ -124,7 +157,6 @@ pub fn vendor_digest() -> Result<String> {
         }
         Ok(())
     }
-    let directory = root().join("vendor/pingora");
     let manifest = fs::read(directory.join("SHA256SUMS"))?;
     let mut expected = BTreeSet::new();
     for line in std::str::from_utf8(&manifest)?.lines() {
@@ -147,7 +179,7 @@ pub fn vendor_digest() -> Result<String> {
         )?;
     }
     let mut actual = BTreeSet::new();
-    walk(&directory, &mut actual)?;
+    walk(directory, &mut actual)?;
     actual.remove(&directory.join("SHA256SUMS"));
     check(expected == actual, "vendored file inventory mismatch")?;
     Ok(format!("{:x}", Sha256::digest(manifest)))

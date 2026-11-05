@@ -1,6 +1,6 @@
 # moon-naive：接手 Agent 工作说明
 
-交接日期：2026-11-04。当前版本：0.6.0，协议修订4。
+交接日期：2026-11-04。当前版本：0.7.0，协议修订4。
 
 ## 先读与工作原则
 
@@ -152,3 +152,10 @@ hickory-proto升级0.26.1、time升级0.3.47，锁定有限传递更新。权威
 抓包工具增加可配置损失概率/种子/短时双向中断，以及h2-soak/h3-soak单认证通道。正式样本、耗时、失败/排除及检查结果见VERIFICATION.md与packet-lab-results.json；原始reports不随源码。虚拟24小时期限测试和120秒网络试验均不能充当24小时稳定性验收；不是Chromium、公网TCP BBR或DPI识别率测试。
 
 最终Release workspace136通过、0失败、11 ignored；Clippy/fmt/Release构建/来源vendor审计通过，BBR门控及CLI配置/传输检查另显式执行。正式25份捕获零抓包丢失，24份QUIC内容/偏移/FIN核验通过。30秒间歇H3驱动循环1198→620，但长通道某次p50/p95反而较高，不得把减少轮询写成全面延迟提升。十秒后注入的两秒中断确认落在认证后，同通道恢复；一秒后中断的原样本可能只影响握手，保留但不作严格恢复配对证明。
+
+
+## 0.7.0 ACME 客户端重构
+
+账户注册/恢复抽到 src/acme/account.rs；EAB 移除手写 JWS/nonce 协议，统一调用 instant-acme。固定上游版本随 vendor/instant-acme 保存，唯一接口补丁支持已持久化私钥 + EAB，详见 MOON-PATCH.md；xtask 对来源和完整文件清单进行校验。旧账户 ID/私钥日志兼容，既有 DNS、证书安装及热更新流程保留。
+
+本轮本机 Debug 工作区测试 138 通过、11 ignored；另显式执行 Pebble 2 项集成测试均通过（因此尚未执行的 ignored 为9项）。包括普通/EAB签发、重启与续期、旧EAB日志恢复、一次性凭据删除后的恢复及DNS故障保留证书。Clippy（-D warnings）、格式检查及来源/vendor审计通过。公网GTS/Porkbun签发未执行。README已精简。用户已批准推送，发布版本为0.7.0。

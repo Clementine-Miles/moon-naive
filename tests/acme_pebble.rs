@@ -407,7 +407,7 @@ async fn exercise(eab: bool) {
     let account = first_state["account"].clone();
     let account_id = first_state["account_id"].clone();
     if eab {
-        assert!(account.is_null());
+        assert_eq!(account["id"], account_id);
         assert!(
             account_id
                 .as_str()
@@ -514,6 +514,18 @@ async fn exercise(eab: bool) {
     assert_eq!(recovered.tick().await.unwrap(), Tick::Idle);
     assert_eq!(provider.creates.load(Ordering::Relaxed), 2);
     if eab {
+        // Restore the old EAB journal format (ID + key, no serialized credentials)
+        // after the one-time EAB credential file has been removed.
+        drop(recovered);
+        patch_journal(&config.state_dir, |state| {
+            state["account"] = Value::Null;
+            state["ari_check_at"] = json!(0);
+            state["next_attempt"] = json!(0);
+        });
+        let mut recovered = Manager::open(&config, provider.clone(), http.clone()).unwrap();
+        assert_eq!(recovered.tick().await.unwrap(), Tick::Idle);
+        assert_eq!(journal(&config.state_dir)["account_id"], account_id);
+        assert_eq!(provider.creates.load(Ordering::Relaxed), 2);
         // Model registration's response/persistence gap: the CA knows the key,
         // but the local journal has not saved its account URL. No EAB remains.
         drop(recovered);

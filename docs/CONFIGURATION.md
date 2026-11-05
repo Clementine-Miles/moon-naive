@@ -328,3 +328,10 @@ api_token = "REPLACE_WITH_SCOPED_API_TOKEN"
 | 首次一直等待证书 | 检查日志中的失败阶段、API access/权限、真实 NS、CAA、DNS传播及 HTTPS/DNS 出站；保留退避与状态，不删目录 |
 | 网站502或跳转到源站 | 检查 origin可达性、证书和虚拟主机配置；绝对跳转/链接不自动改写 |
 | 官方 NaïveProxy 客户端连不上 | 本项目协议修订4不兼容官方旧认证，配置简化不改变此事实 |
+
+
+## instant-acme 账户实现
+
+ACME 协议请求（包括 EAB JWS、nonce 重试、订单和 ARI）统一由 instant-acme 处理，DNS 操作仍由内置 Porkbun 适配器完成，无 shell hooks。账户私钥在联网前持久化；遇到一次性 EAB 注册响应丢失，先用同一私钥查找既有账户，再决定是否注册。旧版仅保存 account_id/key 的日志仍可恢复。
+
+固定版本的 instant-acme 已随 vendor 提供。唯一 API 补丁允许使用已保存的私钥和 EAB 调用其原有注册实现，来源与差异见 vendor/instant-acme/MOON-PATCH.md。无需删除状态目录或重新申请 EAB。

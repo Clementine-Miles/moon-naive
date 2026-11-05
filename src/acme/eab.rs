@@ -1,13 +1,7 @@
-//! RFC 8555 §7.3.4 bootstrap using the account key already saved in the journal.
-//! All subsequent account/order operations remain in instant-acme.
+//! EAB credential import and instant-acme account registration.
 use super::{Result, crypto::CRYPTO, http::Http, state::read_private};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use bytes::Bytes;
-use http::{Request, header};
-use http_body_util::{BodyExt, Full};
 use rustls_pki_types::PrivatePkcs8KeyDer;
 use serde::Deserialize;
-use serde_json::{Value, json};
 use std::path::Path;
 
 pub use moon_naive_core::config::EabCredentials as Credentials;
@@ -38,95 +32,56 @@ pub fn import_gcloud(input: &Path, output: &Path) -> Result<()> {
     let text = toml::to_string(&value)?;
     super::state::write_private_new(output, text.as_bytes())
 }
-fn encoded(value: &Value) -> Result<String> {
-    Ok(URL_SAFE_NO_PAD.encode(serde_json::to_vec(value)?))
-}
+/// EAB registration uses instant-acme's protocol implementation while retaining
+/// the key persisted before the first network request.
 pub async fn register(
     http: &Http,
     directory: &str,
     key_der: &[u8],
     contact: &str,
     credentials: &Credentials,
-) -> Result<String> {
-    let directory = http.json("GET", directory, None, None).await?;
-    let account_url = directory["newAccount"]
-        .as_str()
-        .ok_or("ACME newAccount missing")?;
-    let nonce_url = directory["newNonce"]
-        .as_str()
-        .ok_or("ACME newNonce missing")?;
-    let key = CRYPTO
-        .key_provider
-        .load_key(PrivatePkcs8KeyDer::from(key_der.to_vec()))?;
-    let jwk = serde_json::to_value(key.as_jwk())?;
-    let protected = encoded(&json!({"alg":"HS256","kid":credentials.key_id,"url":account_url}))?;
-    let payload = encoded(&jwk)?;
-    let signature = CRYPTO
-        .hmac
-        .load_key(&credentials.mac()?)
-        .sign(format!("{protected}.{payload}").as_bytes());
-    let binding = json!({"protected":protected,"payload":payload,"signature":URL_SAFE_NO_PAD.encode(signature)});
-    let payload = encoded(&json!({"termsOfServiceAgreed":true,
-        "contact":[format!("mailto:{}",contact.trim_start_matches("mailto:"))],"externalAccountBinding":binding}))?;
-    // Retry only explicit badNonce. Ambiguous responses return to the durable
-    // manager, which first looks up the same key before trying EAB again.
-    for _ in 0..3 {
-        let nonce = http
-            .request(
-                Request::builder()
-                    .method("HEAD")
-                    .uri(nonce_url)
-                    .body(Full::new(Bytes::new()))?,
-            )
-            .await?;
-        if !nonce.status().is_success() {
-            return Err("ACME nonce request failed".into());
-        }
-        let nonce = nonce
-            .headers()
-            .get("Replay-Nonce")
-            .and_then(|v| v.to_str().ok())
-            .ok_or("ACME nonce missing")?;
-        let protected = encoded(&json!({"alg":"ES256","jwk":jwk,"nonce":nonce,"url":account_url}))?;
-        let signature = key.sign(format!("{protected}.{payload}").as_bytes())?;
-        let response = http.request(Request::builder().method("POST").uri(account_url)
-            .header(header::CONTENT_TYPE,"application/jose+json")
-            .body(Full::new(Bytes::from(serde_json::to_vec(&json!({"protected":protected,"payload":payload,"signature":URL_SAFE_NO_PAD.encode(signature)}))?)))?).await?;
-        let status = response.status();
-        let location = response
-            .headers()
-            .get(header::LOCATION)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
-        let data: Value = serde_json::from_slice(&response.into_body().collect().await?.to_bytes())
-            .map_err(|_| "malformed ACME account response")?;
-        if status.is_success() {
-            if data["status"] != "valid" {
-                return Err("ACME account is not valid".into());
-            }
-            let location = location.ok_or("ACME account Location missing")?;
-            let uri: http::Uri = location.parse()?;
-            if uri.scheme_str() != Some("https")
-                || uri.host().is_none()
-                || uri.authority().is_some_and(|a| a.as_str().contains('@'))
-            {
-                return Err("invalid ACME account Location".into());
-            }
-            return Ok(location);
-        }
-        if data["type"] != "urn:ietf:params:acme:error:badNonce" {
-            return Err("ACME EAB account registration failed".into());
-        }
+) -> Result<(instant_acme::Account, instant_acme::AccountCredentials)> {
+    credentials.validate()?;
+    let der = PrivatePkcs8KeyDer::from(key_der.to_vec());
+    let key = instant_acme::Key::from_pkcs8_der(der.clone_key(), &CRYPTO)?;
+    let external = instant_acme::ExternalAccountKey::new(
+        credentials.key_id.clone(),
+        CRYPTO.hmac.load_key(&credentials.mac()?),
+    );
+    let contact = format!("mailto:{}", contact.trim_start_matches("mailto:"));
+    let result = instant_acme::Account::builder(Box::new(http.clone()), &CRYPTO)?
+        .create_with_key(
+            &instant_acme::NewAccount {
+                contact: &[&contact],
+                terms_of_service_agreed: true,
+                only_return_existing: false,
+            },
+            (key, der),
+            directory.to_owned(),
+            Some(&external),
+        )
+        .await?;
+    let uri: http::Uri = result.0.id().parse()?;
+    if uri.scheme_str() != Some("https")
+        || uri.host().is_none()
+        || uri.authority().is_some_and(|a| a.as_str().contains('@'))
+    {
+        return Err("invalid ACME account Location".into());
     }
-    Err("ACME nonce retry limit exceeded".into())
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::tests::http_server;
     use super::*;
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use boring::{bn::BigNum, ecdsa::EcdsaSig, pkey::PKey};
+    use bytes::Bytes;
     use http::Response;
+    use http::header;
+    use http_body_util::Full;
+    use serde_json::{Value, json};
     use std::{
         sync::{
             Arc,
@@ -190,7 +145,7 @@ mod tests {
                 async move {
                     let origin=format!("http://{}",request.headers()["host"].to_str().unwrap());
                     if request.uri().path()=="/directory" {
-                        return Response::new(Full::new(Bytes::from(serde_json::to_vec(&json!({"newAccount":format!("{origin}/account"),"newNonce":format!("{origin}/nonce")})).unwrap())));
+                        return Response::new(Full::new(Bytes::from(serde_json::to_vec(&json!({"newAccount":format!("{origin}/account"),"newNonce":format!("{origin}/nonce"),"newOrder":format!("{origin}/order")})).unwrap())));
                     }
                     if request.uri().path()=="/nonce" {
                         assert_eq!(request.method(),"HEAD");
@@ -237,9 +192,55 @@ mod tests {
                 &credentials
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .0
+            .id(),
             "https://acme.example.dev/account/1"
         );
         assert_eq!(attempts.load(Ordering::Relaxed), 2);
+    }
+    #[tokio::test]
+    async fn eab_does_not_retry_rejected_credentials() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server = http_server({
+            let attempts = attempts.clone();
+            move |request| {
+                let attempts = attempts.clone();
+                async move {
+                    let origin = format!("http://{}", request.headers()["host"].to_str().unwrap());
+                    match request.uri().path() {
+                        "/directory" => Response::new(Full::new(Bytes::from(serde_json::to_vec(
+                            &json!({"newAccount":format!("{origin}/account"),
+                                "newNonce":format!("{origin}/nonce"),"newOrder":format!("{origin}/order")})
+                        ).unwrap()))),
+                        "/nonce" => Response::builder().header("Replay-Nonce", "nonce")
+                            .body(Full::new(Bytes::new())).unwrap(),
+                        _ => {
+                            attempts.fetch_add(1, Ordering::Relaxed);
+                            Response::builder().status(400).body(Full::new(Bytes::from_static(
+                                br#"{"type":"urn:ietf:params:acme:error:unauthorized"}"#
+                            ))).unwrap()
+                        }
+                    }
+                }
+            }
+        }).await;
+        let (_, der) = CRYPTO.key_provider.generate_key().unwrap();
+        let http = Http::new(None, Duration::from_secs(2))
+            .unwrap()
+            .with_loopback_http();
+        let result = register(
+            &http,
+            &format!("{}/directory", server.url),
+            der.secret_pkcs8_der(),
+            "operator@example.test",
+            &Credentials {
+                key_id: "rejected".into(),
+                b64_mac_key: URL_SAFE_NO_PAD.encode([0x42; 32]),
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
     }
 }

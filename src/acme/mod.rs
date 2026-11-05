@@ -1,4 +1,5 @@
 //! Live DNS-01 certificate management. All network crypto uses boring 5.
+mod account;
 pub mod certificate;
 pub mod crypto;
 pub mod dns;

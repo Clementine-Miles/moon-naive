@@ -1195,7 +1195,6 @@ dependencies = [
 [[package]]
 name = "instant-acme"
 version = "0.9.0"
-source = "git+https://github.com/djc/instant-acme.git?rev=4a9b80fdc22f23ab39b78dfd20ff5d4c92938e52#4a9b80fdc22f23ab39b78dfd20ff5d4c92938e52"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -1403,7 +1402,7 @@ dependencies = [
 
 [[package]]
 name = "moon-naive"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1440,7 +1439,7 @@ dependencies = [
 
 [[package]]
 name = "moon-naive-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "base64 0.22.1",
  "hmac",
@@ -2889,7 +2888,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "flate2",
  "goblin",

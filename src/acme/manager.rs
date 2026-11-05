@@ -1,7 +1,6 @@
 use super::{
     Error, Result,
     certificate::{self, Validator},
-    crypto::CRYPTO,
     dns::DnsProvider,
     http::Http,
     now, random_below,
@@ -12,12 +11,12 @@ use super::{
     store::{DiskStore, StoreFailure},
 };
 use instant_acme::{
-    Account, AuthorizationStatus, CertificateIdentifier, ChallengeType, Identifier, Key, NewOrder,
+    Account, AuthorizationStatus, CertificateIdentifier, ChallengeType, Identifier, NewOrder,
     OrderStatus, RetryPolicy,
 };
 use moon_naive_core::config::Config;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use std::{path::PathBuf, sync::atomic::Ordering, time::Duration};
+use rustls_pki_types::CertificateDer;
+use std::{sync::atomic::Ordering, time::Duration};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Tick {
@@ -36,7 +35,7 @@ pub struct Manager<P> {
     state: State,
     journal: Journal,
     account: Option<Account>,
-    contact: String,
+    accounts: super::account::AccountClient,
     window: u64,
     initial_retry: u64,
     max_retry: u64,
@@ -44,8 +43,6 @@ pub struct Manager<P> {
     poll_interval: Duration,
     suspended: bool,
     phase: &'static str,
-    eab_file: Option<PathBuf>,
-    eab_inline: Option<moon_naive_core::config::EabCredentials>,
 }
 impl<P: DnsProvider> Manager<P> {
     pub fn open(config: &Config, provider: P, http: Http) -> Result<Self> {
@@ -105,13 +102,13 @@ impl<P: DnsProvider> Manager<P> {
         let mut manager = Self {
             slot,
             provider,
-            http,
+            http: http.clone(),
             validator,
             store,
             state,
             journal,
             account: None,
-            contact: config.acme.contact.clone(),
+            accounts: super::account::AccountClient::new(config, http.clone()),
             window: config.acme.renew_before_secs,
             initial_retry: config.acme.retry_initial_secs,
             max_retry: config.acme.retry_max_secs,
@@ -119,8 +116,6 @@ impl<P: DnsProvider> Manager<P> {
             poll_interval: Duration::from_secs(config.acme.poll_interval_secs),
             suspended: false,
             phase: "startup",
-            eab_file: config.acme.eab_credentials_file.clone(),
-            eab_inline: config.acme.eab.clone(),
         };
         if let Some(stored) = manager.store.read_current()? {
             // Never trust the plaintext lifetime metadata for readiness.
@@ -228,88 +223,15 @@ impl<P: DnsProvider> Manager<P> {
         self.phase = "account";
         self.journal.next_attempt = now().saturating_add(self.initial_retry);
         self.persist()?;
-        let builder = Account::builder(Box::new(self.http.clone()), &CRYPTO)?;
-        let account = if let Some(credentials) = &self.journal.account {
-            builder
-                .from_credentials(serde_json::from_value(credentials.clone())?)
-                .await?
-        } else if let Some(id) = &self.journal.account_id {
-            builder
-                .from_parts(
-                    id.clone(),
-                    PrivatePkcs8KeyDer::from(self.journal.account_key.clone()),
-                    self.journal.directory.clone(),
-                )
-                .await?
-        } else {
-            // Persist key before newAccount: retries reuse the same identity.
-            if self.journal.account_key.is_empty() {
-                let (_, key) = CRYPTO.key_provider.generate_key()?;
-                self.journal.account_key = key.secret_pkcs8_der().to_vec();
-                self.persist()?;
-            }
-            let der = PrivatePkcs8KeyDer::from(self.journal.account_key.clone());
-            let key = Key::from_pkcs8_der(der.clone_key(), &CRYPTO)?;
-            if self.eab_file.is_some() || self.eab_inline.is_some() {
-                // EAB credentials can be single-use. Always recover by the
-                // durable account key before attempting a new registration.
-                match builder
-                    .from_key(
-                        (key, PrivateKeyDer::Pkcs8(der)),
-                        self.journal.directory.clone(),
-                    )
-                    .await
-                {
-                    Ok((account, credentials)) => {
-                        self.journal.account = Some(serde_json::to_value(credentials)?);
-                        self.persist()?;
-                        account
-                    }
-                    Err(instant_acme::Error::Api(problem))
-                        if problem.r#type.as_deref()
-                            == Some("urn:ietf:params:acme:error:accountDoesNotExist") =>
-                    {
-                        self.phase = "account-eab";
-                        let credentials = if let Some(value) = &self.eab_inline {
-                            value.clone()
-                        } else {
-                            super::eab::load_credentials(self.eab_file.as_ref().unwrap())?
-                        };
-                        let id = super::eab::register(
-                            &self.http,
-                            &self.journal.directory,
-                            &self.journal.account_key,
-                            &self.contact,
-                            &credentials,
-                        )
-                        .await?;
-                        self.journal.account_id = Some(id.clone());
-                        self.persist()?;
-                        Account::builder(Box::new(self.http.clone()), &CRYPTO)?
-                            .from_parts(
-                                id,
-                                PrivatePkcs8KeyDer::from(self.journal.account_key.clone()),
-                                self.journal.directory.clone(),
-                            )
-                            .await?
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-            } else {
-                let (account, credentials) = builder
-                    .create_from_key(
-                        (key, PrivateKeyDer::Pkcs8(der)),
-                        self.journal.directory.clone(),
-                    )
-                    .await?;
-                self.journal.account = Some(serde_json::to_value(credentials)?);
-                self.persist()?;
-                account
-            }
-        };
-        let contact = format!("mailto:{}", self.contact.trim_start_matches("mailto:"));
-        account.update_contacts(&[&contact]).await?;
-        self.account = Some(account);
+        let state = &self.state;
+        let suspended = &mut self.suspended;
+        self.account = Some(
+            self.accounts
+                .restore_or_create(&mut self.journal, |journal| {
+                    state.save(journal).inspect_err(|_| *suspended = true)
+                })
+                .await?,
+        );
         Ok(())
     }
     async fn reconcile(&mut self) -> Result<Tick> {
