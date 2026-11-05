@@ -207,14 +207,11 @@ pub fn dist(binary: &Path, directory: &Path) -> Result<()> {
         ),
         ("deploy/moon-naive.openrc", "deploy/moon-naive.openrc", true),
         ("docs/VPS-GUIDE.md", "docs/VPS-GUIDE.md", false),
-        ("docs/PROJECT-FILES.md", "docs/PROJECT-FILES.md", false),
         ("config.example.toml", "config.example.toml", false),
         ("deploy/Dockerfile.musl", "deploy/Dockerfile.musl", false),
         ("docs/VERIFICATION.md", "docs/VERIFICATION.md", false),
         ("docs/CONFIGURATION.md", "docs/CONFIGURATION.md", false),
         ("docs/PROTOCOL.md", "docs/PROTOCOL.md", false),
-        ("docs/FINGERPRINTS.md", "docs/FINGERPRINTS.md", false),
-        ("docs/ARCHITECTURE.md", "docs/ARCHITECTURE.md", false),
     ] {
         copy(&root().join(source), &stage.join(destination), executable)?;
     }

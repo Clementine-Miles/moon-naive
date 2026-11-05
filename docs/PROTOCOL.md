@@ -1,4 +1,4 @@
-# moon-naive 协议和隧道方案
+# 协议与架构
 
 当前版本 **0.7.0**，认证域与 exporter 使用修订4。**不产生空闲假流量，不为真实反代添加Padding首部或改写正文**。采用认证协商的8/16条初期窗口，可选低比例后段填充。旧moon-naive和官方Naïve客户端不兼容；新的Chromium客户端尚待实现。
 
@@ -100,3 +100,86 @@ MAC只位于请求/确认首部，应用记录没有新的自制加密或逐记�
 认证协商在core/src/auth.rs，预算与借用解码在core/src/codec.rs，采样/缓冲/空闲期限在src/net/tunnel.rs，H2/H3适配分别使用Pingora/quiche。没有新增运行依赖或Go栈。
 
 客户端应保留Chromium证书策略、TLS/H2/H3栈，在实际分配流ID后签名，验证协商后初始化双向codec；复用外层会话，禁止H1代理回退、0-RTT和Fast Open。验证范围见[VERIFICATION.md](VERIFICATION.md)。
+
+
+## 服务端架构
+
+0.7.0 由根包构建 moon-naive；core 提供协议与配置逻辑，tools/xtask 提供构建及发布工具。运行时只需服务端程序、配置、持久化状态和所需系统信任根。
+
+### 生命周期
+
+CLI 先校验配置、用户、网站和传输条件。ACME 控制面运行在独立线程的 Tokio runtime，避免 DNS、日志写入和 fsync 占用数据面线程。没有有效证书时等待 DNS-01 签发，验证、安装后绑定 TCP/UDP，并通知 systemd 就绪。
+
+账户操作使用 instant-acme；Porkbun/Cloudflare 适配器管理 TXT，日志记录未完成操作。证书经 SAN、私钥、链、有效期等检查后写入 generation，原子更新 CURRENT。续期失败保留仍有效的证书；轮换后新连接使用新上下文，已有连接继续。
+
+SIGTERM/SIGINT 停止接入并排空连接，随后限时清理本进程拥有的 TXT。状态使用单写锁；升级时应保留整个 state_dir。
+
+### 请求路径
+
+- TCP：BoringSSL 处理 TLS；H1 提供网站，Pingora H2 支持网站与认证代理。
+- UDP：quiche 处理 QUIC/H3；网站通过有界内存 H2 桥进入同一 Pingora 引擎。
+- 代理仅在 TLS 1.3 H2/H3 上启用。每条请求绑定 exporter、流 ID 和请求字段验证；CONNECT 经 ACL、预算和目标拨号后才返回 200 与响应证明。
+- 未认证请求进入固定网站路由；固定网站与任意目标正向代理使用不同的路由、元数据和连接池隔离规则。
+
+实现见[网络入口](../src/net/mod.rs)、[网站引擎](../src/net/site/mod.rs)及[内存桥](../src/net/site/bridge.rs)。认证和记录格式以[协议](PROTOCOL.md)为准。
+
+### 连接与资源
+
+每条 CONNECT 对应一条目标 TCP 连接，外层 H2/H3 连接可以复用。隧道保留背压、半关闭、取消和额度释放；任一方向实际进展更新空闲期限，默认 600 秒。
+
+网站支持固定源站池、最长前缀路由、gzip、SSE/gRPC、trailers 和固定路由 WebSocket。HTTPS 回源校验证书及名称；安全方法的建连失败可有限回退，不重放 POST。正向出站先检查 DNS/IP ACL，可使用一个 HTTP、HTTPS 或 SOCKS5 下一跳，失败不回退直连。
+
+连接/流窗口和共享接收预算约束内存，接收预算不等于 RSS 上限。TCP 拥塞由内核处理，QUIC 拥塞由 quiche 处理；Linux timerfd 为 QUIC 提供发送期限等待，UDP 阻塞时等待可写。
+
+### 依赖与边界
+
+TLS 共用 BoringSSL；quiche 使用 boring crate 后端。gzip 由 Rust miniz_oxide 处理。源码打包、SHA-256 和 ELF 检查由 tools/xtask 的 Rust 库完成；首次 BoringSSL 构建仍需要原生工具链。
+
+固定 Pingora 与 instant-acme 补丁随 vendor 提供并校验；后者仅增加使用持久化私钥和 EAB 注册的接口，复用上游协议实现。
+
+不提供管理 API、动态任意网站路由、多 SAN 自动证书、分布式状态或多 CA 自动切换。ECH 为实验性功能。配置详见[配置指南](CONFIGURATION.md)，未验收范围见[验证记录](VERIFICATION.md)，网络可观察性见[可观察性与兼容性](#可观察性与兼容性)。
+
+
+### 恢复边界
+
+H3 内存桥使用可替换代际。任一驱动退出会通知当前交换失败；后续请求经有界、单次构建及冷却后获得新桥。不会重放应用请求。DATA 长度在进入共享 H2 连接前检查，长度不符只重置该流。
+
+CONNECT、HTTP 转发及固定网站源站复用有界 TCP 候选拨号，最多同时尝试两个地址。固定源站允许显式配置的私网地址，任意转发目标仍应用公共目标策略。源站选择与其地址回退分开；TLS 握手后的候选回退、整个 DNS/TCP/TLS 链的一次总截止时间仍待完善。
+
+上述改动没有完成控制面进程隔离、双身份自动证书管理、原子多路径激活或认证容量预留。当前真实实现及验收差距见[实施报告](VERIFICATION.md#安全实施记录)。
+
+
+## 项目结构
+
+0.7.0 使用一个 Cargo workspace 和锁文件，共三个包：moon-naive、moon-naive-core、xtask。
+
+| 路径 | 职责 |
+| --- | --- |
+| [src](../src/) | 服务端 CLI、运行时、证书控制面及网络入口 |
+| [src/acme/account.rs](../src/acme/account.rs) | instant-acme 账户创建、恢复及 EAB 协调 |
+| [src/acme/manager.rs](../src/acme/manager.rs) | DNS-01 订单、续期、退避及恢复 |
+| [src/acme/eab.rs](../src/acme/eab.rs) | EAB 导入和 instant-acme 注册适配 |
+| [src/acme/state.rs](../src/acme/state.rs) / [store.rs](../src/acme/store.rs) | 日志、私有权限、证书 generation 和 CURRENT |
+| [src/net](../src/net/) | TLS、H2/H3、隧道、ACL 拨号及固定下一跳 |
+| [src/net/site](../src/net/site/) | 共用 Pingora 网站/正向代理、上游池和 WebSocket |
+| [core/src](../core/src/) | 配置、认证、记录 codec、准入及额度策略 |
+| [tools/xtask](../tools/xtask/) | Rust 审计、构建检查及发布打包 |
+| [deploy](../deploy/) | systemd、OpenRC 和可选 musl 构建镜像 |
+| [config.example.toml](../config.example.toml) | 唯一运行配置模板，config init 内嵌同一文件 |
+| [assets](../assets/) | 对应内置 staging CA 的公开根证书 |
+| [vendor/pingora](../vendor/pingora/) | 固定 Pingora 源码、补丁和校验清单 |
+| [vendor/instant-acme](../vendor/instant-acme/) | 固定 instant-acme 源码及持久化私钥注册接口补丁 |
+| [licenses](../licenses/) | 第三方许可文本 |
+| [docs](./) | 使用、设计、限制与历史摘要 |
+
+第一方单元、传输及隔离 ACME 测试已恢复；`tests/` 保存 CLI 和 Pebble 集成测试。HANDOFF 和外部抓包工具未恢复。vendor 中的公开测试夹具属于受校验的上游快照，不能直接清理。target、reports、dist 为生成目录，不属于运行依赖。
+
+构建入口见[工具说明](../tools/README.md)。
+
+## 可观察性与兼容性
+
+BoringSSL、Pingora、quiche 的组合不代表浏览器指纹，也不证明更难识别。TLS/QUIC 握手、SNI、ALPN、HTTP 设置、包长、方向和时序仍可被观察；认证和填充不能消除 TLS-in-TLS、关联或长度信号。ECH 不隐藏 IP、公开名称、长度或时序，证书及 DNS 发布边界见[配置](CONFIGURATION.md#ech)。
+
+本项目不兼容官方 NaïveProxy 客户端，未实现 REALITY 的目标站握手校准。AnyTLS 等协议的历史对照不代表当前上游漏洞状态，也不能用于推导本项目的安全性或识别率。桥接上传失败、最终响应、半关闭和取消分别处理；固定网站可携带服务端生成的转发元数据，任意目标正向代理清理身份字段及 Via，动态压缩尊重 no-transform。
+
+旧抓包数据保留在 [packet-lab-results.json](packet-lab-results.json)，仅供追溯；未完成真实 Chromium 客户端或公网 DPI 验收。验证结果见[验证记录](VERIFICATION.md)。

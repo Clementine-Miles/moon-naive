@@ -29,7 +29,7 @@ cargo build --release --locked -p moon-naive
 ## 文档
 
 - [配置与证书](docs/CONFIGURATION.md) · [VPS 部署](docs/VPS-GUIDE.md)
-- [协议](docs/PROTOCOL.md) · [架构](docs/ARCHITECTURE.md)
+- [协议与架构](docs/PROTOCOL.md)
 - [验证范围与已知限制](docs/VERIFICATION.md)
 
 本地测试不代表公网 CA 签发、长期稳定性或 DPI 不可识别。许可证：Apache-2.0。
