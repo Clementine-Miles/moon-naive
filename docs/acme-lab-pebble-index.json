@@ -1,0 +1,849 @@
+{
+  "artifact_root": "/workspace/acme-lab-artifacts/pebble-final",
+  "cases": [
+    {
+      "case": "pebble-eab-normal-88765-1793941773415022277",
+      "tshark_exit": 0,
+      "pcap_rows": 158,
+      "http_requests": 59,
+      "dns_frames": 40,
+      "valid_jose": 27,
+      "invalid_jose": 0,
+      "eab_valid": 1,
+      "url_mismatch": 0
+    },
+    {
+      "case": "pebble-plain-crash-88765-1793941736907312998",
+      "tshark_exit": 0,
+      "pcap_rows": 66,
+      "http_requests": 23,
+      "dns_frames": 20,
+      "valid_jose": 10,
+      "invalid_jose": 0,
+      "eab_valid": 0,
+      "url_mismatch": 0
+    },
+    {
+      "case": "pebble-plain-nonce100-88765-1793941772672225107",
+      "tshark_exit": 0,
+      "pcap_rows": 16,
+      "http_requests": 8,
+      "dns_frames": 0,
+      "valid_jose": 5,
+      "invalid_jose": 0,
+      "eab_valid": 0,
+      "url_mismatch": 0
+    },
+    {
+      "case": "pebble-plain-normal-88765-1793941778923610069",
+      "tshark_exit": 0,
+      "pcap_rows": 132,
+      "http_requests": 46,
+      "dns_frames": 40,
+      "valid_jose": 23,
+      "invalid_jose": 0,
+      "eab_valid": 0,
+      "url_mismatch": 0
+    },
+    {
+      "case": "pebble-plain-reuse-88765-1793941732927633361",
+      "tshark_exit": 0,
+      "pcap_rows": 80,
+      "http_requests": 30,
+      "dns_frames": 20,
+      "valid_jose": 16,
+      "invalid_jose": 0,
+      "eab_valid": 0,
+      "url_mismatch": 0
+    },
+    {
+      "case": "pebble-plain-sigterm-88765-1793941740051931155",
+      "tshark_exit": 0,
+      "pcap_rows": 56,
+      "http_requests": 18,
+      "dns_frames": 20,
+      "valid_jose": 8,
+      "invalid_jose": 0,
+      "eab_valid": 0,
+      "url_mismatch": 0
+    },
+    {
+      "case": "pebble-plain-timeout-88765-1793941741486675806",
+      "tshark_exit": 0,
+      "pcap_rows": 58,
+      "http_requests": 19,
+      "dns_frames": 20,
+      "valid_jose": 9,
+      "invalid_jose": 0,
+      "eab_valid": 0,
+      "url_mismatch": 0
+    }
+  ],
+  "files": [
+    {
+      "path": "baseline.json",
+      "bytes": 171779,
+      "sha256": "83358982bde9e2471224a65458769290a7ee0a54f17ee1d874818cf2785884de"
+    },
+    {
+      "path": "build-integration.result.json",
+      "bytes": 237,
+      "sha256": "696f9c16af3b9082b244bf5009550cb3048e12790f5c908f8cf7297667e07e27"
+    },
+    {
+      "path": "build-integration.stderr.log",
+      "bytes": 211,
+      "sha256": "ed45e0f6d98283f59f5e9fa693c2350d746898ad5ae485b0c8954507b224d72a"
+    },
+    {
+      "path": "build-integration.stdout.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "commands.json",
+      "bytes": 748,
+      "sha256": "cbc28f3ca25dbf0a01a41d1eaa9dfe143e2c7d2f822731110ac8f218d10edbd4"
+    },
+    {
+      "path": "pebble-eab-normal-88765-1793941773415022277/analysis.json",
+      "bytes": 222,
+      "sha256": "a0895842dacd8e02c75371ad5fd55d911b6887f8761108635abd0e7b700b0aa5"
+    },
+    {
+      "path": "pebble-eab-normal-88765-1793941773415022277/analysis.keys",
+      "bytes": 34128,
+      "sha256": "f28e580c61842304b9e0937e4abe1209059f5521015d3b2c8f8f98642c8b46bd"
+    },
+    {
+      "path": "pebble-eab-normal-88765-1793941773415022277/challtestsrv.stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "pebble-eab-normal-88765-1793941773415022277/challtestsrv.stdout.log",
+      "bytes": 1125,
+      "sha256": "b4749746bf3f3f607291eb2ba90d5adaeb8f7255fb60fdcb2575987c85d70042"
+    },
+    {
+      "path": "pebble-eab-normal-88765-1793941773415022277/events.jsonl",
+      "bytes": 1056,
+      "sha256": "cd3c2bc23d8d3c40c8b1bd9fc7ef8e468f80cf8c32f518f61d0d06be3d2dd5b5"
+    },
+    {
+      "path": "pebble-eab-normal-88765-1793941773415022277/journal-eab-account-recovery.json",
+      "bytes": 1174,
+      "sha256": "515e7fd6780d7885752a9f68f7dbcc005fea49b471eda45b46d9b37df84b7cf7"
+    },
+    {
+      "path": "pebble-eab-normal-88765-1793941773415022277/journal-initial-issued.json",
+      "bytes": 1214,
+      "sha256": "c4da265133a76e7fcf52a5e2b50f4e27615af8abea6475a2910d1acdafed1872"
+    },
+    {
+      "path": "pebble-eab-normal-88765-1793941773415022277/journal-renewed.json",
+      "bytes": 1214,
+      "sha256": "0b6cf48aefcd9c99c3cb1a11dc52cf40bb2fccc52c0660c9025792b32db3c752"
+    },
+    {
+      "path": "pebble-eab-normal-88765-1793941773415022277/manifest.json",
+      "bytes": 477,
+      "sha256": "a447b359d85d520ac2b34efedbf5fc3b78b80bb83ea0a97eec1425f433b9441f"
+    },
+    {
+      "path": "pebble-eab-normal-88765-1793941773415022277/pebble.json",
+      "bytes": 543,
+      "sha256": "aa1e5c27d86b3cc48e291dcd71fe303908d9b620540cc601990d6a83285bbbd1"
+    },
+    {
+      "path": "pebble-eab-normal-88765-1793941773415022277/pebble.log",
+      "bytes": 7130,
+      "sha256": "74db0a15c3bcd4c34b91c2159572017694e71c69535bb796cfc39493e15798e6"
+    },
+    {
+      "path": "pebble-eab-normal-88765-1793941773415022277/pebble.stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "pebble-eab-normal-88765-1793941773415022277/ports.json",
+      "bytes": 74,
+      "sha256": "54f656a96d1e86f442d2e4a243c9331dae55b39628d66f2e3cf8c99cff7ee215"
+    },
+    {
+      "path": "pebble-eab-normal-88765-1793941773415022277/state/acme/journal-e4a8b0ec57d1b986577f978dbb56dfb5c6d3b330c8a68a086a002ab6b6ed0cc5.json",
+      "bytes": 1174,
+      "sha256": "515e7fd6780d7885752a9f68f7dbcc005fea49b471eda45b46d9b37df84b7cf7"
+    },
+    {
+      "path": "pebble-eab-normal-88765-1793941773415022277/tcpdump.log",
+      "bytes": 166,
+      "sha256": "52b8e3811a3200509773bde5d8f46860349a64644fa6407f9155ff5392caa2bf"
+    },
+    {
+      "path": "pebble-eab-normal-88765-1793941773415022277/timeline.json",
+      "bytes": 82579,
+      "sha256": "60014a704f44039d243121b8db65dfdd1cc8d87628935d7a5241f299f180488d"
+    },
+    {
+      "path": "pebble-eab-normal-88765-1793941773415022277/tls.keys",
+      "bytes": 34128,
+      "sha256": "f28e580c61842304b9e0937e4abe1209059f5521015d3b2c8f8f98642c8b46bd"
+    },
+    {
+      "path": "pebble-eab-normal-88765-1793941773415022277/tshark.result.json",
+      "bytes": 1301,
+      "sha256": "1effcb2583857a72f73f58d0b089111a88b89a8ca94bca0bdc6f2bd39e35d6cf"
+    },
+    {
+      "path": "pebble-eab-normal-88765-1793941773415022277/tshark.stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "pebble-eab-normal-88765-1793941773415022277/wire.pcap",
+      "bytes": 385017,
+      "sha256": "326ee388d160782b267674f3ff2736f8f0eecfcee95876733a368594a84b1a1a"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/analysis.json",
+      "bytes": 222,
+      "sha256": "4ad33d2bd75359247a45abb2f884d2c9f5faa06109713944519f753dfb33954d"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/analysis.keys",
+      "bytes": 13272,
+      "sha256": "d5e68bbdba5fb44bcc03ceaee00b1d910db7487746866809469ccb476bf1a1bc"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/challtestsrv.stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/challtestsrv.stdout.log",
+      "bytes": 722,
+      "sha256": "14c1f83be964b6db8a16fa6a974c3f76d5665ca069ba0b379ebcd620e484d123"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/events.jsonl",
+      "bytes": 2420,
+      "sha256": "2f01e1feb7826d0851aad4242010e9c5f760fad554b52632d79cad613070dba1"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/journal-after-cancel-before-dns.json",
+      "bytes": 2262,
+      "sha256": "80225f8d91e49607e0fcbab3d5f9644c77d4907bf698ed66f4fccc71344af37c"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/journal-after-crash-before-restart.json",
+      "bytes": 2456,
+      "sha256": "c86f665e7ac49b067378e649948f3df2e3e39caa70e85d7ca6d5275ada0a6594"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/journal-challenge-acked-before-authority.json",
+      "bytes": 2456,
+      "sha256": "c86f665e7ac49b067378e649948f3df2e3e39caa70e85d7ca6d5275ada0a6594"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/manifest.json",
+      "bytes": 476,
+      "sha256": "31352aaeccc605b2e88cea1ed01e5dabd5ee7b26f1a79f5eafd7dc9353e6d67a"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/pebble.json",
+      "bytes": 544,
+      "sha256": "b7ebeb80d507decaa697ee7bfd8494319765df59664098545440af17a747f5e6"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/pebble.log",
+      "bytes": 3610,
+      "sha256": "e7d9ea718b2a1d02584e8f03e1677da68ceb6e2372da07addea8ab070798c309"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/pebble.stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/ports.json",
+      "bytes": 74,
+      "sha256": "69a9d567b01384fa2be41a0e14b866eaf37491fc948b47639aa081133902c5f2"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/state/acme/journal-d3cbec345e1bd5e0f5f9950cd726ea40b8acea20aff639097727ee58055bed9c.json",
+      "bytes": 2262,
+      "sha256": "80225f8d91e49607e0fcbab3d5f9644c77d4907bf698ed66f4fccc71344af37c"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/tcpdump.log",
+      "bytes": 164,
+      "sha256": "7faa33f9595d0e536eff38fd3766c0e8c459ea1632fe3982ee56a95d22812453"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/timeline.json",
+      "bytes": 35723,
+      "sha256": "454b8acb812c7c440a67011d0d9e41b48844501670f35812b6285556efc34d54"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/tls.keys",
+      "bytes": 13272,
+      "sha256": "d5e68bbdba5fb44bcc03ceaee00b1d910db7487746866809469ccb476bf1a1bc"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/tshark.result.json",
+      "bytes": 1303,
+      "sha256": "02baf9f0655747ce590e7c8f9877a3bfde31895fdcb432c2e63a767195fd469a"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/tshark.stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/wire.pcap",
+      "bytes": 147927,
+      "sha256": "b371a8fddd3a3248cadad37c9163e382e308d63dba2a8b14c104b4363d59279d"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/worker-initial.stderr.log",
+      "bytes": 127,
+      "sha256": "0ffab2f62e430f32cf1af313d874e6af2019719fc61ad5f65066d4d699f43df8"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/worker-initial.stdout.log",
+      "bytes": 84,
+      "sha256": "88d04013c53fdbfae2dfa44228e15f3f6ad66376fa3a0b5c1f583a3d45414a55"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/worker-restart.stderr.log",
+      "bytes": 184,
+      "sha256": "9be60b95b113b54af8cb952f7643c4d9e83c8a3021358bb24bb768e827be90eb"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/worker-restart.stdout.log",
+      "bytes": 183,
+      "sha256": "627a7feb121e110824203169eb17a5651cb4718e4112366335110f54691ced5e"
+    },
+    {
+      "path": "pebble-plain-crash-88765-1793941736907312998/worker.json",
+      "bytes": 678,
+      "sha256": "94df35633ec663ded2f9fb72509794048078abdf051960b53837e674a75d1e3d"
+    },
+    {
+      "path": "pebble-plain-nonce100-88765-1793941772672225107/analysis.json",
+      "bytes": 222,
+      "sha256": "1514c10c09fccd928a92e4bc111f505897d6def1e35dd3441df1e034bc10351d"
+    },
+    {
+      "path": "pebble-plain-nonce100-88765-1793941772672225107/analysis.keys",
+      "bytes": 5056,
+      "sha256": "b49170b7a93792352f2b4bd03e2223a76a4e728e9282a9c8f4bbd1cda9a4abc8"
+    },
+    {
+      "path": "pebble-plain-nonce100-88765-1793941772672225107/challtestsrv.stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "pebble-plain-nonce100-88765-1793941772672225107/challtestsrv.stdout.log",
+      "bytes": 436,
+      "sha256": "48b8a526366b27081239cfd3965113da0f3acc60fef1b79a4d73cf68571d1fd2"
+    },
+    {
+      "path": "pebble-plain-nonce100-88765-1793941772672225107/events.jsonl",
+      "bytes": 770,
+      "sha256": "7a2a3cc065cbf79eaf4409406e54999f11aeaa23e5044da49fd4e6b06a79bc30"
+    },
+    {
+      "path": "pebble-plain-nonce100-88765-1793941772672225107/journal-after-bounded-rejection.json",
+      "bytes": 837,
+      "sha256": "a232c9fba1da08a76192f580d4ee65e8031276b510926678aed242563a2901fb"
+    },
+    {
+      "path": "pebble-plain-nonce100-88765-1793941772672225107/manifest.json",
+      "bytes": 463,
+      "sha256": "ba371bee331ef5621e3ad00765c8dfc903229e63cf416774759c05c995ce7743"
+    },
+    {
+      "path": "pebble-plain-nonce100-88765-1793941772672225107/pebble.json",
+      "bytes": 544,
+      "sha256": "f0498863ae22ac40ca1fc5048480ee90b64965c6f7c02e97abdebec775922a45"
+    },
+    {
+      "path": "pebble-plain-nonce100-88765-1793941772672225107/pebble.log",
+      "bytes": 1723,
+      "sha256": "c8892665cf802b22a2d6066ced8cebec3a370e793e4a4dd197abf20ee84bd4fc"
+    },
+    {
+      "path": "pebble-plain-nonce100-88765-1793941772672225107/pebble.stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "pebble-plain-nonce100-88765-1793941772672225107/ports.json",
+      "bytes": 74,
+      "sha256": "6a269e495f2858fa7ec1d1c46719046cb990a79c797de3e6c33204e2bd5c109c"
+    },
+    {
+      "path": "pebble-plain-nonce100-88765-1793941772672225107/state/acme/journal-292e5dd32c3b78121f0d88e8ba0f7e7bdba5e91db0297a53de28e805d2a65a24.json",
+      "bytes": 837,
+      "sha256": "a232c9fba1da08a76192f580d4ee65e8031276b510926678aed242563a2901fb"
+    },
+    {
+      "path": "pebble-plain-nonce100-88765-1793941772672225107/tcpdump.log",
+      "bytes": 164,
+      "sha256": "3fe36c1eb6b5d9a8509631a7f6ccdfa0613d793cecd42647573134290dd7e04f"
+    },
+    {
+      "path": "pebble-plain-nonce100-88765-1793941772672225107/timeline.json",
+      "bytes": 10399,
+      "sha256": "0bd6c434464e98fdb71d4ec5d78f044fdb514cd4a06d7e3d72535385936e2ee5"
+    },
+    {
+      "path": "pebble-plain-nonce100-88765-1793941772672225107/tls.keys",
+      "bytes": 5056,
+      "sha256": "b49170b7a93792352f2b4bd03e2223a76a4e728e9282a9c8f4bbd1cda9a4abc8"
+    },
+    {
+      "path": "pebble-plain-nonce100-88765-1793941772672225107/tshark.result.json",
+      "bytes": 1309,
+      "sha256": "abd0d6e67778c2beeb01721ae174efb2f92ed13aab93026a6c323d99247e40cf"
+    },
+    {
+      "path": "pebble-plain-nonce100-88765-1793941772672225107/tshark.stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "pebble-plain-nonce100-88765-1793941772672225107/wire.pcap",
+      "bytes": 54564,
+      "sha256": "ccf93504ffcc3673d5a753ad892bfe09ffcf772499cbf7e1683f29d6aa9e33f4"
+    },
+    {
+      "path": "pebble-plain-normal-88765-1793941778923610069/analysis.json",
+      "bytes": 224,
+      "sha256": "66fbabf218cbe67a3d5535bee4c21c8c700bcdaa2287528ecc45436b63218b8b"
+    },
+    {
+      "path": "pebble-plain-normal-88765-1793941778923610069/analysis.keys",
+      "bytes": 25912,
+      "sha256": "82304fd94e84f0583b648a3c9ef6f446f6ad4a0b6b7e5044b40773527c624d6e"
+    },
+    {
+      "path": "pebble-plain-normal-88765-1793941778923610069/challtestsrv.stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "pebble-plain-normal-88765-1793941778923610069/challtestsrv.stdout.log",
+      "bytes": 1125,
+      "sha256": "8f6b2edb2ea2047b74b74357bfd3e2f41ea49af0ba84997a952cb2a0b4b099a5"
+    },
+    {
+      "path": "pebble-plain-normal-88765-1793941778923610069/events.jsonl",
+      "bytes": 930,
+      "sha256": "2c817adc6c869af824f148d2c20659f544a47d1ca8ad105be4bd0e0a947bd899"
+    },
+    {
+      "path": "pebble-plain-normal-88765-1793941778923610069/journal-initial-issued.json",
+      "bytes": 1156,
+      "sha256": "743b7cea007cb40ab880f13db881b5a0e431be4a84d4d2967fabacea79f29df3"
+    },
+    {
+      "path": "pebble-plain-normal-88765-1793941778923610069/journal-renewed.json",
+      "bytes": 1156,
+      "sha256": "1f80cd2fc299e9ed8ed1cbef7ac1e50983a27bb5eeb680e8c9f0593e8f8e9665"
+    },
+    {
+      "path": "pebble-plain-normal-88765-1793941778923610069/manifest.json",
+      "bytes": 477,
+      "sha256": "7af9eaba79b7b5dfdaf28df21e5eec3a36de43a11557d9c2b85b1f1022fe47e3"
+    },
+    {
+      "path": "pebble-plain-normal-88765-1793941778923610069/pebble.json",
+      "bytes": 544,
+      "sha256": "d81337dcd890c3be45ed0d2a2473546d1eb1f7b78fd5176f1bbfbc15f1f342b4"
+    },
+    {
+      "path": "pebble-plain-normal-88765-1793941778923610069/pebble.log",
+      "bytes": 6177,
+      "sha256": "f53da17a6607c0004c58670d2923b51860b6440862b8e61ae9b21d349b5a21ec"
+    },
+    {
+      "path": "pebble-plain-normal-88765-1793941778923610069/pebble.stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "pebble-plain-normal-88765-1793941778923610069/ports.json",
+      "bytes": 74,
+      "sha256": "fb49ca30865187301a675955c1e0306cf413a2c4298064d7e52c669063783b72"
+    },
+    {
+      "path": "pebble-plain-normal-88765-1793941778923610069/state/acme/journal-2c3cd97ff6212202c2df1544c49347691d3d2788b069cf09cdaf05841ccc651e.json",
+      "bytes": 1165,
+      "sha256": "e5a9c75a97f7d289123e9505e872bdc395b37c6787b26fef3732240894cdaa51"
+    },
+    {
+      "path": "pebble-plain-normal-88765-1793941778923610069/tcpdump.log",
+      "bytes": 165,
+      "sha256": "9de5abba73ab74e7f5eee09e1dffb4b6cff23d1d2db470808b04736c126f5be9"
+    },
+    {
+      "path": "pebble-plain-normal-88765-1793941778923610069/timeline.json",
+      "bytes": 71328,
+      "sha256": "a8bf0694d21bb3ce2d8ef2f050d6b04cbb18d61c8174625a3fbc0bbe92560629"
+    },
+    {
+      "path": "pebble-plain-normal-88765-1793941778923610069/tls.keys",
+      "bytes": 25912,
+      "sha256": "82304fd94e84f0583b648a3c9ef6f446f6ad4a0b6b7e5044b40773527c624d6e"
+    },
+    {
+      "path": "pebble-plain-normal-88765-1793941778923610069/tshark.result.json",
+      "bytes": 1305,
+      "sha256": "e6242dbf67af60c2e16354b47219e85d47a1bdaaac54906aa61a4b68ae61effb"
+    },
+    {
+      "path": "pebble-plain-normal-88765-1793941778923610069/tshark.stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "pebble-plain-normal-88765-1793941778923610069/wire.pcap",
+      "bytes": 299272,
+      "sha256": "cdb3bf7941710bbc37e979439b29bae91b3ebe0a6e58fac711db42de8927b771"
+    },
+    {
+      "path": "pebble-plain-reuse-88765-1793941732927633361/analysis.json",
+      "bytes": 222,
+      "sha256": "92ccd056c712685d068fd7ac055a4ea7c36e0a27122b47d24bf91fde3890b69d"
+    },
+    {
+      "path": "pebble-plain-reuse-88765-1793941732927633361/analysis.keys",
+      "bytes": 17696,
+      "sha256": "2e613b567e15f28681ccff98055fb945302c9587e73b0a218836b9572532b357"
+    },
+    {
+      "path": "pebble-plain-reuse-88765-1793941732927633361/challtestsrv.stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "pebble-plain-reuse-88765-1793941732927633361/challtestsrv.stdout.log",
+      "bytes": 722,
+      "sha256": "5f1fe786ba01ab4e58470c117c8c4c77cd041c76371f39a313370d3a89f44861"
+    },
+    {
+      "path": "pebble-plain-reuse-88765-1793941732927633361/events.jsonl",
+      "bytes": 858,
+      "sha256": "4651bc638528cb3fcfb7edb8032ebcabf0aad55cc04cce51fee45eea19c358f6"
+    },
+    {
+      "path": "pebble-plain-reuse-88765-1793941732927633361/journal-initial-issued.json",
+      "bytes": 1170,
+      "sha256": "5c1aca8673bb98f7f2914c0788fcaa866891618ba58009c45b14221a7b865565"
+    },
+    {
+      "path": "pebble-plain-reuse-88765-1793941732927633361/journal-renewed-with-reused-authorization.json",
+      "bytes": 1170,
+      "sha256": "ac5365aef1318a9d17282297fb376965f0530d91b2cb9007b0bf210cc38b81dc"
+    },
+    {
+      "path": "pebble-plain-reuse-88765-1793941732927633361/manifest.json",
+      "bytes": 472,
+      "sha256": "d469be608c10b7b880313ff5f79a844360b428c479579e1d81b93f69a6204fa4"
+    },
+    {
+      "path": "pebble-plain-reuse-88765-1793941732927633361/pebble.json",
+      "bytes": 544,
+      "sha256": "ceae16a41b7f430c01257c12bb0e2b0edc605232782209aba9c3bc2ee40ee46d"
+    },
+    {
+      "path": "pebble-plain-reuse-88765-1793941732927633361/pebble.log",
+      "bytes": 4759,
+      "sha256": "7652e5556c5391920c9da75012e06fc2233ce4323417992e7a90856a86e2cb47"
+    },
+    {
+      "path": "pebble-plain-reuse-88765-1793941732927633361/pebble.stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "pebble-plain-reuse-88765-1793941732927633361/ports.json",
+      "bytes": 74,
+      "sha256": "48e422912299267d06677b3ed8b2df95e31ea96943a65bcb773cab3979737020"
+    },
+    {
+      "path": "pebble-plain-reuse-88765-1793941732927633361/state/acme/journal-3682a3b704773e626e38ed5da60d90023c609d9392ab2e0a6da54fc6e5eeb0e2.json",
+      "bytes": 1170,
+      "sha256": "ac5365aef1318a9d17282297fb376965f0530d91b2cb9007b0bf210cc38b81dc"
+    },
+    {
+      "path": "pebble-plain-reuse-88765-1793941732927633361/tcpdump.log",
+      "bytes": 165,
+      "sha256": "5f66eebf3853b4d2979a3aaf655a56661ce7a2913cc2d465a9689eb72cbd6528"
+    },
+    {
+      "path": "pebble-plain-reuse-88765-1793941732927633361/timeline.json",
+      "bytes": 43945,
+      "sha256": "d0b3ad92b7d37b34a74028232f1c8bbac68b3ae23e94c3737485dc0a1e57c1f2"
+    },
+    {
+      "path": "pebble-plain-reuse-88765-1793941732927633361/tls.keys",
+      "bytes": 17696,
+      "sha256": "2e613b567e15f28681ccff98055fb945302c9587e73b0a218836b9572532b357"
+    },
+    {
+      "path": "pebble-plain-reuse-88765-1793941732927633361/tshark.result.json",
+      "bytes": 1303,
+      "sha256": "0d4e554ad81911ed44fb41ff3263c614a0cdc6084439cadda926836add65c494"
+    },
+    {
+      "path": "pebble-plain-reuse-88765-1793941732927633361/tshark.stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "pebble-plain-reuse-88765-1793941732927633361/wire.pcap",
+      "bytes": 202431,
+      "sha256": "0e3178d6730f2cd9742b228dc12e1230bb1827e2a7717a5819c228b5e2618707"
+    },
+    {
+      "path": "pebble-plain-sigterm-88765-1793941740051931155/analysis.json",
+      "bytes": 223,
+      "sha256": "5233c5ea88831a671342e68d58ed0b0ce56456f7161e5d18a79c6692a6568bdd"
+    },
+    {
+      "path": "pebble-plain-sigterm-88765-1793941740051931155/analysis.keys",
+      "bytes": 10112,
+      "sha256": "ea9be6d38bf37063bf6ec7135526227f72c9cdd8d97668f49c96678221d1579a"
+    },
+    {
+      "path": "pebble-plain-sigterm-88765-1793941740051931155/challtestsrv.stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "pebble-plain-sigterm-88765-1793941740051931155/challtestsrv.stdout.log",
+      "bytes": 722,
+      "sha256": "9a142cea0f691904fe9b6430d16f31db47c1e83b2ff46946d117c1fde28f95d0"
+    },
+    {
+      "path": "pebble-plain-sigterm-88765-1793941740051931155/events.jsonl",
+      "bytes": 2190,
+      "sha256": "51bac77940ebc1948570273122f383384ee9590312c999236a0e856a13ed59fd"
+    },
+    {
+      "path": "pebble-plain-sigterm-88765-1793941740051931155/journal-after-cancel-before-dns.json",
+      "bytes": 2260,
+      "sha256": "f8cb20d4f6ab8f3fee18a1b6bc856b6ba48b58c6077c60ffad374acabaeb0701"
+    },
+    {
+      "path": "pebble-plain-sigterm-88765-1793941740051931155/journal-challenge-acked-before-authority.json",
+      "bytes": 2454,
+      "sha256": "3adcdfc03b4f4206a237f5308b87bc3104d55cf1a190ada4d287539edc9520c8"
+    },
+    {
+      "path": "pebble-plain-sigterm-88765-1793941740051931155/manifest.json",
+      "bytes": 472,
+      "sha256": "789acbf41bd5512c143057c3a443094e8097f520f0a9afb34ebf1b173925799e"
+    },
+    {
+      "path": "pebble-plain-sigterm-88765-1793941740051931155/pebble.json",
+      "bytes": 544,
+      "sha256": "b8a1572299fbfdfc471c22e7c2cbcca7246c5fb82cc71b25182ff26b58a83fdd"
+    },
+    {
+      "path": "pebble-plain-sigterm-88765-1793941740051931155/pebble.log",
+      "bytes": 3296,
+      "sha256": "3bc38f0185fc7ef66061448d0e0d607e444a68afea8f47684d2c6b61d644b298"
+    },
+    {
+      "path": "pebble-plain-sigterm-88765-1793941740051931155/pebble.stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "pebble-plain-sigterm-88765-1793941740051931155/ports.json",
+      "bytes": 74,
+      "sha256": "3e0164b097c7c887bd83082a429f0181919ed8de0421eaf620e907ef47f49a1c"
+    },
+    {
+      "path": "pebble-plain-sigterm-88765-1793941740051931155/state/acme/journal-7b9e8e5b5e8829f818aa3731b2ad8bbae0928f1959b7e9b29c773f0198b84b27.json",
+      "bytes": 2260,
+      "sha256": "f8cb20d4f6ab8f3fee18a1b6bc856b6ba48b58c6077c60ffad374acabaeb0701"
+    },
+    {
+      "path": "pebble-plain-sigterm-88765-1793941740051931155/tcpdump.log",
+      "bytes": 164,
+      "sha256": "e0edad651e4031dc3c966740bb1d29708fce513682b33a9cc93bec3f3822acaf"
+    },
+    {
+      "path": "pebble-plain-sigterm-88765-1793941740051931155/timeline.json",
+      "bytes": 31124,
+      "sha256": "973b96f579c769c974514b680931776410e0af394c6a4e66e8897eceb6bc72ac"
+    },
+    {
+      "path": "pebble-plain-sigterm-88765-1793941740051931155/tls.keys",
+      "bytes": 10112,
+      "sha256": "ea9be6d38bf37063bf6ec7135526227f72c9cdd8d97668f49c96678221d1579a"
+    },
+    {
+      "path": "pebble-plain-sigterm-88765-1793941740051931155/tshark.result.json",
+      "bytes": 1307,
+      "sha256": "b1a2d72aab61d5f17bdebbfed3ffe6c1cd3b45dae86e223bff0d64c310b8ea8d"
+    },
+    {
+      "path": "pebble-plain-sigterm-88765-1793941740051931155/tshark.stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "pebble-plain-sigterm-88765-1793941740051931155/wire.pcap",
+      "bytes": 115407,
+      "sha256": "6160718508c956683429f1106c4d6e219372d870dfab228b0fd40a30015874d9"
+    },
+    {
+      "path": "pebble-plain-sigterm-88765-1793941740051931155/worker-initial.stderr.log",
+      "bytes": 184,
+      "sha256": "9be60b95b113b54af8cb952f7643c4d9e83c8a3021358bb24bb768e827be90eb"
+    },
+    {
+      "path": "pebble-plain-sigterm-88765-1793941740051931155/worker-initial.stdout.log",
+      "bytes": 177,
+      "sha256": "8765c661740d56cf1235a43faf0f4611636f3f361a7f8e2f1a11cc7a9c9b135a"
+    },
+    {
+      "path": "pebble-plain-sigterm-88765-1793941740051931155/worker.json",
+      "bytes": 686,
+      "sha256": "c03d8748871a7b0510e1c8b20bf67bd344ca6729bac300e8ddae1972de4b8ec6"
+    },
+    {
+      "path": "pebble-plain-timeout-88765-1793941741486675806/analysis.json",
+      "bytes": 223,
+      "sha256": "1da9fc1f894105bd2d5632ed2e293a143b727087d935b027f0dd3c4e93458b40"
+    },
+    {
+      "path": "pebble-plain-timeout-88765-1793941741486675806/analysis.keys",
+      "bytes": 10744,
+      "sha256": "a8d86ca957ac974d5c2e6ed9fb9ed7425eba72306492cab5ad24b8f20877a9e1"
+    },
+    {
+      "path": "pebble-plain-timeout-88765-1793941741486675806/challtestsrv.stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "pebble-plain-timeout-88765-1793941741486675806/challtestsrv.stdout.log",
+      "bytes": 722,
+      "sha256": "21fabf412e5bfedd34b02687e9028ff8c7851c1e2883a4fee5f61d0f167cf98f"
+    },
+    {
+      "path": "pebble-plain-timeout-88765-1793941741486675806/events.jsonl",
+      "bytes": 2041,
+      "sha256": "1696d81e34790b5eb944bcb6163d2b02666aebc82aef3905756cd75893e29034"
+    },
+    {
+      "path": "pebble-plain-timeout-88765-1793941741486675806/journal-after-cancel-before-dns.json",
+      "bytes": 2272,
+      "sha256": "4f4ed8d6db460670d8dada5517e4550653f0e730aad9a93ade9db6b36c0ac5c1"
+    },
+    {
+      "path": "pebble-plain-timeout-88765-1793941741486675806/journal-challenge-acked-before-authority.json",
+      "bytes": 2457,
+      "sha256": "3f799fc5fd0e682517f90e9ac4756a90e7c72f195fa828a689ac0bfa5aaf66f1"
+    },
+    {
+      "path": "pebble-plain-timeout-88765-1793941741486675806/manifest.json",
+      "bytes": 472,
+      "sha256": "33a2d7646d61a7990cb4a03df005267c0f58636361dcfd5d7037af91fbd3258a"
+    },
+    {
+      "path": "pebble-plain-timeout-88765-1793941741486675806/pebble.json",
+      "bytes": 544,
+      "sha256": "36768f5c649a53fbdd76a6b534b1ca8f0266a68956c0fc727c1dab59b33f2a75"
+    },
+    {
+      "path": "pebble-plain-timeout-88765-1793941741486675806/pebble.log",
+      "bytes": 3360,
+      "sha256": "9345dee674c43b50da4c345bc2b66872eb6db03ea51a4ae6e20299bda2d28bde"
+    },
+    {
+      "path": "pebble-plain-timeout-88765-1793941741486675806/pebble.stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "pebble-plain-timeout-88765-1793941741486675806/ports.json",
+      "bytes": 74,
+      "sha256": "669655c1d4f573a897204dcc2e07978346409914259658fee50e1365c280d706"
+    },
+    {
+      "path": "pebble-plain-timeout-88765-1793941741486675806/state/acme/journal-d5e00ee329fdaea0d77b32a4ecb9c4fc738007e36be2e8a9a2563d0f401321cc.json",
+      "bytes": 2272,
+      "sha256": "4f4ed8d6db460670d8dada5517e4550653f0e730aad9a93ade9db6b36c0ac5c1"
+    },
+    {
+      "path": "pebble-plain-timeout-88765-1793941741486675806/tcpdump.log",
+      "bytes": 164,
+      "sha256": "010c8b8719be2cc3e06b61435646732c571aff0ff6fec120878254ca033312cf"
+    },
+    {
+      "path": "pebble-plain-timeout-88765-1793941741486675806/timeline.json",
+      "bytes": 32394,
+      "sha256": "48fd6bbbee16756e037b9e6a58b0d9e2fc3a141052899c38ea8d49c50d15562d"
+    },
+    {
+      "path": "pebble-plain-timeout-88765-1793941741486675806/tls.keys",
+      "bytes": 10744,
+      "sha256": "a8d86ca957ac974d5c2e6ed9fb9ed7425eba72306492cab5ad24b8f20877a9e1"
+    },
+    {
+      "path": "pebble-plain-timeout-88765-1793941741486675806/tshark.result.json",
+      "bytes": 1307,
+      "sha256": "2ffdd004c1a290eb603920552ecc44f1e1838a58d7ece728e4217ac43b2b1bce"
+    },
+    {
+      "path": "pebble-plain-timeout-88765-1793941741486675806/tshark.stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "pebble-plain-timeout-88765-1793941741486675806/wire.pcap",
+      "bytes": 123149,
+      "sha256": "0d4fbcdc397fe7b224e8a4fadc51a6fec83382452fa3409a51536585ed231c19"
+    },
+    {
+      "path": "pebble-plain-timeout-88765-1793941741486675806/worker-initial.stderr.log",
+      "bytes": 299,
+      "sha256": "d6ceb228169d41fae69062a1dd302a2466917d9db2510b70e28ac740d88462ba"
+    },
+    {
+      "path": "pebble-plain-timeout-88765-1793941741486675806/worker-initial.stdout.log",
+      "bytes": 178,
+      "sha256": "d8e32bcccb367864a62563d529edfbd22d490c7ad7abc745f3eb88ac8667ae3a"
+    },
+    {
+      "path": "pebble-plain-timeout-88765-1793941741486675806/worker.json",
+      "bytes": 686,
+      "sha256": "1883d53ad44297855a71201783f02811a3b10ee4bbc6a08a793782c8da53ab3a"
+    },
+    {
+      "path": "pebble.result.json",
+      "bytes": 425,
+      "sha256": "db791798def40354a44daf28e682ab93f086b3dab7631c8c8df519f1bcdd97f3"
+    },
+    {
+      "path": "pebble.stderr.log",
+      "bytes": 19356,
+      "sha256": "eeaf17bc16606da931c4d1832328feb415d9a77aca50e95855765fad32f75803"
+    },
+    {
+      "path": "pebble.stdout.log",
+      "bytes": 2037,
+      "sha256": "7159268e27a4244107312019e8bd24106ab1ac5a69ad69d7ea0ec85eb0a4a6b7"
+    }
+  ]
+}

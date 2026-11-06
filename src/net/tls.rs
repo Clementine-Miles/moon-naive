@@ -17,10 +17,23 @@ pub(super) struct Generation {
     outer: Option<crate::acme::certificate::Lifetime>,
 }
 #[derive(Clone)]
-pub(super) struct Slot(Arc<RwLock<Arc<Generation>>>);
+pub(super) struct Slot(
+    Arc<RwLock<Arc<Generation>>>,
+    #[cfg(test)] Arc<Mutex<Option<RecordFault>>>,
+);
+#[cfg(test)]
+struct RecordFault {
+    stage: &'static str,
+    skip_records: usize,
+}
+
 impl Slot {
     pub fn load(config: &Config) -> Result<Self> {
-        let slot = Self(Arc::new(RwLock::new(Arc::new(load(config)?))));
+        let slot = Self(
+            Arc::new(RwLock::new(Arc::new(load(config)?))),
+            #[cfg(test)]
+            Arc::new(Mutex::new(None)),
+        );
         slot.record(config)?;
         Ok(slot)
     }
@@ -55,6 +68,20 @@ impl Slot {
             .read()
             .map_err(|_| "TLS generation lock poisoned")?
             .clone();
+        #[cfg(test)]
+        let fault = {
+            let mut fault = self.1.lock().unwrap();
+            if let Some(value) = fault.as_mut() {
+                if value.skip_records > 0 {
+                    value.skip_records -= 1;
+                    None
+                } else {
+                    fault.take().map(|value| value.stage)
+                }
+            } else {
+                None
+            }
+        };
         let path = config.state_dir.join("certificates/TLS-LOADED");
         let mut composite = boring::sha::Sha256::new();
         composite.update(generation.id.as_bytes());
@@ -80,15 +107,35 @@ impl Slot {
         let mut nonce = [0; 8];
         boring::rand::rand_bytes(&mut nonce)?;
         let temp = path.with_file_name(format!("TLS-LOADED-{}.tmp", u64::from_be_bytes(nonce)));
+        #[cfg(test)]
+        record_fault(fault, "create")?;
         crate::acme::state::write_private_new(&temp, text.as_bytes())?;
+        #[cfg(test)]
+        record_fault(fault, "rename")?;
         std::fs::rename(&temp, &path)?;
+        #[cfg(test)]
+        record_fault(fault, "fsync")?;
         std::fs::File::open(path.parent().unwrap())?.sync_all()?;
         Ok(())
+    }
+    #[cfg(test)]
+    pub(super) fn laboratory_fail_record(&self, stage: &'static str, skip_records: usize) {
+        *self.1.lock().unwrap() = Some(RecordFault {
+            stage,
+            skip_records,
+        });
     }
     fn replace(&self, generation: Generation) -> Result<()> {
         *self.0.write().map_err(|_| "TLS generation lock poisoned")? = Arc::new(generation);
         Ok(())
     }
+}
+#[cfg(test)]
+fn record_fault(fault: Option<&str>, stage: &str) -> Result<()> {
+    if fault == Some(stage) {
+        return Err(std::io::Error::other(format!("injected TLS-LOADED {stage} failure")).into());
+    }
+    Ok(())
 }
 fn load(config: &Config) -> Result<Generation> {
     let stamp = ech_stamp(config)?;

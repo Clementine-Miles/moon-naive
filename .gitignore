@@ -20,3 +20,10 @@
 /tools/packet-lab/opengfw/controls.*
 /tools/packet-lab/opengfw/nontls-control.*
 __pycache__/
+
+# ACME laboratory secrets and raw captures stay outside source archives.
+/acme-lab-artifacts/
+**/wire.pcap
+**/tls.keys
+**/h3.keys
+**/analysis.keys

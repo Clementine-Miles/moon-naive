@@ -1,5 +1,7 @@
 //! Real ACME/JWS/HTTPS/CSR/certificate issuance and authoritative DNS-01.
 //! Test-only provider controls pebble-challtestsrv on loopback. No public DNS writes.
+#[path = "../src/acme/lab_support.rs"]
+mod lab_support;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -14,7 +16,7 @@ use moon_naive::acme::{
 use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -81,6 +83,13 @@ impl DnsProvider for TestDns {
             )
             .await?;
         self.cleanups.fetch_add(1, Ordering::Relaxed);
+        if let Some(manifest) = std::env::var_os("ACME_LAB_WORKER") {
+            std::fs::write(
+                PathBuf::from(manifest).with_extension("cleanup"),
+                acme::now().to_string(),
+            )
+            .unwrap();
+        }
         Ok(())
     }
 }
@@ -106,18 +115,55 @@ fn journal(root: &Path) -> Value {
 #[tokio::test]
 #[ignore = "requires PEBBLE_BIN, CHALLTESTSRV_BIN and PEBBLE_SOURCE; starts loopback-only test services"]
 async fn issue_restart_renew_and_keep_certificate_during_dns_outage() {
-    exercise(false).await;
+    exercise(false, "normal").await;
 }
 
 #[tokio::test]
 #[ignore = "requires PEBBLE_BIN, CHALLTESTSRV_BIN and PEBBLE_SOURCE; starts loopback-only test services"]
 async fn eab_issue_restart_renew_and_recover_account_without_eab_file() {
-    exercise(true).await;
+    exercise(true, "normal").await;
 }
 
-async fn exercise(eab: bool) {
+#[tokio::test]
+#[ignore = "requires the isolated Pebble laboratory"]
+async fn challenge_timeout_before_ca_dns_preserves_validation() {
+    exercise(false, "timeout").await;
+}
+#[tokio::test]
+#[ignore = "requires the isolated Pebble laboratory"]
+async fn challenge_sigterm_before_ca_dns_preserves_validation() {
+    exercise(false, "sigterm").await;
+}
+#[tokio::test]
+#[ignore = "requires the isolated Pebble laboratory"]
+async fn challenge_crash_restart_before_ca_dns_preserves_validation() {
+    exercise(false, "crash").await;
+}
+#[tokio::test]
+#[ignore = "requires the isolated Pebble laboratory"]
+async fn continuous_nonce_rejection_fails_boundedly() {
+    exercise(false, "nonce100").await;
+}
+#[tokio::test]
+#[ignore = "requires the isolated Pebble laboratory"]
+async fn authorization_reuse_does_not_require_second_dns_create() {
+    exercise(false, "reuse").await;
+}
+
+async fn exercise(eab: bool, scenario: &str) {
+    if let Some(manifest) = std::env::var_os("ACME_LAB_WORKER") {
+        worker(Path::new(&manifest)).await;
+        return;
+    }
+
     let source = PathBuf::from(std::env::var_os("PEBBLE_SOURCE").expect("PEBBLE_SOURCE"));
-    let scratch = tempfile::tempdir().unwrap();
+    let evidence = lab_support::Case::new(&format!(
+        "pebble-{}-{scenario}",
+        if eab { "eab" } else { "plain" }
+    ));
+    let barrier = evidence.path().join("barrier");
+    std::fs::create_dir(&barrier).unwrap();
+    let scratch = Retained(evidence.path().to_owned());
     // Hold all reservations until the processes are about to bind them.
     let reservations: Vec<_> = (0..4)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -155,8 +201,8 @@ async fn exercise(eab: bool) {
                 "-doh",
                 "",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(std::fs::File::create(scratch.path().join("challtestsrv.stdout.log")).unwrap())
+            .stderr(std::fs::File::create(scratch.path().join("challtestsrv.stderr.log")).unwrap())
             .spawn()
             .unwrap(),
     );
@@ -174,26 +220,90 @@ async fn exercise(eab: bool) {
             let n = backend.recv(&mut buffer).await.unwrap();
             let mut answer = hickory_proto::op::Message::from_vec(&buffer[..n]).unwrap();
             answer.metadata.authoritative = true;
+            answer.metadata.truncation =
+                std::env::var("ACME_LAB_FORCE_DNS_TCP").is_ok_and(|v| v == "1");
             authoritative
                 .send_to(&answer.to_vec().unwrap(), peer)
                 .await
                 .unwrap();
         }
     }));
+    let authority_tcp = tokio::net::TcpListener::bind(authoritative_address)
+        .await
+        .unwrap();
+    let trace = evidence.clone();
+    let _authority_tcp = Task(tokio::spawn(async move {
+        loop {
+            let (mut client, _) = authority_tcp.accept().await.unwrap();
+            let trace = trace.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut backend = tokio::net::TcpStream::connect(("127.0.0.1", dns_port))
+                    .await
+                    .unwrap();
+                let n = client.read_u16().await.unwrap();
+                let mut query = vec![0; n as usize];
+                client.read_exact(&mut query).await.unwrap();
+                backend.write_u16(n).await.unwrap();
+                backend.write_all(&query).await.unwrap();
+                let n = backend.read_u16().await.unwrap();
+                let mut answer = vec![0; n as usize];
+                backend.read_exact(&mut answer).await.unwrap();
+                let mut answer = hickory_proto::op::Message::from_vec(&answer).unwrap();
+                answer.metadata.authoritative = true;
+                answer.metadata.truncation = false;
+                let answer = answer.to_vec().unwrap();
+                client.write_u16(answer.len() as u16).await.unwrap();
+                client.write_all(&answer).await.unwrap();
+                trace.event("authority_tcp", json!({"bytes":answer.len()}));
+            });
+        }
+    }));
+    let mut capture_ports = ports.clone();
+    capture_ports.push(authoritative_address.port());
+    let _capture = evidence.capture(&capture_ports);
     let _pebble = Process(
         Command::new(std::env::var_os("PEBBLE_BIN").expect("PEBBLE_BIN"))
             .arg("-config")
             .arg(config_path)
             .args(["-dnsserver", &authoritative_address.to_string()])
             .env("PEBBLE_VA_NOSLEEP", "1")
-            .env("PEBBLE_WFE_NONCEREJECT", "0")
-            .env("PEBBLE_AUTHZREUSE", "0")
+            .env(
+                "PEBBLE_WFE_NONCEREJECT",
+                if scenario == "nonce100" {
+                    "100".into()
+                } else {
+                    std::env::var("ACME_LAB_NONCE_REJECT").unwrap_or("0".into())
+                },
+            )
+            .env(
+                "PEBBLE_AUTHZREUSE",
+                if scenario == "reuse" {
+                    "100".into()
+                } else {
+                    std::env::var("ACME_LAB_AUTHZ_REUSE").unwrap_or("0".into())
+                },
+            )
+            .env("PEBBLE_LAB_KEYLOGFILE", scratch.path().join("tls.keys"))
+            .env(
+                "PEBBLE_LAB_STALL_ORDER",
+                if scenario == "timeout" { "1" } else { "0" },
+            )
+            .env(
+                "PEBBLE_LAB_BARRIER_DIR",
+                if matches!(scenario, "timeout" | "sigterm" | "crash") {
+                    barrier.clone()
+                } else {
+                    PathBuf::from("/nonexistent-acme-lab-barrier")
+                },
+            )
             .current_dir(&source)
             .stdout(std::fs::File::create(&logs).unwrap())
-            .stderr(Stdio::null())
+            .stderr(std::fs::File::create(scratch.path().join("pebble.stderr.log")).unwrap())
             .spawn()
             .unwrap(),
     );
+    evidence.event("processes",json!({"pebble_pid":_pebble.0.id(),"challtestsrv_pid":_chall.0.id(),"authority":authoritative_address.to_string(),"ports":ports}));
     let http = Http::new(
         Some(&source.join("test/certs/pebble.minica.pem")),
         Duration::from_secs(10),
@@ -315,6 +425,34 @@ async fn exercise(eab: bool) {
     let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     config.listener.udp = udp.local_addr().unwrap();
     drop((tcp, udp));
+    config.acme.directory_ca_file = Some(source.join("test/certs/pebble.minica.pem"));
+    if scenario == "nonce100" {
+        let start = std::time::Instant::now();
+        provider.gate.add_permits(100);
+        let mut manager = Manager::open(&config, provider, http.clone()).unwrap();
+        let result = manager.tick().await;
+        evidence.event(
+            "continuous_nonce_result",
+            json!({"elapsed_ms":start.elapsed().as_millis(),"result":format!("{result:?}")}),
+        );
+        evidence.journal(&config.state_dir, "after-bounded-rejection");
+        assert_eq!(result.unwrap(), Tick::RetryScheduled);
+        assert!(start.elapsed() < Duration::from_secs(10));
+        return;
+    }
+    if matches!(scenario, "timeout" | "sigterm" | "crash") {
+        barrier_experiment(
+            &config,
+            &provider,
+            &http,
+            &evidence,
+            &barrier,
+            scenario,
+            origin_address,
+        )
+        .await;
+        return;
+    }
     let config = Arc::new(config);
     let (stop, shutdown) = tokio::sync::watch::channel(false);
     let service = tokio::spawn(moon_naive::runtime::serve_with_provider(
@@ -397,7 +535,7 @@ async fn exercise(eab: bool) {
     let old = slot.current(acme::now()).unwrap();
     let pointer = config.state_dir.join("certificates/CURRENT");
     let generation = std::fs::read(&pointer).unwrap();
-    let first_state = journal(&config.state_dir);
+    let first_state = evidence.journal(&config.state_dir, "initial-issued");
     assert!(first_state["leases"].as_array().unwrap().is_empty());
     assert!(first_state["ari_check_at"].as_u64().unwrap() > 0);
     assert!(
@@ -459,8 +597,35 @@ async fn exercise(eab: bool) {
         state["next_attempt"] = json!(0);
     });
     provider.fail.store(true, Ordering::Relaxed);
+    if scenario == "reuse" {
+        let mut manager = Manager::open(&config, provider.clone(), http.clone()).unwrap();
+        assert_eq!(
+            manager.tick().await.unwrap(),
+            Tick::Installed,
+            "valid reused authorization needs no fresh DNS write, even during a provider outage"
+        );
+        assert_eq!(provider.creates.load(Ordering::Relaxed), 1);
+        assert_ne!(std::fs::read(&pointer).unwrap(), generation);
+        evidence.journal(&config.state_dir, "renewed-with-reused-authorization");
+        return;
+    }
     let mut manager = Manager::open(&config, provider.clone(), http.clone()).unwrap();
-    assert_eq!(manager.tick().await.unwrap(), Tick::RetryScheduled);
+    let renewal = manager.tick().await.unwrap();
+    if renewal == Tick::Installed {
+        // Pebble v2.8.0 uses rand.Intn(100) > authzReusePercent: even 0
+        // permits a 1% reuse. A successful reused authz bypasses DNS correctly.
+        assert!(manager.ready());
+        assert_eq!(provider.creates.load(Ordering::Relaxed), 1);
+        assert_ne!(std::fs::read(&pointer).unwrap(), generation);
+        evidence.event("renewal_reused_authorization",json!({"configured_reuse":std::env::var("ACME_LAB_AUTHZ_REUSE").unwrap_or("0".into()),"outage_was_not_exercised":true}));
+        evidence.journal(&config.state_dir, "renewed-reused-authorization");
+        drop(manager);
+        if eab {
+            eab_recovery(&config, &provider, http, &account_id, &evidence).await;
+        }
+        return;
+    }
+    assert_eq!(renewal, Tick::RetryScheduled);
     assert!(manager.ready());
     assert_eq!(std::fs::read(&pointer).unwrap(), generation);
     let retry = manager.next_attempt();
@@ -499,8 +664,9 @@ async fn exercise(eab: bool) {
             .unwrap()
             .is_empty()
     );
-    assert_eq!(provider.creates.load(Ordering::Relaxed), 2);
-    assert!(provider.cleanups.load(Ordering::Relaxed) >= 2);
+    assert!((1..=2).contains(&provider.creates.load(Ordering::Relaxed)));
+    assert!(provider.cleanups.load(Ordering::Relaxed) >= 1);
+    evidence.journal(&config.state_dir, "renewed");
     drop(manager);
     // Simulate a crash after durable CURRENT installation but before clearing
     // the old order journal. Recovery identifies the matching private key.
@@ -512,33 +678,10 @@ async fn exercise(eab: bool) {
     assert!(journal(&config.state_dir)["order"].is_null());
     assert_eq!(recovered.next_attempt(), 0);
     assert_eq!(recovered.tick().await.unwrap(), Tick::Idle);
-    assert_eq!(provider.creates.load(Ordering::Relaxed), 2);
+    assert!((1..=2).contains(&provider.creates.load(Ordering::Relaxed)));
     if eab {
-        // Restore the old EAB journal format (ID + key, no serialized credentials)
-        // after the one-time EAB credential file has been removed.
         drop(recovered);
-        patch_journal(&config.state_dir, |state| {
-            state["account"] = Value::Null;
-            state["ari_check_at"] = json!(0);
-            state["next_attempt"] = json!(0);
-        });
-        let mut recovered = Manager::open(&config, provider.clone(), http.clone()).unwrap();
-        assert_eq!(recovered.tick().await.unwrap(), Tick::Idle);
-        assert_eq!(journal(&config.state_dir)["account_id"], account_id);
-        assert_eq!(provider.creates.load(Ordering::Relaxed), 2);
-        // Model registration's response/persistence gap: the CA knows the key,
-        // but the local journal has not saved its account URL. No EAB remains.
-        drop(recovered);
-        patch_journal(&config.state_dir, |state| {
-            state["account"] = Value::Null;
-            state["account_id"] = Value::Null;
-            state["ari_check_at"] = json!(0);
-            state["next_attempt"] = json!(0);
-        });
-        let mut recovered = Manager::open(&config, provider.clone(), http).unwrap();
-        assert_eq!(recovered.tick().await.unwrap(), Tick::Idle);
-        assert_eq!(journal(&config.state_dir)["account"]["id"], account_id);
-        assert_eq!(provider.creates.load(Ordering::Relaxed), 2);
+        eab_recovery(&config, &provider, http, &account_id, &evidence).await;
     }
     let status_config = scratch.path().join("status.toml");
     let mut doc: toml::Value = toml::from_str(include_str!("../config.example.toml")).unwrap();
@@ -571,4 +714,273 @@ async fn exercise(eab: bool) {
     println!(
         "real Pebble DNS-01 issue/restart/renew=passed; EAB={eab}; SAN/key/expiry/trust rejection=passed; DNS outage preserves CURRENT=passed; persistent backoff/account/order recovery=passed"
     );
+}
+
+struct Retained(PathBuf);
+impl Retained {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+// A separate test process runs the real control thread and OS SIGTERM path.
+// This constructor has no production configuration or provider-endpoint switch.
+async fn worker(path: &Path) {
+    let options: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let mut config =
+        moon_naive_core::config::Config::parse(include_str!("../config.example.toml")).unwrap();
+    config.domain = "acme.example.test".into();
+    config.proxy.users.clear();
+    config.state_dir = options["state"].as_str().unwrap().into();
+    config.credentials_file = options["credentials"].as_str().unwrap().into();
+    config.acme.accept_terms = true;
+    config.acme.eab = None;
+    config.acme.issuer = moon_naive_core::config::Issuer::Letsencrypt;
+    config.acme.dns_zone = Some("example.test".into());
+    config.acme.directory_url = Some(options["directory"].as_str().unwrap().into());
+    config.acme.directory_ca_file = Some(options["directory_ca"].as_str().unwrap().into());
+    config.acme.certificate_ca_file = Some(options["certificate_ca"].as_str().unwrap().into());
+    config.acme.operation_timeout_secs = 30;
+    config.acme.poll_interval_secs = 1;
+    config.acme.retry_initial_secs = 2;
+    config.acme.retry_max_secs = 4;
+    config.limits.graceful_timeout_secs = 1;
+    config.listener.tcp = options["tcp"].as_str().unwrap().parse().unwrap();
+    config.listener.udp = options["udp"].as_str().unwrap().parse().unwrap();
+    config.website.upstreams = vec![moon_naive_core::website::Upstream {
+        name: "fixture".into(),
+        origins: vec![format!("http://{}", options["origin"].as_str().unwrap())],
+        tls_server_name: None,
+        host_header: None,
+        ca_file: None,
+        http2: false,
+    }];
+    config.website.routes = vec![moon_naive_core::website::Route {
+        path_prefix: "/".into(),
+        upstream: "fixture".into(),
+        strip_prefix: false,
+    }];
+    let http = Http::new(
+        config.acme.directory_ca_file.as_deref(),
+        Duration::from_secs(if options["scenario"] == "timeout" {
+            45
+        } else {
+            10
+        }),
+    )
+    .unwrap()
+    .with_loopback_http();
+    let provider = TestDns {
+        http: http.clone(),
+        control: options["control"].as_str().unwrap().into(),
+        dns: options["dns"].as_str().unwrap().parse().unwrap(),
+        fail: Arc::new(AtomicBool::new(false)),
+        creates: Arc::new(AtomicUsize::new(0)),
+        cleanups: Arc::new(AtomicUsize::new(0)),
+        gate: Arc::new(tokio::sync::Semaphore::new(100)),
+        started: Arc::new(tokio::sync::Notify::new()),
+    };
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let signal = tokio::spawn(async move {
+        let mut signal =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+        signal.recv().await;
+        stop.send(true).unwrap();
+    });
+    let result =
+        moon_naive::runtime::serve_with_provider(Arc::new(config), provider, http, rx).await;
+    eprintln!("LAB_WORKER_RESULT={result:?}");
+    signal.abort();
+    result.unwrap();
+}
+async fn barrier_experiment(
+    config: &moon_naive_core::config::Config,
+    provider: &TestDns,
+    http: &Http,
+    case: &lab_support::Case,
+    barrier: &Path,
+    scenario: &str,
+    origin: std::net::SocketAddr,
+) {
+    let manifest = case.path().join("worker.json");
+    case.write("worker.json",&json!({"scenario":scenario,"state":config.state_dir,"credentials":config.credentials_file,"directory":config.acme.directory_url,"directory_ca":config.acme.directory_ca_file,"certificate_ca":config.acme.certificate_ca_file,"tcp":config.listener.tcp.to_string(),"udp":config.listener.udp.to_string(),"origin":origin.to_string(),"control":provider.control,"dns":provider.dns.to_string()}));
+    let name = match scenario {
+        "timeout" => "challenge_timeout_before_ca_dns_preserves_validation",
+        "sigterm" => "challenge_sigterm_before_ca_dns_preserves_validation",
+        _ => "challenge_crash_restart_before_ca_dns_preserves_validation",
+    };
+    let spawn = |suffix: &str| {
+        Process(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--ignored", "--nocapture"])
+                .env("ACME_LAB_WORKER", &manifest)
+                .stdout(
+                    std::fs::File::create(case.path().join(format!("worker-{suffix}.stdout.log")))
+                        .unwrap(),
+                )
+                .stderr(
+                    std::fs::File::create(case.path().join(format!("worker-{suffix}.stderr.log")))
+                        .unwrap(),
+                )
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let mut process = spawn("initial");
+    case.event(
+        "worker_started",
+        json!({"pid":process.0.id(),"scenario":scenario}),
+    );
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !barrier.join("entered").exists() {
+            assert!(process.0.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let before = case.journal(&config.state_dir, "challenge-acked-before-authority");
+    assert_eq!(before["leases"].as_array().unwrap().len(), 1);
+    case.event(
+        "validation_barrier_entered",
+        json!({"time":std::fs::read_to_string(barrier.join("entered")).unwrap()}),
+    );
+    let order_url = before["order"]["url"].as_str().unwrap().to_owned();
+    if scenario == "timeout" {
+        tokio::time::timeout(Duration::from_secs(38), async {
+            loop {
+                let j = journal(&config.state_dir);
+                if j["failures"].as_u64().unwrap() > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+    } else {
+        let signal = if scenario == "crash" {
+            "-KILL"
+        } else {
+            "-TERM"
+        };
+        assert!(
+            Command::new("kill")
+                .args([signal, &process.0.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while process.0.try_wait().unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        case.event(
+            "worker_exited",
+            json!({"signal":signal,"status":format!("{:?}",process.0.try_wait().unwrap())}),
+        );
+        if scenario == "crash" {
+            case.journal(&config.state_dir, "after-crash-before-restart");
+            process = spawn("restart");
+            case.event("worker_restarted", json!({"pid":process.0.id()}));
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !manifest.with_extension("cleanup").exists() {
+                    assert!(process.0.try_wait().unwrap().is_none());
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+    let canceled = case.journal(&config.state_dir, "after-cancel-before-dns");
+    // Query the original order with its durable account key; no new order is created by the observer.
+    let account =
+        instant_acme::Account::builder(Box::new(http.clone()), &moon_naive::acme::crypto::CRYPTO)
+            .unwrap()
+            .from_parts(
+                before["account_id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| before["account"]["id"].as_str().map(str::to_owned))
+                    .unwrap(),
+                rustls_pki_types::PrivatePkcs8KeyDer::from(
+                    serde_json::from_value::<Vec<u8>>(before["account_key"].clone()).unwrap(),
+                ),
+                config.acme.directory().to_owned(),
+            )
+            .await
+            .unwrap();
+    std::fs::write(barrier.join("release"), b"release").unwrap();
+    let deleted_before_validation = manifest.with_extension("cleanup").exists();
+    case.event(
+        "validation_barrier_released",
+        json!({"leases_remaining":canceled["leases"].as_array().unwrap().len(),"dns_deleted_before_ca_query":deleted_before_validation}),
+    );
+    let mut order = account.order(order_url.clone()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let status = order.refresh().await.unwrap().status;
+            if status != instant_acme::OrderStatus::Pending {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let status = order.state().status;
+    case.event("original_order_after_authority",json!({"url":order_url,"status":format!("{status:?}"),"state":format!("{:?}",order.state())}));
+    if process.0.try_wait().unwrap().is_none() {
+        let _ = Command::new("kill")
+            .args(["-TERM", &process.0.id().to_string()])
+            .status();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert!(
+        !deleted_before_validation,
+        "DNS cleanup preceded the acknowledged CA validation; order={status:?}"
+    );
+    assert_ne!(
+        status,
+        instant_acme::OrderStatus::Invalid,
+        "cleanup removed DNS before the CA performed its acknowledged validation"
+    );
+}
+
+async fn eab_recovery(
+    config: &moon_naive_core::config::Config,
+    provider: &TestDns,
+    http: Http,
+    account_id: &Value,
+    evidence: &lab_support::Case,
+) {
+    // Restore the old EAB journal format (ID + key, no serialized credentials)
+    // after the one-time EAB credential file has been removed.
+    patch_journal(&config.state_dir, |state| {
+        state["account"] = Value::Null;
+        state["ari_check_at"] = json!(0);
+        state["next_attempt"] = json!(0);
+    });
+    let mut recovered = Manager::open(config, provider.clone(), http.clone()).unwrap();
+    assert_eq!(recovered.tick().await.unwrap(), Tick::Idle);
+    assert_eq!(&journal(&config.state_dir)["account_id"], account_id);
+    assert!((1..=2).contains(&provider.creates.load(Ordering::Relaxed)));
+    drop(recovered);
+    // Model registration's response/persistence gap: the CA knows the key,
+    // but the local journal has not saved its account URL. No EAB remains.
+    patch_journal(&config.state_dir, |state| {
+        state["account"] = Value::Null;
+        state["account_id"] = Value::Null;
+        state["ari_check_at"] = json!(0);
+        state["next_attempt"] = json!(0);
+    });
+    let mut recovered = Manager::open(config, provider.clone(), http).unwrap();
+    assert_eq!(recovered.tick().await.unwrap(), Tick::Idle);
+    assert_eq!(&journal(&config.state_dir)["account"]["id"], account_id);
+    assert!((1..=2).contains(&provider.creates.load(Ordering::Relaxed)));
+    evidence.journal(&config.state_dir, "eab-account-recovery");
 }

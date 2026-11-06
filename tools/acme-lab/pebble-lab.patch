@@ -1,0 +1,116 @@
+diff --git a/cmd/pebble/main.go b/cmd/pebble/main.go
+index 40e6e6f..dd43859 100644
+--- a/cmd/pebble/main.go
++++ b/cmd/pebble/main.go
+@@ -1,13 +1,17 @@
+ package main
+ 
+ import (
++	"crypto/tls"
+ 	"flag"
+ 	"fmt"
++	"io"
+ 	"log"
+ 	"net/http"
+ 	"os"
+ 	"strconv"
+ 	"strings"
++	"sync"
++	"time"
+ 
+ 	"github.com/letsencrypt/pebble/v2/ca"
+ 	"github.com/letsencrypt/pebble/v2/cmd"
+@@ -133,7 +137,7 @@ func main() {
+ 	if c.Pebble.ManagementListenAddress != "" {
+ 		go func() {
+ 			adminHandler := wfeImpl.ManagementHandler()
+-			err = http.ListenAndServeTLS(
++			err = labListenTLS(
+ 				c.Pebble.ManagementListenAddress,
+ 				c.Pebble.Certificate,
+ 				c.Pebble.PrivateKey,
+@@ -154,10 +158,52 @@ func main() {
+ 	logger.Printf("Listening on: %s\n", c.Pebble.ListenAddress)
+ 	logger.Printf("ACME directory available at: https://%s%s",
+ 		c.Pebble.ListenAddress, wfe.DirectoryPath)
+-	err = http.ListenAndServeTLS(
++	err = labListenTLS(
+ 		c.Pebble.ListenAddress,
+ 		c.Pebble.Certificate,
+ 		c.Pebble.PrivateKey,
+ 		muxHandler)
+ 	cmd.FailOnError(err, "Calling ListenAndServeTLS()")
+ }
++
++// ACME laboratory only: explicit server key logging, never a client TLS bypass.
++type labLockedWriter struct {
++	sync.Mutex
++	io.Writer
++}
++
++func (w *labLockedWriter) Write(p []byte) (int, error) {
++	w.Lock()
++	defer w.Unlock()
++	return w.Writer.Write(p)
++}
++func labListenTLS(addr, cert, key string, handler http.Handler) error {
++	if os.Getenv("PEBBLE_LAB_STALL_ORDER") == "1" {
++		next := handler
++		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			dir := os.Getenv("PEBBLE_LAB_BARRIER_DIR")
++			if strings.HasPrefix(r.URL.Path, "/my-order/") {
++				if _, err := os.Stat(dir + "/entered"); err == nil {
++					until := time.Now().Add(60 * time.Second)
++					for time.Now().Before(until) {
++						if _, err := os.Stat(dir + "/release"); err == nil {
++							break
++						}
++						time.Sleep(10 * time.Millisecond)
++					}
++				}
++			}
++			next.ServeHTTP(w, r)
++		})
++	}
++	config := &tls.Config{}
++	if path := os.Getenv("PEBBLE_LAB_KEYLOGFILE"); path != "" {
++		f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
++		if err != nil {
++			return err
++		}
++		defer f.Close()
++		config.KeyLogWriter = &labLockedWriter{Writer: f}
++	}
++	return (&http.Server{Addr: addr, Handler: handler, TLSConfig: config}).ListenAndServeTLS(cert, key)
++}
+diff --git a/va/va.go b/va/va.go
+index 23b9df4..a8b4a3a 100644
+--- a/va/va.go
++++ b/va/va.go
+@@ -327,6 +327,17 @@ func (va VAImpl) performValidation(task *vaTask, results chan<- *core.Validation
+ }
+ 
+ func (va VAImpl) validateDNS01(task *vaTask) *core.ValidationRecord {
++	if dir := os.Getenv("PEBBLE_LAB_BARRIER_DIR"); dir != "" && labDirectoryExists(dir) {
++		_ = os.WriteFile(dir+"/entered", []byte(time.Now().UTC().Format(time.RFC3339Nano)), 0600)
++		until := time.Now().Add(120 * time.Second)
++		for time.Now().Before(until) {
++			if _, err := os.Stat(dir + "/release"); err == nil {
++				break
++			}
++			time.Sleep(10 * time.Millisecond)
++		}
++	}
++
+ 	const dns01Prefix = "_acme-challenge"
+ 	challengeSubdomain := fmt.Sprintf("%s.%s", dns01Prefix, task.Identifier.Value)
+ 
+@@ -736,3 +747,8 @@ func reverseaddr(addr string) string {
+ 	buf = append(buf, "ip6.arpa.")
+ 	return strings.Join(buf, ".")
+ }
++
++func labDirectoryExists(path string) bool {
++	info, err := os.Stat(path)
++	return err == nil && info.IsDir()
++}

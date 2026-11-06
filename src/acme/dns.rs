@@ -660,3 +660,13 @@ mod ns_fallback_tests {
         drop(stalled);
     }
 }
+
+#[cfg(test)]
+impl Cloudflare {
+    pub(super) fn laboratory(http: Http, api_base: String) -> Self {
+        let mut provider =
+            Self::new(http, &"a".repeat(32), "synthetic-cloudflare-token".into()).unwrap();
+        provider.api_base = api_base;
+        provider
+    }
+}

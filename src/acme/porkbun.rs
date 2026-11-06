@@ -273,6 +273,17 @@ impl DnsProvider for Porkbun {
 }
 
 #[cfg(test)]
+impl Porkbun {
+    pub(super) fn laboratory(http: super::http::Http, api_base: String) -> Self {
+        let credentials =
+            Credentials::new("synthetic-api-key".into(), "synthetic-secret-key".into()).unwrap();
+        let mut provider = Self::new(http, "example.test", credentials).unwrap();
+        provider.api_base = api_base;
+        provider
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::super::tests::http_server;
     use super::*;

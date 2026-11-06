@@ -32,6 +32,8 @@ pub struct Http {
     pub last_status: Arc<AtomicU64>,
     timeout: Duration,
     allow_local_http: bool,
+    #[cfg(test)]
+    lab_tasks: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl Http {
     pub fn new(ca_file: Option<&Path>, timeout: Duration) -> Result<Self> {
@@ -51,6 +53,8 @@ impl Http {
             last_status: Arc::new(AtomicU64::new(0)),
             timeout,
             allow_local_http: false,
+            #[cfg(test)]
+            lab_tasks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
     /// Test-CA control endpoints only; production CLI never enables cleartext.
@@ -112,7 +116,11 @@ impl Http {
             let (mut sender, connection) =
                 hyper::client::conn::http1::handshake::<_, Full<Bytes>>(TokioIo::new(stream))
                     .await?;
+            #[cfg(test)]
+            let tracked = LabTask::new(self.lab_tasks.clone());
             let task = AbortTask(tokio::spawn(async move {
+                #[cfg(test)]
+                let _tracked = tracked;
                 let _ = connection.with_upgrades().await;
             }));
             let destination = if host.contains(':') {
@@ -148,7 +156,11 @@ impl Http {
             .max_buf_size(64 * 1024)
             .handshake(TokioIo::new(io))
             .await?;
+        #[cfg(test)]
+        let tracked = LabTask::new(self.lab_tasks.clone());
         let _task = AbortTask(tokio::spawn(async move {
+            #[cfg(test)]
+            let _tracked = tracked;
             let _ = connection.await;
         }));
         *request.uri_mut() = uri
@@ -275,5 +287,27 @@ impl HttpClient for Http {
                 .map(BytesResponse::from)
                 .map_err(instant_acme::Error::Other)
         })
+    }
+}
+
+#[cfg(test)]
+struct LabTask(Arc<std::sync::atomic::AtomicUsize>);
+#[cfg(test)]
+impl LabTask {
+    fn new(count: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count)
+    }
+}
+#[cfg(test)]
+impl Drop for LabTask {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+#[cfg(test)]
+impl Http {
+    pub(crate) fn laboratory_active_drivers(&self) -> usize {
+        self.lab_tasks.load(Ordering::SeqCst)
     }
 }

@@ -1,0 +1,93 @@
+{
+  "artifact_root": "/workspace/acme-lab-artifacts/system-resolver",
+  "cases": [
+    {
+      "case": "system-resolver-cancel-89911-1793942149735783063",
+      "tshark_exit": 0,
+      "pcap_rows": 4,
+      "http_requests": 0,
+      "dns_frames": 4,
+      "valid_jose": 0,
+      "invalid_jose": 0,
+      "eab_valid": 0,
+      "url_mismatch": 0
+    }
+  ],
+  "files": [
+    {
+      "path": "baseline.json",
+      "bytes": 171887,
+      "sha256": "303592d5c1f1544689fed01234580d279251a91b53388e994798bfb14acd45bf"
+    },
+    {
+      "path": "commands.json",
+      "bytes": 634,
+      "sha256": "deaa52ffa238e0225285f5cef7539ecd56e287139d6208cd67cea2c3f7de1e85"
+    },
+    {
+      "path": "system-resolver-cancel-89911-1793942149735783063/analysis.json",
+      "bytes": 222,
+      "sha256": "1e4c4af55fc7a4884a60b9bce7e306899f9dda451380867c4f0c32c63f3bc1e2"
+    },
+    {
+      "path": "system-resolver-cancel-89911-1793942149735783063/analysis.keys",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "system-resolver-cancel-89911-1793942149735783063/events.jsonl",
+      "bytes": 832,
+      "sha256": "95cd049ce2efc5946a3983d7002313b649012e853b29551494dd1950a0abeb8e"
+    },
+    {
+      "path": "system-resolver-cancel-89911-1793942149735783063/manifest.json",
+      "bytes": 519,
+      "sha256": "c0fa5a9bbf40eb08be76f3700b769afc81e7b953c511d1b608fb9984143c9a2d"
+    },
+    {
+      "path": "system-resolver-cancel-89911-1793942149735783063/ports.json",
+      "bytes": 27,
+      "sha256": "b90678f57379d7d79ab9a92ae7e1de9c8f073691695a8fd1b175c5e3c6cf0c81"
+    },
+    {
+      "path": "system-resolver-cancel-89911-1793942149735783063/tcpdump.log",
+      "bytes": 160,
+      "sha256": "28007c7525b651a72485371482f1cf7dc2857f97a90999352f151954ba48837a"
+    },
+    {
+      "path": "system-resolver-cancel-89911-1793942149735783063/timeline.json",
+      "bytes": 3330,
+      "sha256": "341bc49fe408a89f9c86be2c68e73f0c851bd40f8d8453fcdadd708e0617bf4f"
+    },
+    {
+      "path": "system-resolver-cancel-89911-1793942149735783063/tshark.result.json",
+      "bytes": 1095,
+      "sha256": "ae06f2037ea540c2b2e95d63309b964c2522bfc8cd83ef16f8502343804376f5"
+    },
+    {
+      "path": "system-resolver-cancel-89911-1793942149735783063/tshark.stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "system-resolver-cancel-89911-1793942149735783063/wire.pcap",
+      "bytes": 432,
+      "sha256": "20bf4efd603c3fa644d30fab7ae267fbf192730e648290adfd9cd47149f60a0a"
+    },
+    {
+      "path": "system-resolver.result.json",
+      "bytes": 566,
+      "sha256": "1bca4b49cd206c4c3b7993ce2457a7e4f61aee5b8d3e8dcf8329666a4ee670ee"
+    },
+    {
+      "path": "system-resolver.stderr.log",
+      "bytes": 325,
+      "sha256": "9709bb76de25ff9df3205730c15dfc57db4000eb88ed98f9967dcd186a3a63a3"
+    },
+    {
+      "path": "system-resolver.stdout.log",
+      "bytes": 208,
+      "sha256": "db54531c0ebf41fff83e9a76022953c1658f100f0cd64bddbd9dbc5865a7d15c"
+    }
+  ]
+}
