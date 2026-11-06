@@ -65,14 +65,14 @@ impl<P: DnsProvider> Manager<P> {
             .collect();
         let state = State::open(&config.state_dir.join("acme"), &namespace)?;
         state.check_other_journals()?;
-        let journal = state.load()?.unwrap_or_else(|| Journal {
+        let mut journal = state.load()?.unwrap_or_else(|| Journal {
             version: 1,
             domain: domain.clone(),
             directory: directory.clone(),
             dns_identity: provider.identity(),
             ..Journal::default()
         });
-        if journal.version != 1
+        if !matches!(journal.version, 1 | 2)
             || journal.domain != domain
             || journal.directory != directory
             || journal.dns_identity != provider.identity()
@@ -82,6 +82,7 @@ impl<P: DnsProvider> Manager<P> {
                 "ACME journal identity/version mismatch; do not discard pending DNS cleanup".into(),
             );
         }
+        journal.version = 2;
         if journal.account.is_none()
             && journal.account_id.is_none()
             && journal.account_key.is_empty()
@@ -154,6 +155,11 @@ impl<P: DnsProvider> Manager<P> {
         }
         Ok(())
     }
+    pub fn retry_certificate(&mut self) -> Result<()> {
+        self.journal.blocked_certificate = None;
+        self.journal.next_attempt = 0;
+        self.persist()
+    }
     pub fn next_attempt(&self) -> u64 {
         self.journal.next_attempt
     }
@@ -168,6 +174,13 @@ impl<P: DnsProvider> Manager<P> {
     }
     pub async fn cleanup(&mut self) -> Result<()> {
         while let Some(lease) = self.journal.leases.first().cloned() {
+            let mut lease = lease;
+            self.provider.recover(&mut lease).await?;
+            if lease.phase == super::state::LeasePhase::Created || lease.record_id.is_some() {
+                lease.phase = super::state::LeasePhase::DeleteUncertain;
+                self.journal.leases[0] = lease.clone();
+                self.persist()?;
+            }
             self.provider.cleanup(&lease).await?;
             self.journal.leases.remove(0);
             self.persist()?;
@@ -237,6 +250,13 @@ impl<P: DnsProvider> Manager<P> {
     async fn reconcile(&mut self) -> Result<Tick> {
         self.phase = "dns-cleanup";
         self.cleanup().await?;
+        if let Some(blocked) = &self.journal.blocked_certificate {
+            if blocked.retry_at.is_none_or(|at| now() < at) {
+                return Ok(Tick::Idle);
+            }
+            self.journal.blocked_certificate = None;
+            self.persist()?;
+        }
         if self.ready() && self.journal.order.is_none() && now() < self.journal.renew_at {
             if now() >= self.journal.ari_check_at {
                 self.account().await?;
@@ -327,11 +347,13 @@ impl<P: DnsProvider> Manager<P> {
                     marker,
                     record_id: None,
                     borrowed: false,
+                    ..Lease::default()
                 });
                 self.persist()?;
                 let mut lease = self.journal.leases[0].clone();
                 self.phase = "dns-present";
                 self.provider.present(&mut lease).await?;
+                lease.phase = super::state::LeasePhase::Created;
                 self.journal.leases[0] = lease.clone();
                 self.persist()?;
                 self.phase = "dns-propagation";
@@ -375,8 +397,41 @@ impl<P: DnsProvider> Manager<P> {
                 .to_vec(),
         };
         self.phase = "certificate-validation";
-        let bundle = match self.validator.download(candidate, now(), self.window)? {
+        let evidence = candidate.chain_pem.clone();
+        let outcome = self
+            .validator
+            .download(candidate, now(), self.window)
+            .unwrap_or_else(|error| {
+                let category = if error.downcast_ref::<std::io::Error>().is_some() {
+                    "local-trust-configuration-error"
+                } else if error.to_string()
+                    == "certificate chain, identity or validity verification failed"
+                {
+                    "chain-or-local-trust-needs-investigation"
+                } else {
+                    "invalid-certificate-material"
+                };
+                certificate::Download::Blocked {
+                    category,
+                    retry_at: None,
+                }
+            });
+        let bundle = match outcome {
             certificate::Download::Usable(bundle) => bundle,
+            certificate::Download::Blocked { category, retry_at } => {
+                self.journal.blocked_certificate = Some(super::state::BlockedCertificate {
+                    sha256: boring::sha::sha256(&evidence)
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect(),
+                    category: category.into(),
+                    chain_pem: evidence,
+                    retry_at,
+                });
+                self.journal.last_failure_phase = Some(category.into());
+                self.persist()?;
+                return Ok(Tick::RetryScheduled);
+            }
             certificate::Download::Obsolete(lifetime) => {
                 self.phase = "completed-certificate-obsolete";
                 self.journal.retire_completed(

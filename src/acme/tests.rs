@@ -131,6 +131,7 @@ fn completed_order_retirement_persists_cooldown_account_and_dns_ownership() {
             marker: "owned".into(),
             record_id: None,
             borrowed: false,
+            ..Lease::default()
         }],
         ..Journal::default()
     };

@@ -204,7 +204,7 @@ impl DnsProvider for Porkbun {
         for host in self.nameservers.as_ref().unwrap() {
             let mut addresses: Vec<_> = tokio::time::timeout(
                 Duration::from_secs(5),
-                tokio::net::lookup_host((host.as_str(), 53)),
+                crate::net::resolve::lookup_control(host.as_str(), 53),
             )
             .await??
             .collect();
@@ -228,11 +228,40 @@ impl DnsProvider for Porkbun {
         }
         Ok(true)
     }
+    async fn recover(&mut self, lease: &mut Lease) -> Result<()> {
+        if lease.borrowed
+            || lease.record_id.is_some()
+            || lease.phase != super::state::LeasePhase::CreateUncertain
+        {
+            return Ok(());
+        }
+        let records = self.records(lease).await?;
+        if let Some(record) = records
+            .iter()
+            .find(|record| matches(record, lease) && record["notes"] == lease.marker)
+        {
+            lease.record_id = Some(record_id(&record["id"])?);
+            lease.phase = super::state::LeasePhase::Created;
+            return Ok(());
+        }
+        Err("DNS create outcome uncertain; retain marker and reconcile again".into())
+    }
     async fn cleanup(&mut self, lease: &Lease) -> Result<()> {
         if lease.borrowed {
             return Ok(());
         }
-        for record in self.records(lease).await? {
+        let records = self.records(lease).await?;
+        if lease.phase == super::state::LeasePhase::CreateUncertain
+            && lease.record_id.is_none()
+            && !records
+                .iter()
+                .any(|record| matches(record, lease) && record["notes"] == lease.marker)
+        {
+            // A single empty list can precede a delayed remote commit. Keep the
+            // durable marker, including across shutdown; never create a new order.
+            return Err("DNS create outcome uncertain; retain lease and reconcile again".into());
+        }
+        for record in records {
             if matches(&record, lease) && record["notes"] == lease.marker {
                 let id = record_id(&record["id"])?;
                 self.api(&format!("/dns/delete/{}/{id}", self.zone), json!({}), None)
@@ -262,6 +291,7 @@ mod tests {
             marker: "moon-naive-unique-intent".into(),
             record_id: None,
             borrowed: false,
+            ..Lease::default()
         }
     }
     #[tokio::test]
@@ -314,8 +344,9 @@ mod tests {
         assert_eq!(recovered.record_id.as_deref(), Some("10"));
         assert!(!recovered.borrowed);
         assert_eq!(*creates.lock().unwrap(), 1);
-        provider.cleanup(&intent).await.unwrap();
-        provider.cleanup(&intent).await.unwrap();
+        provider.cleanup(&recovered).await.unwrap();
+        provider.cleanup(&recovered).await.unwrap();
+        assert!(provider.cleanup(&intent).await.is_err());
         assert_eq!(*records.lock().unwrap(), vec![foreign]);
         records.lock().unwrap().push(json!({"id":"11","type":"TXT","name":intent.name,"content":intent.value,"notes":"another-owner"}));
         let mut borrowed = intent;

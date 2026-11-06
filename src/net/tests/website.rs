@@ -707,7 +707,7 @@ async fn website_resets_cancel_waiting_origins_and_release_request_quotas() {
         .stream_shutdown(id, quiche::Shutdown::Write, 0x10c)
         .unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    while active.load(Ordering::Relaxed) > 0 || app.requests.active() > 0 {
+    while active.load(Ordering::Relaxed) > 0 || app.resources.requests.active() > 0 {
         assert!(
             std::time::Instant::now() < deadline,
             "cancelled website origin or request quota leaked"

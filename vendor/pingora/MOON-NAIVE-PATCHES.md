@@ -68,3 +68,15 @@ The H2 server session exposes the already parsed request stream ID as a read-onl
 `u64`. The Moon/2 adapter combines this with BoringSSL TLS 1.3 exporter material
 for per-request HMAC authentication. No synthetic stream counter, HTTP header
 or connection-wide login is accepted as a substitute.
+
+## Candidate TCP/TLS retry before HTTP transmission
+
+`connectors::L4Connect` adds opt-in `connection_attempts` and `attempt_timeout`
+(default one attempt, no additional timeout). The connector retries the complete
+TCP/TLS establishment only inside the original total connection deadline, before
+an HTTP session is handed to the proxy. moon-naive advances validated concrete
+candidates while retaining logical SNI, certificate verification and pool grouping.
+This does not retry an HTTP request or change `error_while_proxy`/POST policy.
+A real TLS regression stalls the first connected address and verifies the second.
+The proxy also applies the peer's remaining total connection timeout around pool
+acquisition and HTTP-session initialization, before handing any request to it.

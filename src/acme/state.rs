@@ -22,6 +22,8 @@ pub struct Journal {
     pub order: Option<Order>,
     #[serde(default)]
     pub retired_order: Option<RetiredOrder>,
+    #[serde(default)]
+    pub blocked_certificate: Option<BlockedCertificate>,
     pub leases: Vec<Lease>,
     pub next_attempt: u64,
     pub failures: u32,
@@ -31,6 +33,15 @@ pub struct Journal {
     pub ari_selected: Option<u64>,
     #[serde(default)]
     pub last_failure_phase: Option<String>,
+}
+/// Public certificate evidence only; the original order retains its private key.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockedCertificate {
+    pub sha256: String,
+    pub category: String,
+    pub chain_pem: Vec<u8>,
+    pub retry_at: Option<u64>,
 }
 /// One bounded diagnostic record; obsolete certificate private keys are discarded.
 #[derive(Serialize, Deserialize)]
@@ -67,9 +78,19 @@ pub struct Order {
     pub key_pem: String,
     pub csr: Vec<u8>,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LeasePhase {
+    // Legacy journals default conservatively: an absent ID never proves no POST.
+    #[default]
+    CreateUncertain,
+    Created,
+    DeleteUncertain,
+}
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Lease {
+    #[serde(default)]
+    pub phase: LeasePhase,
     pub name: String,
     pub value: String,
     pub marker: String,
@@ -161,7 +182,7 @@ impl State {
         })
     }
     pub fn load(&self) -> Result<Option<Journal>> {
-        match read_private(&self.root.join(&self.name), 2 * 1024 * 1024) {
+        match read_private(&self.root.join(&self.name), 8 * 1024 * 1024) {
             Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
             Err(e)
                 if e.downcast_ref::<std::io::Error>()
@@ -184,7 +205,7 @@ impl State {
             {
                 continue;
             }
-            let journal: Journal = serde_json::from_slice(&read_private(&path, 2 * 1024 * 1024)?)?;
+            let journal: Journal = serde_json::from_slice(&read_private(&path, 8 * 1024 * 1024)?)?;
             if !journal.leases.is_empty() {
                 return Err("another issuer has pending DNS cleanup; run cleanup with its original configuration first".into());
             }
@@ -193,7 +214,7 @@ impl State {
     }
     pub fn save(&self, journal: &Journal) -> Result<()> {
         let data = serde_json::to_vec(journal)?;
-        if data.len() > 2 * 1024 * 1024 {
+        if data.len() > 8 * 1024 * 1024 {
             return Err("ACME journal exceeds limit".into());
         }
         let mut random = [0; 16];

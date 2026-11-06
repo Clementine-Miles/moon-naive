@@ -111,6 +111,6 @@ async fn official_naive_h2_h3_legacy_authentication_never_opens_egress() {
     );
     stop.send(true).unwrap();
     task.await.unwrap().unwrap();
-    assert_eq!(app.tunnels.active(), 0);
-    assert_eq!(app.requests.active(), 0);
+    assert_eq!(app.resources.tunnels.active(), 0);
+    assert_eq!(app.resources.requests.active(), 0);
 }

@@ -5,7 +5,7 @@ use super::{
 };
 use h2::Reason;
 use pingora_core::protocols::{
-    Digest, Ssl,
+    Digest, GetSocketDigest, SocketDigest, Ssl,
     http::v2::server::{self, H2Accept, HttpSession},
     l4::stream::Stream as L4,
 };
@@ -25,9 +25,15 @@ pub(super) async fn serve(
     let generation = tls.current()?;
     super::congestion::apply(&socket, app.tcp_congestion)?;
     socket.set_nodelay(true)?;
+    // We bypass Pingora's listener, so initialize the trusted socket metadata
+    // before TLS. H1 website forwarding reads this digest on every keepalive use.
+    let mut socket = L4::from(socket);
+    use std::os::fd::AsRawFd;
+    let digest = SocketDigest::from_raw_fd(socket.as_raw_fd());
+    socket.set_socket_digest(digest);
     let stream = tokio::time::timeout(
         Duration::from_secs(10),
-        pingora_core::protocols::tls::server::handshake(&generation.h2, L4::from(socket)),
+        pingora_core::protocols::tls::server::handshake(&generation.h2, socket),
     )
     .await??;
     // ALPN callback is not invoked if absent; only the configured website may fall back to H1.
@@ -49,6 +55,7 @@ pub(super) async fn serve(
     // H1 and incomplete TLS handshakes do not use H2 receive credit. The
     // listener's connection permit and TLS deadline still bound their lifetime.
     let _window = app
+        .resources
         .receive
         .clone()
         .try_acquire_many_owned(app.profile.connection_window())
@@ -89,7 +96,7 @@ pub(super) async fn serve(
                 match accepted? {
                     Some(H2Accept::Session(mut session))=>{
                         let Some(permit)=local.acquire() else {session.shutdown_with_reason(Reason::REFUSED_STREAM);continue;};
-                        let Some(global)=app.requests.acquire() else {session.shutdown_with_reason(Reason::REFUSED_STREAM);continue;};
+                        let Some(global)=app.resources.requests.acquire() else {session.shutdown_with_reason(Reason::REFUSED_STREAM);continue;};
                         let app=app.clone();
                         tasks.spawn(async move {let _permit=permit;let _global=global;let _active=super::Active::new(app.stats.clone());let _=process(session,&app,peer_ip,exporter).await;});
                     }
@@ -175,6 +182,7 @@ async fn process(
                     if !data.is_empty() {
                         activity.touch();
                     }
+                    let data = app.resources.buffers.charge(data).await?;
                     decoder.write_to(&mut write, &data, &activity).await?;
                 }
                 if session.take_request_trailers().is_some() {
@@ -189,6 +197,7 @@ async fn process(
                 let mut download = TunnelDownload::new(framed)?;
                 while let Some(bytes) = download.read_next(&mut read).await? {
                     activity.touch();
+                    let bytes = app.resources.buffers.charge(bytes).await?;
                     send_body(&mut writer, bytes, false, &activity).await?;
                 }
                 send_body(&mut writer, Bytes::new(), true, &activity).await?;

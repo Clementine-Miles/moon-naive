@@ -8,6 +8,35 @@ use std::{
 };
 use tokio::net::TcpStream;
 
+pub(super) fn same_ip(a: IpAddr, b: IpAddr) -> bool {
+    fn normalize(ip: IpAddr) -> IpAddr {
+        match ip {
+            IpAddr::V6(v) => v.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+            _ => ip,
+        }
+    }
+    normalize(a) == normalize(b)
+}
+pub(super) fn is_local(ip: IpAddr) -> bool {
+    let ip = match ip {
+        IpAddr::V6(v) => v.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        _ => ip,
+    };
+    if ip.is_loopback() || ip.is_unspecified() {
+        return true;
+    }
+    // UDP connect selects a route/source without transmitting a datagram. Unlike
+    // a successful bind(), this does not classify every address as local on a
+    // host with ip_nonlocal_bind enabled.
+    let bind = if ip.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    std::net::UdpSocket::bind(bind).is_ok_and(|socket| {
+        socket.connect(SocketAddr::new(ip, 9)).is_ok()
+            && socket
+                .local_addr()
+                .is_ok_and(|local| same_ip(local.ip(), ip))
+    })
+}
+
 #[derive(Clone)]
 pub(super) struct Egress {
     timeout: Duration,
@@ -26,7 +55,11 @@ impl Egress {
     pub fn new(config: &Config, stats: Arc<Stats>) -> super::Result<Self> {
         Ok(Self {
             timeout: Duration::from_secs(config.limits.connect_timeout_secs),
-            own: vec![config.listener.tcp.ip(), config.listener.udp.ip()],
+            own: [
+                vec![config.listener.tcp.ip(), config.listener.udp.ip()],
+                config.listener.public_addresses.clone(),
+            ]
+            .concat(),
             domain: config.domain.clone(),
             stats,
             tcp_congestion: config.transport.tcp_congestion,
@@ -75,18 +108,22 @@ impl Egress {
             vec![SocketAddr::new(ip, target.port)]
         } else {
             self.stats.resolutions.fetch_add(1, Ordering::Relaxed);
-            tokio::net::lookup_host((target.host.as_str(), target.port))
-                .await
-                .map_err(|_| 502u16)?
-                .take(33)
-                .collect()
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                crate::net::resolve::lookup(target.host.as_str(), target.port),
+            )
+            .await
+            .map_err(|_| 504u16)?
+            .map_err(|_| 502u16)?
+            .take(33)
+            .collect()
         };
         if addresses.len() > 32 {
             return Err(502);
         }
         let addresses: Vec<_> = addresses
             .into_iter()
-            .filter(|a| allows_ip(a.ip(), &self.own))
+            .filter(|a| allows_ip(a.ip(), &self.own) && !is_local(a.ip()))
             .collect();
         if addresses.is_empty() {
             return Err(403);
@@ -105,7 +142,7 @@ impl Egress {
         }
         let addresses = addresses
             .into_iter()
-            .filter(|a| allows_ip(a.ip(), &self.own))
+            .filter(|a| allows_ip(a.ip(), &self.own) && !is_local(a.ip()))
             .collect::<Vec<_>>();
         if addresses.is_empty() {
             return Err(403);
@@ -117,28 +154,43 @@ impl Egress {
     async fn dial_addresses_inner(&self, addresses: Vec<SocketAddr>) -> Result<Stream, u16> {
         if let Some(upstream) = &self.upstream {
             let proxy = &upstream.authority;
-            let proxy_addresses = tokio::net::lookup_host((proxy.host.as_str(), proxy.port))
-                .await
-                .map_err(|_| 502u16)?
-                .take(33)
-                .collect::<Vec<_>>();
+            let proxy_addresses = tokio::time::timeout(
+                Duration::from_secs(2),
+                crate::net::resolve::lookup(proxy.host.as_str(), proxy.port),
+            )
+            .await
+            .map_err(|_| 504u16)?
+            .map_err(|_| 502u16)?
+            .take(33)
+            .collect::<Vec<_>>();
             if proxy_addresses.is_empty()
                 || proxy_addresses.len() > 32
                 || proxy.host.eq_ignore_ascii_case(&self.domain)
-                || proxy_addresses.iter().any(|a| self.own.contains(&a.ip()))
+                || proxy_addresses
+                    .iter()
+                    .any(|a| self.own.iter().any(|ip| same_ip(*ip, a.ip())))
             {
                 return Err(502);
             }
             for address in addresses {
-                let socket = connect_candidates(
-                    proxy_addresses.clone(),
-                    self.stats.clone(),
-                    self.tcp_congestion,
-                )
-                .await?;
-                super::congestion::apply(&socket, self.tcp_congestion).map_err(|_| 502u16)?;
-                if let Ok(stream) = upstream.handshake(socket, address).await {
-                    return Ok(stream);
+                for proxy_address in &proxy_addresses {
+                    let Ok(socket) = connect_candidates(
+                        vec![*proxy_address],
+                        self.stats.clone(),
+                        self.tcp_congestion,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    if let Ok(Ok(stream)) = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        upstream.handshake(socket, address),
+                    )
+                    .await
+                    {
+                        return Ok(stream);
+                    }
                 }
             }
             Err(502)
@@ -157,6 +209,30 @@ pub(super) async fn connect_candidates(
     stats: Arc<Stats>,
     algorithm: moon_naive_core::config::TcpCongestion,
 ) -> Result<TcpStream, u16> {
+    let stream = race_candidates(addresses, move |address| {
+        let stats = stats.clone();
+        async move {
+            stats.dials.fetch_add(1, Ordering::Relaxed);
+            let socket = if address.is_ipv4() {
+                tokio::net::TcpSocket::new_v4()?
+            } else {
+                tokio::net::TcpSocket::new_v6()?
+            };
+            super::congestion::apply_connecting(&socket, algorithm)
+                .map_err(|_| std::io::Error::other("TCP congestion unavailable"))?;
+            socket.connect(address).await
+        }
+    })
+    .await?;
+    stream.set_nodelay(true).map_err(|_| 502u16)?;
+    Ok(stream)
+}
+async fn race_candidates<T, F, Fut>(addresses: Vec<SocketAddr>, mut connect: F) -> Result<T, u16>
+where
+    T: Send + 'static,
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>> + Send + 'static,
+{
     let first_v6 = addresses.first().is_some_and(SocketAddr::is_ipv6);
     let (mut v6, mut v4): (std::collections::VecDeque<_>, std::collections::VecDeque<_>) =
         addresses.into_iter().partition(SocketAddr::is_ipv6);
@@ -181,21 +257,16 @@ pub(super) async fn connect_candidates(
             && (tasks.is_empty() || tasks.len() < 2 && tokio::time::Instant::now() >= next)
         {
             let address = ordered.pop_front().unwrap();
-            stats.dials.fetch_add(1, Ordering::Relaxed);
+            let attempt = connect(address);
             tasks.spawn(async move {
-                let socket = if address.is_ipv4() {
-                    tokio::net::TcpSocket::new_v4()?
-                } else {
-                    tokio::net::TcpSocket::new_v6()?
-                };
-                super::congestion::apply_connecting(&socket, algorithm)
-                    .map_err(|_| std::io::Error::other("TCP congestion unavailable"))?;
-                socket.connect(address).await
+                tokio::time::timeout(Duration::from_secs(2), attempt)
+                    .await
+                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?
             });
             next = tokio::time::Instant::now() + Duration::from_millis(250);
         }
         tokio::select! {
-            result=tasks.join_next(),if !tasks.is_empty()=>{if let Some(Ok(Ok(stream)))=result {stream.set_nodelay(true).map_err(|_|502u16)?;return Ok(stream);}},
+            result=tasks.join_next(),if !tasks.is_empty()=>{if let Some(Ok(Ok(stream)))=result {return Ok(stream);}},
             _=tokio::time::sleep_until(next),if tasks.len()<2 && !ordered.is_empty()=>{},
         }
     }
@@ -310,5 +381,27 @@ mod tests {
         .unwrap();
         assert_eq!(stream.peer_addr().unwrap(), open.local_addr().unwrap());
         assert_eq!(stats.dials.load(Ordering::Relaxed), 2);
+    }
+}
+
+#[cfg(test)]
+mod stalled_tests {
+    use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn two_pending_candidates_do_not_starve_third() {
+        let start = tokio::time::Instant::now();
+        let addresses = (1..=3)
+            .map(|port| SocketAddr::from(([127, 0, 0, 1], port)))
+            .collect();
+        let result = race_candidates(addresses, |address| async move {
+            if address.port() < 3 {
+                std::future::pending::<()>().await;
+            }
+            Ok(address.port())
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, 3);
+        assert!(start.elapsed() <= Duration::from_millis(2500));
     }
 }

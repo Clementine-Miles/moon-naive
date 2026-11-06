@@ -200,7 +200,7 @@ async fn rejected_websocket_requests_do_not_reveal_tunnel_quota() {
     for full in [false, true] {
         let mut held = Vec::new();
         if full {
-            while let Some(permit) = app.tunnels.acquire() {
+            while let Some(permit) = app.resources.tunnels.acquire() {
                 held.push(permit);
             }
             assert!(!held.is_empty());
@@ -269,7 +269,7 @@ async fn rejected_websocket_requests_do_not_reveal_tunnel_quota() {
             baseline = observed;
         }
         drop(held);
-        assert_eq!(app.tunnels.active(), 0);
+        assert_eq!(app.resources.tunnels.active(), 0);
     }
     assert_eq!(app.stats.dials.load(Ordering::Relaxed), 0);
     assert_eq!(app.stats.resolutions.load(Ordering::Relaxed), 0);
@@ -1471,7 +1471,7 @@ async fn incomplete_quic_handshake_releases_connection_and_receive_budget() {
     let server = network(&f, None).await;
     let udp = server.udp_addr().unwrap();
     let connections = server.connections.clone();
-    let receive = server.app.receive.clone();
+    let receive = server.app.resources.receive.clone();
     let available = receive.available_permits();
     let (stop, rx) = watch::channel(false);
     let task = tokio::spawn(server.run(rx));
@@ -1780,7 +1780,7 @@ async fn h1_website_remains_available_when_h2_receive_credit_is_exhausted() {
     Arc::get_mut(&mut f.config).unwrap().listener.h1 = true;
     let server = network(&f, None).await;
     let address = server.tcp_addr().unwrap();
-    let budget = server.app.receive.clone();
+    let budget = server.app.resources.receive.clone();
     let held = budget
         .clone()
         .try_acquire_many_owned(budget.available_permits() as u32)
@@ -1870,4 +1870,201 @@ async fn h3_nat_rebinding_consumes_path_events_and_preserves_session() {
     stop.send(true).unwrap();
     task.await.unwrap().unwrap();
     relay.abort();
+}
+
+#[tokio::test]
+async fn websocket_backup_and_repeated_subprotocol_fields_preserve_raw_target() {
+    let mut f = fixture();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_addr = listener.local_addr().unwrap();
+    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = dead.local_addr().unwrap();
+    drop(dead);
+    let cfg = Arc::get_mut(&mut f.config).unwrap();
+    cfg.listener.h1 = true;
+    cfg.website.max_request_body_bytes = 4;
+    cfg.website
+        .upstreams
+        .push(moon_naive_core::website::Upstream {
+            name: "ws".into(),
+            origins: vec![
+                format!("http://{dead_addr}"),
+                format!("http://{origin_addr}"),
+            ],
+            tls_server_name: None,
+            host_header: None,
+            ca_file: None,
+            http2: false,
+        });
+    cfg.website.routes.push(moon_naive_core::website::Route {
+        path_prefix: "/ws".into(),
+        upstream: "ws".into(),
+        strip_prefix: true,
+    });
+    let origin = tokio::spawn(async move {
+        use base64::Engine;
+        for _ in 0..4 {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(s.read_u8().await.unwrap());
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("GET //a%2Fb?q=%2F HTTP/1."));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("x-forwarded-for: 127.0.0.1"),
+                "{request}"
+            );
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("x-forwarded-host: proxy.example.test"),
+                "{request}"
+            );
+            for forbidden in [
+                "proxy-authorization",
+                "proxy-connection",
+                "padding-type-request",
+                "x-forwarded-port",
+                "spoofed-client",
+            ] {
+                assert!(
+                    !request.to_ascii_lowercase().contains(forbidden),
+                    "{request}"
+                );
+            }
+            if !request.to_ascii_lowercase().contains("upgrade: websocket") {
+                s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+                )
+                .await
+                .unwrap();
+                continue;
+            }
+            let key = request
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':')
+                        .filter(|(k, _)| k.eq_ignore_ascii_case("sec-websocket-key"))
+                        .map(|(_, v)| v.trim())
+                })
+                .unwrap();
+            let accept = base64::engine::general_purpose::STANDARD.encode(boring::sha::sha1(
+                format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes(),
+            ));
+            let protocol = if request
+                .to_ascii_lowercase()
+                .contains("sec-websocket-protocol")
+            {
+                "Sec-WebSocket-Protocol: second\r\n"
+            } else {
+                ""
+            };
+            s.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n{protocol}\r\nhello").as_bytes()).await.unwrap();
+            let mut input = Vec::new();
+            s.read_to_end(&mut input).await.unwrap();
+            assert_eq!(input, b"raw-websocket-data");
+            s.shutdown().await.unwrap();
+        }
+    });
+    let server = network(&f, None).await;
+    let addr = server.tcp_addr().unwrap();
+    let udp = server.udp_addr().unwrap();
+    let (stop, rx) = watch::channel(false);
+    let task = tokio::spawn(server.run(rx));
+    let legacy = h1_request(&f, addr,
+        "GET /ws//a%2Fb?q=%2F HTTP/1.0\r\nHost: proxy.example.test\r\nX-Forwarded-For: spoofed-client\r\nX-Forwarded-Port: 12345\r\nProxy-Authorization: Basic private\r\nConnection: close\r\n\r\n", true).await;
+    assert!(legacy.ends_with("hello"), "{legacy}");
+    let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+    connector.set_ca_file(&f.ca).unwrap();
+    connector.set_alpn_protos(b"\x08http/1.1").unwrap();
+    let mut ws = tokio_boring::connect(
+        connector.build().configure().unwrap(),
+        "proxy.example.test",
+        TcpStream::connect(addr).await.unwrap(),
+    )
+    .await
+    .unwrap();
+    ws.write_all(b"GET /ws//a%2Fb?q=%2F HTTP/1.1\r\nHost: proxy.example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nX-Forwarded-Port: 12345\r\nX-Forwarded-For: spoofed-client\r\nProxy-Authorization: Basic private\r\nPadding-Type-Request: 1\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.unwrap();
+    let mut header = Vec::new();
+    while !header.ends_with(b"\r\n\r\n") {
+        header.push(ws.read_u8().await.unwrap());
+    }
+    assert!(
+        header.starts_with(b"HTTP/1.1 101"),
+        "{}",
+        String::from_utf8_lossy(&header)
+    );
+    let mut hello = [0; 5];
+    ws.read_exact(&mut hello).await.unwrap();
+    assert_eq!(&hello, b"hello");
+    ws.write_all(b"raw-websocket-data").await.unwrap();
+    ws.shutdown().await.unwrap();
+    drop(ws);
+    let (mut client, connection) = h2_client(addr, &f.ca).await;
+    for _ in 0..100 {
+        if client.sender.is_extended_connect_protocol_enabled() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(client.sender.is_extended_connect_protocol_enabled());
+    let mut req = http::Request::builder()
+        .method("CONNECT")
+        .uri("https://proxy.example.test/ws//a%2Fb?q=%2F")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-protocol", "first")
+        .header("sec-websocket-protocol", "second")
+        .header("x-forwarded-port", "12345")
+        .header("x-forwarded-for", "spoofed-client")
+        .header("proxy-authorization", "Basic private")
+        .header("padding-type-request", "1")
+        .body(())
+        .unwrap();
+    req.extensions_mut()
+        .insert(::h2::ext::Protocol::from_static("websocket"));
+    let (response, mut send) = client.send_request(req, false).unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(5), response)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(!response.headers().contains_key("padding"));
+    send.send_data(Bytes::from_static(b"raw-websocket-data"), true)
+        .unwrap();
+    assert_eq!(body(response.into_body()).await, b"hello");
+    let mut q = QClient::new(udp, &f.ca).await;
+    for _ in 0..100 {
+        if q.h3.as_ref().unwrap().extended_connect_enabled_by_peer() {
+            break;
+        }
+        q.step().await;
+    }
+    assert!(q.h3.as_ref().unwrap().extended_connect_enabled_by_peer());
+    let headers = [
+        quiche::h3::Header::new(b":method", b"CONNECT"),
+        quiche::h3::Header::new(b":authority", b"proxy.example.test"),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b":path", b"/ws//a%2Fb?q=%2F"),
+        quiche::h3::Header::new(b":protocol", b"websocket"),
+        quiche::h3::Header::new(b"sec-websocket-version", b"13"),
+        quiche::h3::Header::new(b"sec-websocket-protocol", b"first"),
+        quiche::h3::Header::new(b"sec-websocket-protocol", b"second"),
+        quiche::h3::Header::new(b"x-forwarded-port", b"12345"),
+        quiche::h3::Header::new(b"x-forwarded-for", b"spoofed-client"),
+        quiche::h3::Header::new(b"proxy-authorization", b"Basic private"),
+        quiche::h3::Header::new(b"padding-type-request", b"1"),
+    ];
+    let id = q.send_headers(&headers, false).unwrap();
+    q.send(id, b"raw-websocket-data").await;
+    let reply = q.response(id).await;
+    assert_eq!(reply.status, 200);
+    assert!(!reply.padding);
+    assert_eq!(reply.body, b"hello");
+    origin.await.unwrap();
+    stop.send(true).unwrap();
+    task.await.unwrap().unwrap();
+    connection.abort();
 }

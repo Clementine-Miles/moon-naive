@@ -90,6 +90,10 @@ impl CertificateSlot {
 pub enum Download {
     Usable(VerifiedBundle),
     Obsolete(Lifetime),
+    Blocked {
+        category: &'static str,
+        retry_at: Option<u64>,
+    },
 }
 
 pub struct Validator {
@@ -133,7 +137,14 @@ impl Validator {
         // A past-time check is only used to establish that an obsolete result
         // belongs to this identity/key/trust chain. It cannot yield usable material.
         let checked_at = now.min(life.not_after.saturating_sub(1));
-        let verified = self.verify(candidate, checked_at)?;
+        let future = now < life.not_before;
+        let verified = self.verify(candidate, checked_at.max(life.not_before))?;
+        if future {
+            return Ok(Download::Blocked {
+                category: "future-not-before",
+                retry_at: Some(life.not_before),
+            });
+        }
         if life.renew_at(window) <= now {
             Ok(Download::Obsolete(life))
         } else {
@@ -288,6 +299,15 @@ mod tests {
     };
 
     fn leaf(ca: &X509, ca_key: &PKey<Private>, san: bool, server_auth: bool) -> Candidate {
+        leaf_at(ca, ca_key, san, server_auth, super::super::now() as i64 - 1)
+    }
+    fn leaf_at(
+        ca: &X509,
+        ca_key: &PKey<Private>,
+        san: bool,
+        server_auth: bool,
+        start: i64,
+    ) -> Candidate {
         let key = crypto::p256().unwrap();
         let mut cert = X509::builder().unwrap();
         let mut name = X509NameBuilder::new().unwrap();
@@ -298,7 +318,7 @@ mod tests {
         cert.set_subject_name(&name.build()).unwrap();
         cert.set_issuer_name(ca.subject_name()).unwrap();
         cert.set_pubkey(&key).unwrap();
-        let before = Asn1Time::from_unix(super::super::now() as i64 - 60).unwrap();
+        let before = Asn1Time::from_unix(start).unwrap();
         let after = Asn1Time::days_from_now(1).unwrap();
         cert.set_not_before(&before).unwrap();
         cert.set_not_after(&after).unwrap();
@@ -365,6 +385,29 @@ mod tests {
             validator
                 .verify(leaf(&ca, &key, true, true), super::super::now())
                 .is_ok()
+        );
+        let future = super::super::now() + 3600;
+        assert!(
+            matches!(validator.download(leaf_at(&ca,&key,true,true,future as i64),super::super::now(),3600).unwrap(), Download::Blocked { category:"future-not-before", retry_at:Some(at) } if at == future)
+        );
+        let mut wrong_key = leaf(&ca, &key, true, true);
+        wrong_key.key_pem = crypto::p256().unwrap().private_key_to_pem_pkcs8().unwrap();
+        assert!(
+            validator
+                .download(wrong_key, super::super::now(), 3600)
+                .is_err()
+        );
+        let wrong_name = Validator::new("other.test", Some(roots.path())).unwrap();
+        assert!(
+            wrong_name
+                .download(leaf(&ca, &key, true, true), super::super::now(), 3600)
+                .is_err()
+        );
+        let no_roots = Validator::new("example.test", None).unwrap();
+        assert!(
+            no_roots
+                .download(leaf(&ca, &key, true, true), super::super::now(), 3600)
+                .is_err()
         );
         let later = super::super::now() + 86401;
         assert!(matches!(

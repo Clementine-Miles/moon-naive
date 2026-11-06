@@ -18,6 +18,10 @@ pub trait DnsProvider: Send {
     /// uncertain API response; never adopt another record as owned.
     async fn present(&mut self, lease: &mut Lease) -> Result<()>;
     async fn propagated(&mut self, lease: &Lease) -> Result<bool>;
+    /// Recover a confirmed creation before the manager durably enters deletion.
+    async fn recover(&mut self, _lease: &mut Lease) -> Result<()> {
+        Ok(())
+    }
     async fn cleanup(&mut self, lease: &Lease) -> Result<()>;
 }
 
@@ -31,6 +35,9 @@ impl<T: DnsProvider + ?Sized> DnsProvider for Box<T> {
     }
     async fn propagated(&mut self, lease: &Lease) -> Result<bool> {
         (**self).propagated(lease).await
+    }
+    async fn recover(&mut self, lease: &mut Lease) -> Result<()> {
+        (**self).recover(lease).await
     }
     async fn cleanup(&mut self, lease: &Lease) -> Result<()> {
         (**self).cleanup(lease).await
@@ -95,7 +102,7 @@ pub struct Cloudflare {
     http: Http,
     token: String,
     zone: String,
-    authorities: Option<Vec<SocketAddr>>,
+    authorities: Option<(std::time::Instant, Vec<Vec<SocketAddr>>)>,
     api_base: String,
 }
 impl Cloudflare {
@@ -157,8 +164,12 @@ impl Cloudflare {
             .ok_or("Cloudflare records response malformed")?
             .clone())
     }
-    async fn authorities(&mut self, lease: &Lease) -> Result<&[SocketAddr]> {
-        if self.authorities.is_none() {
+    async fn authorities(&mut self, lease: &Lease) -> Result<&[Vec<SocketAddr>]> {
+        if self
+            .authorities
+            .as_ref()
+            .is_none_or(|(until, _)| *until <= std::time::Instant::now())
+        {
             let zone = self.api("GET", "", None).await?;
             let name = zone["result"]["name"]
                 .as_str()
@@ -181,18 +192,22 @@ impl Cloudflare {
                 let host = server.as_str().ok_or("invalid authoritative server")?;
                 let resolved = tokio::time::timeout(
                     Duration::from_secs(5),
-                    tokio::net::lookup_host((host, 53)),
+                    crate::net::resolve::lookup_control(host, 53),
                 )
                 .await??;
-                // Query one reachable address for every authoritative server.
-                let address = resolved
-                    .min_by_key(|addr| !addr.is_ipv4())
-                    .ok_or("authoritative server has no address")?;
-                addresses.push(address);
+                let mut candidates = resolved.take(33).collect::<Vec<_>>();
+                if candidates.is_empty() || candidates.len() > 32 {
+                    return Err("invalid NS address count".into());
+                }
+                candidates.sort_by_key(|addr| !addr.is_ipv4());
+                addresses.push(candidates);
             }
-            self.authorities = Some(addresses);
+            self.authorities = Some((
+                std::time::Instant::now() + Duration::from_secs(60),
+                addresses,
+            ));
         }
-        Ok(self.authorities.as_deref().unwrap())
+        Ok(&self.authorities.as_ref().unwrap().1)
     }
 }
 fn matches_record(record: &Value, lease: &Lease) -> bool {
@@ -243,21 +258,67 @@ impl DnsProvider for Cloudflare {
     }
     async fn propagated(&mut self, lease: &Lease) -> Result<bool> {
         let addresses = self.authorities(lease).await?.to_vec();
-        for address in addresses {
-            if !authoritative_txt(address, &lease.name, &lease.value)
-                .await
-                .unwrap_or(false)
-            {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        for candidates in addresses {
+            let mut visible = false;
+            for address in candidates {
+                let attempt = deadline.min(tokio::time::Instant::now() + Duration::from_secs(1));
+                if matches!(
+                    tokio::time::timeout_at(
+                        attempt,
+                        authoritative_txt(address, &lease.name, &lease.value)
+                    )
+                    .await,
+                    Ok(Ok(true))
+                ) {
+                    visible = true;
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+            }
+            if !visible {
+                self.authorities = None;
                 return Ok(false);
             }
         }
         Ok(true)
     }
+    async fn recover(&mut self, lease: &mut Lease) -> Result<()> {
+        if lease.borrowed
+            || lease.record_id.is_some()
+            || lease.phase != super::state::LeasePhase::CreateUncertain
+        {
+            return Ok(());
+        }
+        let records = self.records(lease).await?;
+        if let Some(record) = records
+            .iter()
+            .find(|record| matches_record(record, lease) && record["comment"] == lease.marker)
+        {
+            lease.record_id = Some(record["id"].as_str().ok_or("record ID missing")?.to_owned());
+            lease.phase = super::state::LeasePhase::Created;
+            return Ok(());
+        }
+        Err("DNS create outcome uncertain; retain marker and reconcile again".into())
+    }
     async fn cleanup(&mut self, lease: &Lease) -> Result<()> {
         if lease.borrowed {
             return Ok(());
         }
-        for record in self.records(lease).await? {
+        let records = self.records(lease).await?;
+        if lease.phase == super::state::LeasePhase::CreateUncertain
+            && lease.record_id.is_none()
+            && !records
+                .iter()
+                .any(|record| matches_record(record, lease) && record["comment"] == lease.marker)
+        {
+            // A single empty list can precede a delayed remote commit. Keep the
+            // durable marker, including across shutdown; never create a new order.
+            return Err("DNS create outcome uncertain; retain lease and reconcile again".into());
+        }
+        for record in records {
             if !matches_record(&record, lease) || record["comment"] != lease.marker {
                 continue;
             }
@@ -461,6 +522,7 @@ mod tests {
             marker: "moon-naive-acme-test-unique".into(),
             record_id: None,
             borrowed: false,
+            ..Lease::default()
         };
         let mut provider = make_provider();
         assert!(provider.present(&mut lease).await.is_err()); // DNS write happened; response failed.
@@ -496,5 +558,105 @@ mod tests {
         provider.api_base = server.url.clone();
         assert!(provider.api("GET", "", None).await.is_err());
         assert!(http.retry_after.load(Ordering::Relaxed) >= crate::acme::now() + 119);
+    }
+}
+
+#[cfg(test)]
+mod delayed_create_tests {
+    use super::*;
+    use bytes::Bytes;
+    use http_body_util::Full;
+    use std::sync::{Arc, Mutex};
+    #[tokio::test]
+    async fn empty_cleanup_does_not_forget_late_remote_creation() {
+        let records = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let server = crate::acme::tests::http_server({
+            let records = records.clone();
+            move |request| {
+                let records = records.clone();
+                async move {
+                    let value = if request.method() == http::Method::DELETE {
+                        records.lock().unwrap().clear();
+                        json!({"success":true})
+                    } else {
+                        json!({"success":true,"result":*records.lock().unwrap()})
+                    };
+                    http::Response::new(Full::new(Bytes::from(serde_json::to_vec(&value).unwrap())))
+                }
+            }
+        })
+        .await;
+        let http = Http::new(None, Duration::from_secs(1))
+            .unwrap()
+            .with_loopback_http();
+        let mut provider = Cloudflare::new(http, &"a".repeat(32), "test".into()).unwrap();
+        provider.api_base = server.url.clone();
+        let lease = Lease {
+            name: "_acme-challenge.example.test".into(),
+            value: "late".into(),
+            marker: "owned-late".into(),
+            ..Lease::default()
+        };
+        assert!(provider.cleanup(&lease).await.is_err());
+        // Durable recovery uses the same marker after timeout/shutdown.
+        let recovered: Lease =
+            serde_json::from_slice(&serde_json::to_vec(&lease).unwrap()).unwrap();
+        records.lock().unwrap().push(json!({"id":"bbbb","type":"TXT","name":lease.name,"content":lease.value,"comment":lease.marker}));
+        provider.cleanup(&recovered).await.unwrap();
+        assert!(records.lock().unwrap().is_empty());
+        let mut confirmed = recovered;
+        confirmed.phase = super::super::state::LeasePhase::DeleteUncertain;
+        provider.cleanup(&confirmed).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod ns_fallback_tests {
+    use super::*;
+    #[tokio::test]
+    async fn stalled_preferred_ns_address_does_not_hide_working_address() {
+        use hickory_proto::rr::{Record, rdata::TXT};
+        let stalled = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let good = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addresses = vec![stalled.local_addr().unwrap(), good.local_addr().unwrap()];
+        let reply = tokio::spawn(async move {
+            let mut buffer = [0; 4096];
+            let (n, peer) = good.recv_from(&mut buffer).await.unwrap();
+            let query = Message::from_vec(&buffer[..n]).unwrap();
+            let mut response = Message::response(query.id, OpCode::Query);
+            response.metadata.authoritative = true;
+            response.add_queries(query.queries.clone());
+            response.answers.push(Record::from_rdata(
+                query.queries[0].name.clone(),
+                30,
+                RData::TXT(TXT::new(vec!["value".into()])),
+            ));
+            good.send_to(&response.to_vec().unwrap(), peer)
+                .await
+                .unwrap();
+        });
+        let mut provider = Cloudflare::new(
+            Http::new(None, Duration::from_secs(1)).unwrap(),
+            &"a".repeat(32),
+            "test".into(),
+        )
+        .unwrap();
+        provider.authorities = Some((
+            std::time::Instant::now() + Duration::from_secs(60),
+            vec![addresses],
+        ));
+        let lease = Lease {
+            name: "_acme-challenge.example.test".into(),
+            value: "value".into(),
+            ..Lease::default()
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), provider.propagated(&lease))
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        reply.await.unwrap();
+        drop(stalled);
     }
 }

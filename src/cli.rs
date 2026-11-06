@@ -134,6 +134,14 @@ fn transport(config: &Config) -> Result<()> {
     Ok(())
 }
 fn certificate_status(config: &Config) -> Result<()> {
+    let observation = config.state_dir.join("certificates/TLS-LOADED");
+    if observation.exists() {
+        let text = acme::state::read_private(&observation, 4096)?;
+        println!(
+            "runtime_observation_may_be_stale=true\n{}",
+            std::str::from_utf8(&text)?
+        );
+    }
     let store = DiskStore::open(&config.state_dir.join("certificates"))?;
     if let Some(stored) = store.read_current()? {
         let ready = Validator::for_config(config)?
@@ -162,6 +170,15 @@ async fn acme_command(args: &[String]) -> Result<()> {
     let config = config(path)?;
     match cmd.as_str() {
         "status" => certificate_status(&config),
+        "retry-certificate" => {
+            let timeout = Duration::from_secs(config.acme.request_timeout_secs);
+            let http = Http::new(config.acme.directory_ca_file.as_deref(), timeout)?;
+            let provider = acme::dns::provider_from_config(&config, Http::new(None, timeout)?)?;
+            let mut manager = acme::manager::Manager::open(&config, provider, http)?;
+            manager.retry_certificate()?;
+            println!("certificate_validation_retry_scheduled=true; existing order retained");
+            Ok(())
+        }
         "check-ca" => {
             let http = Http::new(
                 config.acme.directory_ca_file.as_deref(),

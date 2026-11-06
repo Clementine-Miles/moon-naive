@@ -409,7 +409,7 @@ fn docker(args: &[String]) -> Result<String> {
 }
 pub fn platform_smoke(binary: &Path, ca_bundle: Option<&Path>) -> Result<()> {
     let binary = fs::canonicalize(binary)?;
-    let example = super::private_example(&binary)?;
+    let example = super::private_example(&binary, None)?;
     let config = fs::canonicalize(&example.0)?;
     let mut report = String::new();
     for (name, image) in [

@@ -14,12 +14,15 @@ pub(super) struct Generation {
     pub h2: SslAcceptor,
     pub h3: Mutex<quiche::Config>,
     pub not_after: u64,
+    outer: Option<crate::acme::certificate::Lifetime>,
 }
 #[derive(Clone)]
 pub(super) struct Slot(Arc<RwLock<Arc<Generation>>>);
 impl Slot {
     pub fn load(config: &Config) -> Result<Self> {
-        Ok(Self(Arc::new(RwLock::new(Arc::new(load(config)?)))))
+        let slot = Self(Arc::new(RwLock::new(Arc::new(load(config)?))));
+        slot.record(config)?;
+        Ok(slot)
     }
     pub fn current(&self) -> Result<Arc<Generation>> {
         let generation = self
@@ -27,12 +30,11 @@ impl Slot {
             .read()
             .map_err(|_| "TLS generation lock poisoned")?
             .clone();
-        if crate::acme::now() >= generation.not_after {
-            return Err("no unexpired TLS generation".into());
-        }
+        generation.valid_at(crate::acme::now())?;
         Ok(generation)
     }
     pub(super) fn refresh(&self, config: &Config) -> Result<bool> {
+        self.record(config)?;
         let current = self
             .0
             .read()
@@ -40,10 +42,48 @@ impl Slot {
             .clone();
         let id = DiskStore::open(&config.state_dir.join("certificates"))?.current_generation()?;
         if id.as_deref() == Some(current.id.as_str()) && ech_stamp(config)? == current.ech_stamp {
+            current.valid_at(crate::acme::now())?;
             return Ok(false);
         }
         self.replace(load(config)?)?;
+        self.record(config)?;
         Ok(true)
+    }
+    fn record(&self, config: &Config) -> Result<()> {
+        let generation = self
+            .0
+            .read()
+            .map_err(|_| "TLS generation lock poisoned")?
+            .clone();
+        let path = config.state_dir.join("certificates/TLS-LOADED");
+        let mut composite = boring::sha::Sha256::new();
+        composite.update(generation.id.as_bytes());
+        if let Some(stamp) = generation.ech_stamp {
+            composite.update(&stamp);
+        }
+        let composite: String = composite
+            .finish()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let text = format!(
+            "process_id={}\nloaded_generation={}\nloaded_bundle_sha256={composite}\nnew_handshakes_allowed={}\ninner_not_after={}\nouter_not_after={:?}\nhandshake_probe=not_performed_by_status_writer\n",
+            std::process::id(),
+            generation.id,
+            generation.valid_at(crate::acme::now()).is_ok(),
+            generation.not_after,
+            generation.outer.map(|life| life.not_after)
+        );
+        if crate::acme::state::read_private(&path, 4096).is_ok_and(|old| old == text.as_bytes()) {
+            return Ok(());
+        }
+        let mut nonce = [0; 8];
+        boring::rand::rand_bytes(&mut nonce)?;
+        let temp = path.with_file_name(format!("TLS-LOADED-{}.tmp", u64::from_be_bytes(nonce)));
+        crate::acme::state::write_private_new(&temp, text.as_bytes())?;
+        std::fs::rename(&temp, &path)?;
+        std::fs::File::open(path.parent().unwrap())?.sync_all()?;
+        Ok(())
     }
     fn replace(&self, generation: Generation) -> Result<()> {
         *self.0.write().map_err(|_| "TLS generation lock poisoned")? = Arc::new(generation);
@@ -75,7 +115,9 @@ fn load(config: &Config) -> Result<Generation> {
         }
     }
     h2.check_private_key()?;
-    let ech = EchMaterial::load(config)?;
+    // Build the latest inner even when outer is expired. Admission below gates
+    // all new handshakes until the complete configured ECH identity is valid.
+    let ech = EchMaterial::read(config, false)?;
     if let Some(ech) = &ech {
         ech.install(&mut h2, &certs, &key)?;
     }
@@ -105,7 +147,8 @@ fn load(config: &Config) -> Result<Generation> {
     let initial = config
         .limits
         .max_early_data_bytes
-        .min(config.limits.max_buffer_bytes_per_stream) as u64;
+        .min(TransportProfile::from_config(config)?.h3_stream_window() as usize)
+        as u64;
     h3.set_initial_max_stream_data_bidi_local(initial);
     h3.set_initial_max_stream_data_bidi_remote(initial);
     h3.set_max_recv_udp_payload_size(1350);
@@ -121,9 +164,27 @@ fn load(config: &Config) -> Result<Generation> {
         h2: h2.build(),
         h3: Mutex::new(h3),
         not_after: bundle.lifetime().not_after,
+        outer: ech.as_ref().map(|ech| ech.lifetime),
     })
 }
+impl Generation {
+    fn valid_at(&self, now: u64) -> Result<()> {
+        if now >= self.not_after {
+            return Err("inner TLS identity expired".into());
+        }
+        if self.outer.is_some_and(|life| !life.valid_at(now)) {
+            return Err(
+                "ECH outer identity invalid; new handshakes suspended (ECH remains configured)"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
 pub(super) async fn watch(config: Arc<Config>, slot: Slot, mut stop: watch::Receiver<bool>) {
+    let mut last_error = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(60))
+        .unwrap();
     loop {
         if *stop.borrow() {
             break;
@@ -132,7 +193,16 @@ pub(super) async fn watch(config: Arc<Config>, slot: Slot, mut stop: watch::Rece
         let local = config.clone();
         let slot = slot.clone();
         // Failed validation leaves the previous immutable generation installed.
-        let _ = tokio::task::spawn_blocking(move || slot.refresh(&local)).await;
+        match tokio::task::spawn_blocking(move || slot.refresh(&local)).await {
+            Ok(Ok(true)) => eprintln!("event=tls_generation_loaded"),
+            Ok(Ok(false)) => {}
+            result => {
+                if last_error.elapsed() >= std::time::Duration::from_secs(60) {
+                    eprintln!("event=tls_refresh_failed detail={result:?}");
+                    last_error = std::time::Instant::now();
+                }
+            }
+        }
     }
 }
 
@@ -143,6 +213,7 @@ struct EchMaterial {
     public_name: String,
     certificates: Vec<X509>,
     private_key: PKey<boring::pkey::Private>,
+    lifetime: crate::acme::certificate::Lifetime,
 }
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -158,6 +229,9 @@ struct EchKeyEntry {
 }
 impl EchMaterial {
     fn load(config: &Config) -> Result<Option<Self>> {
+        Self::read(config, true)
+    }
+    fn read(config: &Config, require_valid_time: bool) -> Result<Option<Self>> {
         use base64::{Engine, engine::general_purpose::STANDARD};
         let Some(settings) = &config.ech else {
             return Ok(None);
@@ -186,7 +260,8 @@ impl EchMaterial {
                 boring::hpke::HpkeKey::dhkem_p256_sha256(&key)?,
             )?;
         }
-        let certificates = X509::stack_from_pem(&std::fs::read(&settings.certificate_file)?)?;
+        let chain_pem = std::fs::read(&settings.certificate_file)?;
+        let certificates = X509::stack_from_pem(&chain_pem)?;
         let leaf = certificates
             .first()
             .ok_or("empty ECH public certificate chain")?;
@@ -197,8 +272,8 @@ impl EchMaterial {
         }) {
             return Err("ECH public certificate requires an exact DNS SAN".into());
         }
-        let now = boring::asn1::Asn1Time::days_from_now(0)?;
-        if leaf.not_before() > now || leaf.not_after() <= now {
+        let lifetime = crate::acme::certificate::lifetime(leaf)?;
+        if require_valid_time && !lifetime.valid_at(crate::acme::now()) {
             return Err("ECH public certificate is not currently valid".into());
         }
         let private_key = PKey::private_key_from_pem(&crate::acme::state::read_private(
@@ -208,11 +283,24 @@ impl EchMaterial {
         if !leaf.public_key()?.public_eq(&private_key) {
             return Err("ECH public certificate key mismatch".into());
         }
+        let candidate = crate::acme::certificate::Candidate {
+            chain_pem,
+            key_pem: private_key.private_key_to_pem_pkcs8()?,
+        };
+        let checked_at = crate::acme::now()
+            .min(lifetime.not_after.saturating_sub(1))
+            .max(lifetime.not_before);
+        crate::acme::certificate::Validator::new(
+            &settings.public_name,
+            config.acme.certificate_ca_file.as_deref(),
+        )?
+        .verify(candidate, checked_at)?;
         Ok(Some(Self {
             keys: builder.build(),
             public_name: settings.public_name.clone(),
             certificates,
             private_key,
+            lifetime,
         }))
     }
     fn install(
@@ -422,14 +510,15 @@ fn h3_settings(
     config.enable_pacing(true);
     config.set_max_idle_timeout(profile.idle_timeout_ms());
     config.set_initial_max_data(u64::from(profile.connection_window()));
-    config.set_initial_max_stream_data_bidi_local(u64::from(profile.stream_window()));
-    config.set_initial_max_stream_data_bidi_remote(u64::from(profile.stream_window()));
+    config.set_initial_max_stream_data_bidi_local(u64::from(profile.h3_stream_window()));
+    config.set_initial_max_stream_data_bidi_remote(u64::from(profile.h3_stream_window()));
     config.set_initial_max_stream_data_uni(64 * 1024);
     config.set_initial_max_streams_bidi(u64::from(profile.max_streams()));
     config.set_initial_max_streams_uni(16);
     config.set_max_connection_window(u64::from(profile.connection_window()));
-    config.set_max_stream_window(u64::from(profile.stream_window()));
-    // Control streams have a separate bounded reserve. No enable_early_data():
+    config.set_max_stream_window(u64::from(profile.h3_stream_window()));
+    // Stalled bidi DATA cannot consume the control reserve. QPACK dynamic tables
+    // remain disabled in the H3 driver. No enable_early_data():
     // 0-RTT stays disabled. H2 applies the same profile in its driver.
     Ok(config)
 }

@@ -35,6 +35,14 @@ use std::os::windows::io::AsRawSocket;
 /// The interface to establish a L4 connection
 #[async_trait]
 pub trait Connect: std::fmt::Debug {
+    /// Opt-in retry of TCP+TLS before any HTTP request is sent. Implementations
+    /// must advance concrete candidates on each connect() call.
+    fn connection_attempts(&self) -> usize {
+        1
+    }
+    fn attempt_timeout(&self) -> Option<std::time::Duration> {
+        None
+    }
     async fn connect(&self, addr: &SocketAddr) -> Result<Stream>;
 }
 

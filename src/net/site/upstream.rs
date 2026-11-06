@@ -21,6 +21,7 @@ pub(super) struct Pool {
     next: AtomicUsize,
     frontend: SocketAddr,
     node_domain: String,
+    public_addresses: Vec<std::net::IpAddr>,
     tcp_congestion: moon_naive_core::config::TcpCongestion,
     group: u64,
 }
@@ -30,7 +31,7 @@ struct Origin {
     tls: bool,
     ca: Option<Arc<Box<[boring::x509::X509]>>>,
     addresses: Mutex<Option<(Instant, Vec<SocketAddr>)>>,
-    failed_until: Mutex<Option<Instant>>,
+    failed_until: std::sync::Mutex<Option<Instant>>,
 }
 impl Pool {
     pub fn load(config: &Upstream, app: &Config) -> Result<Self> {
@@ -71,7 +72,7 @@ impl Pool {
                     tls,
                     ca: ca.clone(),
                     addresses: Mutex::new(None),
-                    failed_until: Mutex::new(None),
+                    failed_until: std::sync::Mutex::new(None),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -81,6 +82,7 @@ impl Pool {
             next: AtomicUsize::new(0),
             frontend: app.listener.tcp,
             node_domain: app.domain.clone(),
+            public_addresses: app.listener.public_addresses.clone(),
             tcp_congestion: app.transport.tcp_congestion,
             group: app
                 .website
@@ -98,12 +100,12 @@ impl Pool {
         self.origins.len()
     }
     pub fn failed(&self, index: usize) {
-        if let Ok(mut slot) = self.origins[index].failed_until.try_lock() {
+        if let Ok(mut slot) = self.origins[index].failed_until.lock() {
             *slot = Some(Instant::now() + Duration::from_secs(5));
         }
     }
     pub fn succeeded(&self, index: usize) {
-        if let Ok(mut slot) = self.origins[index].failed_until.try_lock() {
+        if let Ok(mut slot) = self.origins[index].failed_until.lock() {
             *slot = None;
         }
     }
@@ -112,15 +114,39 @@ impl Pool {
         start: usize,
         config: &Website,
     ) -> pingora_core::Result<(usize, HttpPeer)> {
-        let mut index = start % self.origins.len();
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(config.connect_timeout_secs);
+        let mut last = pingora_core::Error::new_up(pingora_core::ErrorType::ConnectError);
         for n in 0..self.origins.len() {
-            let candidate = (start + n) % self.origins.len();
-            let failed = self.origins[candidate].failed_until.lock().await;
-            if failed.is_none_or(|until| until <= Instant::now()) {
-                index = candidate;
-                break;
+            let index = (start + n) % self.origins.len();
+            if self.origins[index]
+                .failed_until
+                .lock()
+                .map_err(|_| pingora_core::Error::new_str("origin health lock poisoned"))?
+                .is_some_and(|until| until > Instant::now())
+            {
+                continue;
+            }
+            match tokio::time::timeout_at(deadline, self.peer_one(index, config)).await {
+                Ok(Ok(peer)) => return Ok(peer),
+                Ok(Err(error)) => {
+                    self.failed(index);
+                    last = error;
+                }
+                Err(_) => {
+                    return Err(pingora_core::Error::new_up(
+                        pingora_core::ErrorType::ConnectTimedout,
+                    ));
+                }
             }
         }
+        Err(last)
+    }
+    async fn peer_one(
+        &self,
+        index: usize,
+        config: &Website,
+    ) -> pingora_core::Result<(usize, HttpPeer)> {
         let origin = &self.origins[index];
         let mut cache = origin.addresses.lock().await;
         if cache
@@ -128,8 +154,8 @@ impl Pool {
             .is_none_or(|(until, _)| *until <= Instant::now())
         {
             let addresses = tokio::time::timeout(
-                Duration::from_secs(config.connect_timeout_secs),
-                tokio::net::lookup_host((origin.host.as_str(), origin.port)),
+                Duration::from_secs(config.connect_timeout_secs).min(Duration::from_secs(2)),
+                crate::net::resolve::lookup(origin.host.as_str(), origin.port),
             )
             .await
             .map_err(|_| pingora_core::Error::new_up(pingora_core::ErrorType::ConnectTimedout))?
@@ -161,8 +187,12 @@ impl Pool {
             .copied()
             .filter(|address| {
                 !(address.port() == self.frontend.port()
-                    && (address.ip() == self.frontend.ip()
-                        || address.ip().is_loopback()
+                    && (super::super::egress::same_ip(address.ip(), self.frontend.ip())
+                        || super::super::egress::is_local(address.ip())
+                        || self
+                            .public_addresses
+                            .iter()
+                            .any(|ip| super::super::egress::same_ip(*ip, address.ip()))
                         || origin.host.eq_ignore_ascii_case(&self.node_domain)))
             })
             .collect();
@@ -181,6 +211,7 @@ impl Pool {
             addresses,
             algorithm: self.tcp_congestion,
             deadline: Duration::from_secs(config.connect_timeout_secs),
+            next: AtomicUsize::new(0),
         }));
         let algorithm = self.tcp_congestion;
         peer.options.upstream_tcp_sock_tweak_hook = Some(Arc::new(move |socket| {
@@ -259,20 +290,26 @@ struct ResolvedConnector {
     addresses: Vec<SocketAddr>,
     algorithm: moon_naive_core::config::TcpCongestion,
     deadline: Duration,
+    next: AtomicUsize,
 }
 #[async_trait::async_trait]
 impl pingora_core::connectors::L4Connect for ResolvedConnector {
+    fn connection_attempts(&self) -> usize {
+        self.addresses.len()
+    }
+    fn attempt_timeout(&self) -> Option<Duration> {
+        Some(self.deadline.min(Duration::from_secs(3)))
+    }
     async fn connect(
         &self,
         _addr: &pingora_core::protocols::l4::socket::SocketAddr,
     ) -> pingora_core::Result<pingora_core::protocols::l4::stream::Stream> {
+        let mut candidates = self.addresses.clone();
+        let len = candidates.len();
+        candidates.rotate_left(self.next.fetch_add(1, Ordering::Relaxed) % len);
         let socket = tokio::time::timeout(
             self.deadline,
-            super::super::egress::connect_candidates(
-                self.addresses.clone(),
-                Arc::default(),
-                self.algorithm,
-            ),
+            super::super::egress::connect_candidates(candidates, Arc::default(), self.algorithm),
         )
         .await
         .map_err(|_| pingora_core::Error::new_up(pingora_core::ErrorType::ConnectTimedout))?
@@ -285,6 +322,63 @@ impl pingora_core::connectors::L4Connect for ResolvedConnector {
 mod tests {
     use super::*;
     use pingora_core::upstreams::peer::Peer;
+    #[tokio::test]
+    async fn tcp_success_with_stalled_tls_advances_to_next_candidate() {
+        let (acceptor, ca) = crate::net::tests::test_origin_tls_material();
+        let roots = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(roots.path(), ca).unwrap();
+        let bad = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bad_addr = bad.local_addr().unwrap();
+        let good_addr = good.local_addr().unwrap();
+        let stalled = tokio::spawn(async move {
+            let (_socket, _) = bad.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let working = tokio::spawn(async move {
+            let (socket, _) = good.accept().await.unwrap();
+            let _tls = tokio_boring::accept(&acceptor, socket).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        let mut config = Config::parse(include_str!("../../../config.example.toml")).unwrap();
+        config.website.upstreams[0].origins = vec![format!("https://{bad_addr}")];
+        config.website.upstreams[0].tls_server_name = Some("proxy.example.test".into());
+        config.website.upstreams[0].ca_file = Some(roots.path().into());
+        let pool = Pool::load(&config.website.upstreams[0], &config).unwrap();
+        *pool.origins[0].addresses.lock().await = Some((
+            Instant::now() + Duration::from_secs(60),
+            vec![bad_addr, good_addr],
+        ));
+        let (_, mut peer) = pool.peer(0, &config.website).await.unwrap();
+        peer.options.alpn = ALPN::H1;
+        let connector = pingora_core::connectors::http::Connector::<()>::new(None);
+        let session =
+            tokio::time::timeout(Duration::from_secs(5), connector.get_http_session(&peer))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(matches!(
+            session.0,
+            pingora_core::protocols::http::client::HttpSession::H1(_)
+        ));
+        stalled.abort();
+        working.await.unwrap();
+    }
+    #[tokio::test]
+    async fn dns_failure_selects_backup_and_cools_failed_origin() {
+        let mut config = Config::parse(include_str!("../../../config.example.toml")).unwrap();
+        let backup = config.website.upstreams[0].origins[0].clone();
+        config.website.upstreams[0].origins.push(backup);
+        let mut pool = Pool::load(&config.website.upstreams[0], &config).unwrap();
+        pool.origins[0].host = "bad\0host".into();
+        *pool.origins[1].addresses.lock().await = Some((
+            Instant::now() + Duration::from_secs(60),
+            vec!["127.0.0.1:8080".parse().unwrap()],
+        ));
+        assert_eq!(pool.peer(0, &config.website).await.unwrap().0, 1);
+        assert!(pool.origins[0].failed_until.lock().unwrap().is_some());
+        assert_eq!(pool.peer(0, &config.website).await.unwrap().0, 1);
+    }
     #[tokio::test]
     async fn one_origin_retains_all_candidates_before_any_request_is_sent() {
         let config = Config::parse(include_str!("../../../config.example.toml")).unwrap();

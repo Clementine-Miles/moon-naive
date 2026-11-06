@@ -180,7 +180,7 @@ fn test_suites(isolated: bool) -> Result<()> {
     }
 }
 
-fn verify(target: Option<&str>) -> Result<()> {
+fn verify(target: Option<&str>, runner: Option<&[String]>) -> Result<()> {
     let root = root();
     audit::sources()?;
     if target.is_none() {
@@ -229,9 +229,15 @@ fn verify(target: Option<&str>) -> Result<()> {
     if let Some(target) = target {
         output_dir.push(target);
     }
+    if target.is_some() && runner.is_none() {
+        return save_report(
+            "verification",
+            "target compile-only=passed\ntarget runtime checks=not run (use verify-run with an explicit runner)\n",
+        );
+    }
     let cli = output_dir.join("release/moon-naive");
-    let example = private_example(&cli)?;
-    let output = Command::new(&cli)
+    let example = private_example(&cli, runner)?;
+    let output = cli_command(&cli, runner)
         .arg("check-config")
         .arg(&example.0)
         .current_dir(&root)
@@ -263,7 +269,7 @@ fn verify(target: Option<&str>) -> Result<()> {
         .open(&invalid)?;
     file.write_all(text.as_bytes())?;
     drop(file);
-    let denied = Command::new(&cli)
+    let denied = cli_command(&cli, runner)
         .arg("check-config")
         .arg(&invalid)
         .output()?;
@@ -289,16 +295,24 @@ fn verify(target: Option<&str>) -> Result<()> {
     fs::write(&setup, toml::to_string(&config)?)?;
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&setup, fs::Permissions::from_mode(0o600))?;
-    let failed = Command::new(&cli).arg("serve").arg(&setup).output()?;
+    let failed = cli_command(&cli, runner)
+        .arg("serve")
+        .arg(&setup)
+        .output()?;
     fs::remove_file(setup)?;
     check(
         !failed.status.success()
             && !String::from_utf8_lossy(&failed.stderr).contains("event=server_ready"),
         "serve must reject incomplete setup before accepting traffic",
     )?;
+    println!(
+        "verification_target={} runner={:?}",
+        target.unwrap_or("host"),
+        runner
+    );
     save_report(
         "verification",
-        "native Git revision pins=passed\nworkspace fmt=passed\nclippy -D warnings=passed\nrelease server build=passed\nCLI generated private example=passed\nCLI Fast Open rejection=passed\nserve incomplete-setup rejection=passed\n24h network soak=not performed\n",
+        "Git revision pins=passed\nworkspace fmt=passed\nclippy -D warnings=passed\nrelease server build=passed\nCLI generated private example=passed\nCLI Fast Open rejection=passed\nserve incomplete-setup rejection=passed\n24h network soak=not performed\n",
     )
 }
 // Test the installed CLI's embedded example without making the distributed
@@ -309,7 +323,17 @@ impl Drop for PrivateExample {
         let _ = fs::remove_file(&self.0);
     }
 }
-fn private_example(cli: &Path) -> Result<PrivateExample> {
+fn cli_command(cli: &Path, runner: Option<&[String]>) -> Command {
+    // The CLI smoke command must be bounded even with a broken emulator.
+    let mut command = Command::new("timeout");
+    command.args(["--kill-after=5s", "60s"]);
+    if let Some(runner) = runner {
+        command.arg(&runner[0]).args(&runner[1..]);
+    }
+    command.arg(cli);
+    command
+}
+fn private_example(cli: &Path, runner: Option<&[String]>) -> Result<PrivateExample> {
     let dir = root().join("reports");
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!(
@@ -317,7 +341,7 @@ fn private_example(cli: &Path) -> Result<PrivateExample> {
         std::process::id(),
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
     ));
-    let result = Command::new(cli)
+    let result = cli_command(cli, runner)
         .args(["config", "init"])
         .arg(&path)
         .output()?;
@@ -331,17 +355,18 @@ fn private_example(cli: &Path) -> Result<PrivateExample> {
 fn main() -> ExitCode {
     let args: Vec<_> = env::args().skip(1).collect();
     let result = match args.as_slice() {
-        [cmd] if cmd == "verify" => verify(None),
+        [cmd] if cmd == "verify" => verify(None, None),
         [cmd] if cmd == "test" => test_suites(false),
         [cmd] if cmd == "test-isolated" => test_suites(true),
-        [cmd,target] if cmd=="verify"=>verify(Some(target)),
+        [cmd,target] if cmd=="verify"=>verify(Some(target), None),
+        [cmd, target, runner @ ..] if cmd == "verify-run" && !runner.is_empty() => verify(Some(target), Some(runner)),
         [cmd] if cmd == "audit-native" => audit_native(),
         [cmd, binary] if cmd == "check-elf" => release::check_elf(Path::new(binary)),
         [cmd,binary,output] if cmd=="dist"=>release::dist(Path::new(binary),Path::new(output)),
         [cmd,output] if cmd=="source"=>release::source(Path::new(output)),
         [cmd,binary] if cmd=="platform-smoke"=>release::platform_smoke(Path::new(binary),None),
         [cmd,binary,ca] if cmd=="platform-smoke"=>release::platform_smoke(Path::new(binary),Some(Path::new(ca))),
-        _ => Err("usage: cargo xtask test | test-isolated | verify [target] | audit-native | check-elf <binary> | dist <binary> <output-dir> | source <output-dir> | platform-smoke <binary> [ca-bundle]".into()),
+        _ => Err("usage: cargo xtask test | test-isolated | verify [target] | verify-run <target> <runner> [runner-args...] | audit-native | check-elf <binary> | dist <binary> <output-dir> | source <output-dir> | platform-smoke <binary> [ca-bundle]".into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -349,5 +374,33 @@ fn main() -> ExitCode {
             eprintln!("verification failed: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod runner_tests {
+    use super::*;
+    #[test]
+    fn explicit_runner_arguments_are_not_shell_parsed_and_failures_propagate() {
+        let runner = vec![
+            "/usr/bin/false".to_owned(),
+            "literal with spaces".to_owned(),
+        ];
+        let mut command = cli_command(Path::new("/unused target"), Some(&runner));
+        let args = command
+            .get_args()
+            .map(|v| v.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec![
+                "--kill-after=5s",
+                "60s",
+                "/usr/bin/false",
+                "literal with spaces",
+                "/unused target"
+            ]
+        );
+        assert!(!command.status().unwrap().success());
     }
 }

@@ -31,6 +31,7 @@ use tokio::{
 };
 
 pub(super) struct Bridge {
+    pub(super) buffers: Option<Arc<super::super::resources::BufferPool>>,
     health: watch::Receiver<bool>,
     sender: h2::client::SendRequest<Bytes>,
     client: JoinHandle<()>,
@@ -129,6 +130,7 @@ impl Bridge {
             // Dropping JoinSet aborts requests when the memory connection ends.
         });
         Ok(Self {
+            buffers: None,
             health,
             sender,
             client,
@@ -257,6 +259,11 @@ impl Bridge {
                 while let Some(bytes) = body.data().await {
                     let bytes = bytes?;
                     let len = bytes.len();
+                    let bytes = if let Some(pool) = &self.buffers {
+                        pool.charge(bytes).await?
+                    } else {
+                        bytes
+                    };
                     output.send(HttpTask::Body(Some(bytes), false)).await?;
                     // Capacity follows consumption into a bounded queue.
                     body.flow_control().release_capacity(len)?;

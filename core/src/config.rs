@@ -107,6 +107,8 @@ impl TcpCongestion {
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Listener {
+    /// Public/NAT frontend addresses not discoverable by binding a local socket.
+    pub public_addresses: Vec<std::net::IpAddr>,
     #[serde(default = "https_listener")]
     pub tcp: SocketAddr,
     #[serde(default = "https_listener")]
@@ -120,6 +122,7 @@ pub struct Listener {
 impl Default for Listener {
     fn default() -> Self {
         Self {
+            public_addresses: Vec::new(),
             tcp: https_listener(),
             udp: https_listener(),
             h2: true,
@@ -138,10 +141,13 @@ fn https_listener() -> SocketAddr {
 pub struct Limits {
     pub max_streams: usize,
     pub max_connections: usize,
+    pub max_pending_requests: usize,
+    pub max_tunnels_per_user: usize,
     pub max_early_data_bytes: usize,
     pub max_buffer_bytes_per_stream: usize,
     #[serde(default = "receive_budget")]
     pub max_total_receive_bytes: usize,
+    pub max_total_buffer_bytes: usize,
     pub connect_timeout_secs: u64,
     pub idle_timeout_secs: u64,
     pub graceful_timeout_secs: u64,
@@ -151,9 +157,12 @@ impl Default for Limits {
         Self {
             max_streams: 100,
             max_connections: 128,
+            max_pending_requests: 100,
+            max_tunnels_per_user: 100,
             max_early_data_bytes: 65536,
             max_buffer_bytes_per_stream: 262144,
             max_total_receive_bytes: receive_budget(),
+            max_total_buffer_bytes: receive_budget(),
             connect_timeout_secs: 15,
             idle_timeout_secs: 600,
             graceful_timeout_secs: 300,
@@ -339,16 +348,19 @@ impl Config {
             || u32::try_from(l.max_streams).is_err()
             || l.max_connections == 0
             || l.max_connections > 4096
+            || l.max_pending_requests == 0
+            || l.max_pending_requests > 4096
+            || l.max_tunnels_per_user == 0
+            || l.max_tunnels_per_user > 4096
             || l.max_early_data_bytes == 0
             || l.max_early_data_bytes > 1024 * 1024
             || l.max_buffer_bytes_per_stream < l.max_early_data_bytes
             || l.max_buffer_bytes_per_stream > 4 * 1024 * 1024
             || l.max_buffer_bytes_per_stream < 16 * 1024
-            || l.max_total_receive_bytes
-                < l.max_buffer_bytes_per_stream
-                    .saturating_mul(l.max_streams)
-                    .min(16 * 1024 * 1024)
+            || l.max_total_receive_bytes < 65_535
             || l.max_total_receive_bytes > 1024 * 1024 * 1024
+            || l.max_total_buffer_bytes < 2 * 16 * 1024
+            || l.max_total_buffer_bytes > 1024 * 1024 * 1024
             || l.connect_timeout_secs == 0
             || l.idle_timeout_secs == 0
             || l.idle_timeout_secs.checked_mul(1000).is_none()
@@ -772,8 +784,14 @@ impl TransportProfile {
             .map_err(|_| "stream window exceeds transport range")?;
         // Keep connection-level flow control bounded even at high stream counts.
         // These are wire credits, not a substitute for application memory permits.
-        let connection_window =
-            (u64::from(stream_window) * u64::from(max_streams)).min(16 * 1024 * 1024) as u32;
+        // Reserve the entire non-revocable rolling credit for the connection's
+        // lifetime, including after authenticated streams finish. Divide the
+        // configured budget across connection slots instead of reserving 16 MiB
+        // unconditionally. H2's initial connection credit cannot be reduced.
+        let fair_share = (limits.max_total_receive_bytes / limits.max_connections)
+            .clamp(65_535, 16 * 1024 * 1024);
+        let connection_window = (u64::from(stream_window) * u64::from(max_streams))
+            .clamp(65_535, fair_share as u64) as u32;
         Ok(Self {
             idle_timeout_ms,
             max_streams,
@@ -790,6 +808,15 @@ impl TransportProfile {
     }
     pub fn stream_window(&self) -> u32 {
         self.stream_window
+    }
+    /// Bound aggregate stalled request DATA so control/QPACK can still progress.
+    /// These are transport credits; application authentication never owns them.
+    pub fn h3_control_reserve(&self) -> u32 {
+        (self.connection_window / 4).min(64 * 1024)
+    }
+    pub fn h3_stream_window(&self) -> u32 {
+        self.stream_window
+            .min((self.connection_window - self.h3_control_reserve()) / self.max_streams)
     }
     pub fn connection_window(&self) -> u32 {
         self.connection_window
@@ -810,7 +837,11 @@ mod profile_tests {
         assert_eq!(profile.idle_timeout_ms(), 600_000);
         assert_eq!(profile.max_streams(), 100);
         assert_eq!(profile.stream_window(), 262_144);
-        assert_eq!(profile.connection_window(), 16 * 1024 * 1024);
+        assert_eq!(profile.connection_window(), 512 * 1024);
+        assert!(
+            profile.h3_stream_window() * profile.max_streams() + profile.h3_control_reserve()
+                <= profile.connection_window()
+        );
         let config = Config::parse(&format!("{SAMPLE}\n[limits]\nmax_streams=1\n")).unwrap();
         assert_eq!(
             TransportProfile::from_config(&config)
@@ -818,6 +849,19 @@ mod profile_tests {
                 .connection_window(),
             262_144
         );
+    }
+    #[test]
+    fn minimum_credit_and_control_progress_are_budgeted() {
+        let mut config = Config::parse(SAMPLE).unwrap();
+        config.limits.max_streams = 1;
+        config.limits.max_buffer_bytes_per_stream = 16 * 1024;
+        config.limits.max_early_data_bytes = 16 * 1024;
+        config.limits.max_total_receive_bytes = 65_535;
+        let profile = TransportProfile::from_config(&config).unwrap();
+        assert_eq!(profile.connection_window(), 65_535);
+        assert!(profile.h3_stream_window() + profile.h3_control_reserve() <= 65_535);
+        config.limits.max_pending_requests = 0;
+        assert!(config.validate().is_err());
     }
     #[test]
     fn unsupported_transport_values_are_rejected() {

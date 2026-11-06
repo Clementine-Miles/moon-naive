@@ -397,8 +397,33 @@ async fn do_connect<P: Peer + Send + Sync>(
 ) -> Result<Stream> {
     // Create the future that does the connections, but don't evaluate it until
     // we decide if we need a timeout or not
-    let connect_future =
-        do_connect_inner(peer, bind_to, alpn_override, tls_ctx, offload_wait_duration);
+    let connect_future = async {
+        let custom = peer.get_peer_options().and_then(|o| o.custom_l4.as_ref());
+        let attempts = custom.map_or(1, |c| c.connection_attempts()).clamp(1, 32);
+        let phase_timeout = custom.and_then(|c| c.attempt_timeout());
+        let mut last = None;
+        for _ in 0..attempts {
+            let attempt = do_connect_inner(
+                peer,
+                bind_to.clone(),
+                alpn_override.clone(),
+                tls_ctx,
+                offload_wait_duration,
+            );
+            let result = match phase_timeout {
+                Some(t) => match pingora_timeout::timeout(t, attempt).await {
+                    Ok(result) => result,
+                    Err(_) => Error::e_explain(ConnectTimedout, "candidate TCP/TLS deadline"),
+                },
+                None => attempt.await,
+            };
+            match result {
+                Ok(stream) => return Ok(stream),
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.expect("at least one connection attempt"))
+    };
 
     match peer.total_connection_timeout() {
         Some(t) => match pingora_timeout::timeout(t, connect_future).await {

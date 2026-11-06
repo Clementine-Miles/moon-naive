@@ -1225,8 +1225,8 @@ async fn resets_cancel_real_h2_h3_tunnels_and_release_quotas() {
     })
     .await
     .unwrap();
-    assert_eq!(app.tunnels.active(), 0);
-    assert_eq!(app.requests.active(), 0);
+    assert_eq!(app.resources.tunnels.active(), 0);
+    assert_eq!(app.resources.requests.active(), 0);
     let mut client = QClient::new(udp, &fixture.ca).await;
     let id = client.request(
         "CONNECT",
@@ -1258,8 +1258,8 @@ async fn resets_cancel_real_h2_h3_tunnels_and_release_quotas() {
     })
     .await
     .unwrap();
-    assert_eq!(app.tunnels.active(), 0);
-    assert_eq!(app.requests.active(), 0);
+    assert_eq!(app.resources.tunnels.active(), 0);
+    assert_eq!(app.resources.requests.active(), 0);
     origin_task.await.unwrap();
     connection.abort();
     let _ = client.conn.close(true, 0x100, b"");
@@ -1307,7 +1307,7 @@ async fn early_data_resets_cancel_pending_admission_without_dialing() {
         .send_data(Bytes::from_static(b"early data"), false)
         .unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
-        while app.tunnels.active() != 1 {
+        while app.resources.tunnels.active() != 1 {
             tokio::task::yield_now().await;
         }
     })
@@ -1321,13 +1321,13 @@ async fn early_data_resets_cancel_pending_admission_without_dialing() {
     assert_eq!(app.stats.dials.load(Ordering::Relaxed), 0);
     upload.send_reset(::h2::Reason::CANCEL);
     tokio::time::timeout(Duration::from_secs(2), async {
-        while app.requests.active() != 0 {
+        while app.resources.requests.active() != 0 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
-    assert_eq!(app.tunnels.active(), 0);
+    assert_eq!(app.resources.tunnels.active(), 0);
     let mut client = QClient::new(udp, &fixture.ca).await;
     for (stop_read, reset_write, fin) in [
         (true, true, true),
@@ -1356,7 +1356,7 @@ async fn early_data_resets_cancel_pending_admission_without_dialing() {
             );
         }
         tokio::time::timeout(Duration::from_secs(2), async {
-            while app.tunnels.active() != 1 {
+            while app.resources.tunnels.active() != 1 {
                 client.step().await;
             }
         })
@@ -1377,13 +1377,13 @@ async fn early_data_resets_cancel_pending_admission_without_dialing() {
                 .unwrap();
         }
         tokio::time::timeout(Duration::from_secs(2), async {
-            while app.requests.active() != 0 {
+            while app.resources.requests.active() != 0 {
                 client.step().await;
             }
         })
         .await
         .unwrap();
-        assert_eq!(app.tunnels.active(), 0);
+        assert_eq!(app.resources.tunnels.active(), 0);
         assert_eq!(app.stats.dials.load(Ordering::Relaxed), 0);
     }
     connection.abort();
@@ -1438,8 +1438,8 @@ async fn early_data_and_clean_fin_survive_delayed_h3_admission() {
     origin.await.unwrap();
     let _ = stop.send(true);
     task.await.unwrap().unwrap();
-    assert_eq!(app.requests.active(), 0);
-    assert_eq!(app.tunnels.active(), 0);
+    assert_eq!(app.resources.requests.active(), 0);
+    assert_eq!(app.resources.tunnels.active(), 0);
 }
 
 #[tokio::test]
@@ -1603,8 +1603,8 @@ async fn real_h2_idle_allows_one_way_progress_and_reaps_silent_tunnels() {
     connection.abort();
     let _ = stop.send(true);
     task.await.unwrap().unwrap();
-    assert_eq!(app.tunnels.active(), 0);
-    assert_eq!(app.requests.active(), 0);
+    assert_eq!(app.resources.tunnels.active(), 0);
+    assert_eq!(app.resources.requests.active(), 0);
 }
 
 #[tokio::test]
@@ -1691,8 +1691,8 @@ async fn real_h3_idle_allows_one_way_progress_and_reaps_silent_tunnels() {
     client.step().await;
     let _ = stop.send(true);
     task.await.unwrap().unwrap();
-    assert_eq!(app.tunnels.active(), 0);
-    assert_eq!(app.requests.active(), 0);
+    assert_eq!(app.resources.tunnels.active(), 0);
+    assert_eq!(app.resources.requests.active(), 0);
 }
 
 #[tokio::test]
@@ -1774,8 +1774,8 @@ async fn real_h2_h3_slow_readers_preserve_padded_bytes_across_small_windows() {
     client.step().await;
     let _ = stop.send(true);
     task.await.unwrap().unwrap();
-    assert_eq!(app.tunnels.active(), 0);
-    assert_eq!(app.requests.active(), 0);
+    assert_eq!(app.resources.tunnels.active(), 0);
+    assert_eq!(app.resources.requests.active(), 0);
 }
 
 #[tokio::test]
@@ -2367,4 +2367,175 @@ async fn negotiated_windows_share_h2_h3_connections_without_content_changes() {
     stop.send(true).unwrap();
     task.await.unwrap().unwrap();
     origin.await.unwrap();
+}
+
+#[tokio::test]
+async fn fifth_mixed_connection_is_admitted_with_default_limits() {
+    let mut f = fixture();
+    Arc::get_mut(&mut f.config).unwrap().limits = moon_naive_core::config::Limits::default();
+    let server = network(&f, None).await;
+    let tcp = server.tcp_addr().unwrap();
+    let udp = server.udp_addr().unwrap();
+    let app = server.app.clone();
+    let window = app.profile.connection_window();
+    let (stop, rx) = watch::channel(false);
+    let task = tokio::spawn(server.run(rx));
+    let mut clients = Vec::new();
+    let mut drivers = Vec::new();
+    let mut quic = Vec::new();
+    for index in 0..5 {
+        if index % 2 == 0 {
+            let (mut client, driver) = h2_client(tcp, &f.ca).await;
+            let request = http::Request::builder()
+                .uri("https://proxy.example.test/")
+                .body(())
+                .unwrap();
+            let (response, _) = client.send_request(request, true).unwrap();
+            assert_eq!(response.await.unwrap().status(), 200);
+            clients.push(client);
+            drivers.push(driver);
+        } else {
+            let mut client = QClient::new(udp, &f.ca).await;
+            let id = client.request("GET", "proxy.example.test", Some("/"), None, false, true);
+            assert_eq!(client.response(id).await.status, 200);
+            quic.push(client);
+        }
+    }
+    assert_eq!(
+        app.resources.receive.available_permits(),
+        f.config.limits.max_total_receive_bytes - 5 * window as usize
+    );
+    drop(clients);
+    drop(quic);
+    for driver in drivers {
+        driver.abort();
+    }
+    stop.send(true).unwrap();
+    task.await.unwrap().unwrap();
+    assert_eq!(
+        app.resources.receive.available_permits(),
+        f.config.limits.max_total_receive_bytes
+    );
+}
+
+#[tokio::test]
+async fn expired_outer_gates_new_handshakes_but_does_not_stall_inner_loading() {
+    let mut f = fixture();
+    Arc::get_mut(&mut f.config)
+        .unwrap()
+        .limits
+        .idle_timeout_secs = 30;
+    let stored = DiskStore::open(&f.config.state_dir.join("certificates"))
+        .unwrap()
+        .read_current()
+        .unwrap()
+        .unwrap();
+    let root = f._root.path();
+    let cert = root.join("outer.pem");
+    let private = root.join("outer.key");
+    let keys = root.join("ech-expiry.toml");
+    let outer_key = key();
+    let mut expired = X509::builder().unwrap();
+    expired.set_version(2).unwrap();
+    expired
+        .set_serial_number(&BigNum::from_u32(42).unwrap().to_asn1_integer().unwrap())
+        .unwrap();
+    let mut name = X509NameBuilder::new().unwrap();
+    name.append_entry_by_text("CN", "public.example.test")
+        .unwrap();
+    expired.set_subject_name(&name.build()).unwrap();
+    expired
+        .append_extension(&BasicConstraints::new().critical().build().unwrap())
+        .unwrap();
+    expired
+        .append_extension(&ExtendedKeyUsage::new().server_auth().build().unwrap())
+        .unwrap();
+    expired.set_issuer_name(f.ca_cert.subject_name()).unwrap();
+    expired.set_pubkey(&outer_key).unwrap();
+    let now = crate::acme::now() as i64;
+    expired
+        .set_not_before(&Asn1Time::from_unix(now - 3600).unwrap())
+        .unwrap();
+    expired
+        .set_not_after(&Asn1Time::from_unix(now + 10).unwrap())
+        .unwrap();
+    expired
+        .append_extension(
+            &SubjectAlternativeName::new()
+                .dns("public.example.test")
+                .build(&expired.x509v3_context(Some(&f.ca_cert), None))
+                .unwrap(),
+        )
+        .unwrap();
+    expired.sign(&f.ca_key, MessageDigest::sha256()).unwrap();
+    std::fs::write(&cert, expired.build().to_pem().unwrap()).unwrap();
+    std::fs::write(&private, outer_key.private_key_to_pem_pkcs8().unwrap()).unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600)).unwrap();
+    Arc::get_mut(&mut f.config).unwrap().ech = Some(moon_naive_core::config::Ech {
+        public_name: "public.example.test".into(),
+        certificate_file: cert.clone(),
+        private_key_file: private.clone(),
+        keys_file: keys,
+    });
+    tls::ech_command("init", &f.config).unwrap();
+    let server = network(&f, None).await;
+    let tcp = server.tcp_addr().unwrap();
+    let udp = server.udp_addr().unwrap();
+    let slot = server.tls.clone();
+    let (stop, rx) = watch::channel(false);
+    let task = tokio::spawn(server.run(rx));
+    let (mut existing, driver) = h2_client(tcp, &f.ca).await;
+    assert_eq!(peer_serial(tcp, &f.ca).await, vec![2]);
+    let until = (now + 11).saturating_sub(crate::acme::now() as i64) as u64;
+    tokio::time::sleep(Duration::from_secs(until)).await;
+    assert!(slot.current().is_err());
+    let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+    connector.set_ca_file(&f.ca).unwrap();
+    connector.set_alpn_protos(b"\x02h2").unwrap();
+    let socket = TcpStream::connect(tcp).await.unwrap();
+    let rejected = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio_boring::connect(
+            connector.build().configure().unwrap(),
+            "proxy.example.test",
+            socket,
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(
+        rejected.is_err(),
+        "outer expiry must gate new handshakes even with unchanged files"
+    );
+    rotate(&f);
+    assert!(slot.refresh(&f.config).unwrap());
+    assert!(slot.current().is_err());
+    // Repair only outer; the new inner already loaded above must become active.
+    std::fs::write(&cert, stored.candidate.chain_pem).unwrap();
+    std::fs::write(&private, stored.candidate.key_pem).unwrap();
+    assert!(slot.refresh(&f.config).unwrap());
+    let request = http::Request::builder()
+        .uri("https://proxy.example.test/")
+        .body(())
+        .unwrap();
+    let (response, _) = existing.send_request(request, true).unwrap();
+    assert_eq!(response.await.unwrap().status(), 200);
+    assert_eq!(peer_serial(tcp, &f.ca).await, vec![3]);
+    let client = QClient::new(udp, &f.ca).await;
+    assert_eq!(
+        serial(&X509::from_der(client.conn.peer_cert().unwrap()).unwrap()),
+        vec![3]
+    );
+    drop(client);
+    drop(existing);
+    driver.abort();
+    stop.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+pub(crate) fn test_origin_tls_material() -> (boring::ssl::SslAcceptor, Vec<u8>) {
+    let mut f = fixture();
+    Arc::get_mut(&mut f.config).unwrap().listener.h1 = true;
+    let generation = tls::Slot::load(&f.config).unwrap().current().unwrap();
+    (generation.h2.clone(), std::fs::read(&f.ca).unwrap())
 }

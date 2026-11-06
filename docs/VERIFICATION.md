@@ -260,3 +260,66 @@ was tested. No broad dependency upgrade was performed.
 - 文档整合：配置、部署、协议与架构、验证与安全记录共四份 Markdown；历史测量 JSON 独立保留。
 
 旧文件名、命令和工作区路径仅用于追溯，不作为当前操作说明。
+
+## 本轮可靠性修复与验收边界
+
+本轮起点为 `e9066c7a576eb7fa831214485bc010005650df58`；开始时本地和远端
+main 一致、工作区干净。此前文档的历史结果不作为本轮执行结果。
+
+已修复的路径：
+
+- 固定 16 MiB 连接预留改为受全局预算支持的公平常驻信用；等待、逐用户 CONNECT、
+  连接、request/tunnel 和应用 Bytes 额度有明确所有者，QUIC 控制流保留信用。
+- TCP 尝试有两秒期限，最多两个同时运行；锁定 Pingora 的 opt-in L4 接口允许在
+  HTTP 请求发送前重试完整 TCP/TLS，保留原始 SNI 和证书验证。每候选三秒上限，
+  请求级连接期限不会因网站源站回退重置。下一跳握手失败也推进具体候选。
+- 系统 DNS job 在真正结束前持有许可，取消 waiter 不退款。数据面 32 个、控制面
+  8 个 job，均不无界排队；不能宣称 timeout 能终止 libc 解析。
+- 固定网站 DNS 错误在 peer 选择阶段冷却并选择备用；WebSocket 共用长期源站池、
+  DNS 和健康状态。Upgrade 请求开始写出后不做透明重试。
+- 多字段 WebSocket 子协议 token 校验；原始斜杠、转义、query 和可信 forwarded
+  元数据统一处理，正向代理继续删除身份元数据。
+- outer 自然到期有时间门禁，inner 载入与外层有效性分开；磁盘 CURRENT、载入状态
+  和真实新握手分别核对。刷新错误不再丢弃。
+- DNS uncertain create/deletion 持久对账，NS 地址回退、单轮期限和失效刷新；
+  completed certificate 隔离与 future notBefore 等待。
+- `cargo xtask verify <target>` 是 compile-only；`verify-run <target> <runner> [args...]`
+  才显式执行目标 CLI，参数不经过 shell，每条 CLI 命令最多 60 秒再加 5 秒终止宽限。
+
+代表性新增测试使用真实回环 IO 验证：第五条混合 H2/H3 连接、源站 DNS 失败备用、
+TCP 已通但 TLS 不进展后的候选切换、WebSocket 真正使用备用、重复子协议字段和
+原始 target、outer 自然到期后的新握手拒绝及恢复后 H2/H3 新证书。确定性测试覆盖
+前两个候选永久 pending、取消 resolver waiter、Bytes 克隆/切片额度、晚到 DNS
+创建和 NS 地址回退。原有 POST 不重放、codec、权限、半关闭与 reset 测试继续执行。
+
+尚不能据此声称全部架构验收完成：
+
+- 不是所有库内存都经过应用缓冲池，不能把两项字节预算相加当作 RSS 硬上限。
+  QUIC final-size/乱序及未知控制流的完整恶意线报文矩阵仍需专项实验。
+- 不自动撤销已授予信用，不引入认证后全连接登录或新代理 0-RTT/Fast Open；
+  exporter label、实际 stream ID、transcript、response proof 与 codec 源码保持不变。
+- 控制面仍是同进程线程。后续应拆成独立 UID/进程、单独持有 DNS/ACME 密钥，
+  通过只允许 generation 描述的 IPC 发布；数据面无 DNS/ACME 密钥读取权限。
+  验收需覆盖 IPC 凭据、目录 writer/reader/rename 权限、崩溃及升级/回滚。
+- 配套 revision 4 Chromium 客户端尚未实现。普通 Chromium 仅能验证匿名网站、
+  WebSocket、H2/H3 和其支持的 ECH；不能替代逐流代理 proof 的互通验收。
+- 没有匹配硬件/内核/编译选项/配置的服务性能 A/B 数据，性能收益未知。
+  后续固定 Chromium commit、补丁与构建摘要，记录真实协议/连接复用、证书/ECH、
+  错误路径；负载同时记录成功率、p50/p95/p99、吞吐、CPU、RSS、FD、task/queue、
+  连接/stream/permit、缓冲和 bridge generation。确认瓶颈后才改变复制、channel、
+  批处理或调度。BoringSSL 或少量抓包不构成不可识别性证据。
+
+### 本轮实际执行结果
+
+最终工作区 `cargo test --workspace --locked`：服务库 127、core 30、CLI 集成 2、
+xtask runner 1，共 **160 项通过、0 失败**。服务库 9 项和 Pebble 集成 2 项忽略，
+不计为通过；binary/doc 的零测试运行也不计数。
+
+`cargo xtask verify` 实际完成非空 core/ACME/net/CLI 套件、fmt、
+`clippy --workspace --all-targets --locked -- -D warnings`、Release 构建和真实 CLI
+冒烟；`cargo xtask audit-native` 以及根目录 SHA256SUMS 校验通过。
+这些结果来自本轮命令，不来自上方历史安全实施记录。
+
+执行环境：Linux 6.18.57、x86_64 GNU、Intel Xeon Platinum 8573C、5 个可见逻辑 CPU，
+Rust 1.93.0、四路构建。Release 复用本机同锁定 boring-sys 5.2.0 的已验证静态库。
+未验证最低 Rust 1.89、外国架构 runner、真实 CA/DNS、Chromium、24h soak 或性能 A/B。

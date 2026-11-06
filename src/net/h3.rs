@@ -284,14 +284,28 @@ impl Stream {
                 }
                 self.output = Some(output);
                 let idle = app.idle;
+                let buffers = app.resources.buffers.clone();
                 let activity = self.activity.clone();
                 let (result, completion) = oneshot::channel();
                 self.completion = Some(completion);
                 self.task = Some(Abort(tokio::spawn(async move {
                     let _permit = _permit;
                     let _wake = Wake(wake.clone());
-                    let _ = result
-                        .send(bridge(target, framed, receive, send, idle, wake, activity).await);
+                    let _ = result.send(
+                        bridge_charged(
+                            target,
+                            framed,
+                            receive,
+                            send,
+                            BridgeLimits {
+                                idle,
+                                buffers: Some(buffers),
+                            },
+                            wake,
+                            activity,
+                        )
+                        .await,
+                    );
                 })));
             }
         }
@@ -301,15 +315,20 @@ impl Stream {
         Ok(())
     }
 }
-pub(super) async fn bridge(
+struct BridgeLimits {
+    idle: Duration,
+    buffers: Option<Arc<super::resources::BufferPool>>,
+}
+async fn bridge_charged(
     target: super::outbound::Stream,
     framed: Option<moon_naive_core::codec::Mode>,
     mut incoming: mpsc::Receiver<Bytes>,
     outgoing: mpsc::Sender<Bytes>,
-    idle: Duration,
+    limits: BridgeLimits,
     wake: Arc<Notify>,
     activity: Activity,
 ) -> Result<()> {
+    let BridgeLimits { idle, buffers } = limits;
     use tokio::io::AsyncWriteExt;
     let (mut read, mut write) = tokio::io::split(target);
     let notify = wake.clone();
@@ -328,6 +347,11 @@ pub(super) async fn bridge(
         let mut download = TunnelDownload::new(framed)?;
         while let Some(data) = download.read_next(&mut read).await? {
             activity.touch();
+            let data = if let Some(pool) = &buffers {
+                pool.charge(data).await?
+            } else {
+                data
+            };
             outgoing.send(data).await?;
             wake.notify_one();
         }
@@ -364,7 +388,9 @@ pub(super) async fn serve(
     let mut h3_config = quiche::h3::Config::new()?;
     h3_config.enable_extended_connect(true);
     h3_config.set_max_field_section_size(32768);
-    let wake = Arc::new(Notify::new());
+    h3_config.set_qpack_max_table_capacity(0);
+    h3_config.set_qpack_blocked_streams(0);
+    let wake = app.resources.buffers.wake.clone();
     let timer = DriverTimer::new()?;
     let local = socket.local_addr()?;
     let mut draining: Option<Instant> = None;
@@ -485,7 +511,7 @@ pub(super) async fn serve(
                                         .path_stats()
                                         .find(|path| path.active)
                                         .map(|path| path.peer_addr.ip());
-                                    if let Some(permit) = app.requests.acquire() {
+                                    if let Some(permit) = app.resources.requests.acquire() {
                                         client.streams.insert(
                                             id,
                                             Stream::new(app.clone(), head, wake.clone(), permit),
@@ -648,7 +674,7 @@ pub(super) async fn serve(
                     }
                     let Some(original)=validate(&key,from,&cid,token) else {continue;};
                     let Some(permit)=connections.acquire() else {continue;};
-                    let Ok(window)=app.receive.clone().try_acquire_many_owned(app.profile.connection_window()) else {continue;};
+                    let Ok(window)=app.resources.receive.clone().try_acquire_many_owned(app.profile.connection_window()) else {continue;};
                     let generation=match tls.current(){Ok(g)=>g,Err(_)=>continue};
                     let conn={let mut config=generation.h3.lock().map_err(|_|"H3 config lock poisoned")?;quiche::accept(&header.dcid,Some(&quiche::ConnectionId::from_ref(&original)),local,from,&mut config)};
                     let Ok(conn)=conn else {continue;};
@@ -666,11 +692,25 @@ fn recv_body(
     h3: &mut quiche::h3::Connection,
     id: u64,
     buffer: &mut BytesMut,
+    app: &App,
 ) -> Result<Option<Bytes>> {
+    let Ok(permit) = app
+        .resources
+        .buffers
+        .available
+        .clone()
+        .try_acquire_many_owned(CHUNK as u32)
+    else {
+        return Ok(None);
+    };
     buffer.resize(CHUNK, 0);
     match h3.recv_body(conn, id, buffer) {
         Ok(0) | Err(quiche::h3::Error::Done) => Ok(None),
-        Ok(n) => Ok(Some(buffer.split_to(n).freeze())),
+        Ok(n) => Ok(Some(
+            app.resources
+                .buffers
+                .wrap(buffer.split_to(n).freeze(), permit),
+        )),
         Err(e) => Err(e.into()),
     }
 }
@@ -729,7 +769,7 @@ fn drive_stream(
         }
     }
     if stream.website.is_some() {
-        return drive_website(conn, h3, id, stream, body_buffer);
+        return drive_website(conn, h3, id, stream, body_buffer, app);
     }
     if let Some(reply) = &stream.reply
         && !stream.sent_headers
@@ -766,7 +806,7 @@ fn drive_stream(
                 if input.capacity() == 0 {
                     break;
                 }
-                let Some(bytes) = recv_body(conn, h3, id, body_buffer)? else {
+                let Some(bytes) = recv_body(conn, h3, id, body_buffer, app)? else {
                     break;
                 };
                 input
@@ -826,6 +866,7 @@ fn drive_website(
     id: u64,
     stream: &mut Stream,
     body_buffer: &mut BytesMut,
+    app: &App,
 ) -> Result<()> {
     let web = stream.website.as_mut().expect("website stream");
     if let Some(input) = &web.input {
@@ -836,7 +877,7 @@ fn drive_website(
                 if input.capacity() == 0 {
                     break;
                 }
-                let Some(bytes) = recv_body(conn, h3, id, body_buffer)? else {
+                let Some(bytes) = recv_body(conn, h3, id, body_buffer, app)? else {
                     break;
                 };
                 input.try_send(super::site::Input::Data(bytes))?;

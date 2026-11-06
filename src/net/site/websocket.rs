@@ -16,9 +16,15 @@ pub(crate) struct Prepared<'a> {
     uri: http::Uri,
     route: &'a Route,
     pool: &'a Upstream,
+    peers: &'a upstream::Pool,
+    protocols: Vec<String>,
 }
 
-pub(crate) fn prepare<'a>(config: &'a Config, head: &'a Head) -> Result<Prepared<'a>, u16> {
+pub(crate) fn prepare<'a>(
+    config: &'a Config,
+    head: &'a Head,
+    site: &'a super::Site,
+) -> Result<Prepared<'a>, u16> {
     let host = head
         .authority
         .parse::<http::uri::Authority>()
@@ -52,7 +58,17 @@ pub(crate) fn prepare<'a>(config: &'a Config, head: &'a Head) -> Result<Prepared
         .iter()
         .find(|p| p.name == route.upstream)
         .ok_or(502u16)?;
+    let index = config
+        .website
+        .upstreams
+        .iter()
+        .position(|p| p.name == route.upstream)
+        .ok_or(502u16)?;
+    let peers = site.pools.get(index).ok_or(502u16)?;
+    let protocols = super::transform::protocols(head)?;
     Ok(Prepared {
+        peers,
+        protocols,
         config,
         head,
         uri,
@@ -68,33 +84,36 @@ pub(crate) async fn connect(prepared: Prepared<'_>) -> Result<(Stream, Reply), u
         uri,
         route,
         pool,
+        peers,
+        protocols,
     } = prepared;
-    let peers = upstream::Pool::load(pool, config).map_err(|_| 502u16)?;
-    let (_, mut peer) = peers
-        .peer(peers.selection(), &config.website)
-        .await
-        .map_err(|_| 502u16)?;
-    peer.options.alpn = pingora_core::protocols::ALPN::H1;
     let connector = Connector::<()>::new(None);
-    let (session, _) = connector
-        .get_http_session(&peer)
-        .await
-        .map_err(|_| 502u16)?;
-    let HttpSession::H1(mut session) = session else {
-        return Err(502);
-    };
-    let mut target = if route.strip_prefix {
-        format!(
-            "/{}",
-            uri.path()[route.path_prefix.len()..].trim_start_matches('/')
-        )
-    } else {
-        uri.path().to_owned()
-    };
-    if let Some(query) = uri.query() {
-        target.push('?');
-        target.push_str(query);
+    let start = peers.selection();
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(config.website.connect_timeout_secs);
+    let mut selected = None;
+    // Only connection establishment is retried. No Upgrade request has been sent.
+    for offset in 0..peers.len() {
+        let (index, mut peer) = peers
+            .peer(start + offset, &config.website)
+            .await
+            .map_err(|_| 502u16)?;
+        peer.options.alpn = pingora_core::protocols::ALPN::H1;
+        let phase = (deadline - tokio::time::Instant::now()).min(std::time::Duration::from_secs(3));
+        match tokio::time::timeout(phase, connector.get_http_session(&peer)).await {
+            Ok(Ok((HttpSession::H1(session), _))) => {
+                peers.succeeded(index);
+                selected = Some(session);
+                break;
+            }
+            _ => peers.failed(index),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(504);
+        }
     }
+    let mut session = selected.ok_or(502u16)?;
+    let target = super::transform::target(&uri, &route.path_prefix, route.strip_prefix);
     let mut request =
         pingora_http::RequestHeader::build("GET", target.as_bytes(), None).map_err(|_| 502u16)?;
     request.set_version(http::Version::HTTP_11);
@@ -139,6 +158,8 @@ pub(crate) async fn connect(prepared: Prepared<'_>) -> Result<(Stream, Reply), u
     ] {
         request.insert_header(name, value).map_err(|_| 502u16)?;
     }
+    super::transform::metadata(&mut request, &head.authority, head.client_ip)
+        .map_err(|_| 502u16)?;
     session
         .write_request_header(Box::new(request))
         .await
@@ -193,13 +214,9 @@ pub(crate) async fn connect(prepared: Prepared<'_>) -> Result<(Stream, Reply), u
             return Err(502);
         }
         if let Some(protocol) = response.headers.get("sec-websocket-protocol") {
-            let offered = head
-                .header("sec-websocket-protocol")
-                .and_then(|v| std::str::from_utf8(v).ok())
-                .unwrap_or("");
-            if !offered
-                .split(',')
-                .any(|s| s.trim().as_bytes() == protocol.as_bytes())
+            let selected = protocol.to_str().map_err(|_| 502u16)?;
+            if !super::transform::valid_token(selected)
+                || !protocols.iter().any(|offered| offered == selected)
             {
                 return Err(502);
             }

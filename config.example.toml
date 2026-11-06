@@ -78,11 +78,14 @@ b64_mac_key = "dGVzdC10ZXN0LXRlc3QtdGVzdA"
 # [limits]
 # max_streams = 100
 # max_connections = 128
+# max_pending_requests = 100
+# max_tunnels_per_user = 100
 # max_early_data_bytes = 65536         # 认证/拨号期间有界缓冲，不是 TLS 0-RTT。
 # max_buffer_bytes_per_stream = 262144
-# H2初始流窗口取上面两项的较小值；H3可在实际读取后增长至本项上限。
+# H2初始流窗口取上面两项的较小值；H3还受公平连接窗口与控制流保留额约束。
 # 提高max_early_data_bytes也会提高认证前缓存额度；只在测得窗口瓶颈时调整。
-# max_total_receive_bytes = 67108864   # H2/H3 接收窗口预算，不是进程 RSS 上限。
+# max_total_receive_bytes = 67108864   # 默认每连接预留512KiB，不是进程 RSS 上限。
+# max_total_buffer_bytes = 67108864    # 应用持有的 DATA 字节池，与接收信用分开。
 # connect_timeout_secs = 15
 # idle_timeout_secs = 600     # 无应用数据进展的最长空闲期，不是连接总寿命；按业务静默期调整。
 # 高丢包可能延迟数据进展；保留上面的连接/流/缓冲上限，不发送假保活或无限延长超时。

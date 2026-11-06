@@ -133,7 +133,7 @@ chown moon-naive:moon-naive /etc/moon-naive/config.v2.toml
 
 代理认证/Padding 不转发给网站上游，客户端自报的 Forwarded/X-Forwarded-* 被清理，使用真实对端 IP 生成 X-Forwarded-For，并生成 https scheme 和网站 Host。目前没有可信前置代理列表，套在 CDN 后会看到 CDN 对端地址。管理员固定的私网上游与 Naïve 出站 ACL 分开。
 
-`max_total_receive_bytes` 是连接接收窗口预留总预算，不是 RSS 限额。默认连接窗口最多 16 MiB、总预算 64 MiB，因此可能先触发四个连接的窗口预算，再达到 max_connections。调整这些值会改变资源和网络行为，应按目标负载测量。
+`max_total_receive_bytes` 是连接接收信用预留总预算，不是 RSS 限额。默认总预算 64 MiB，按 128 个连接槽位分配每连接 512 KiB；实际容量及 QUIC 控制流保留额由 check-transport 报告。调整会改变资源和网络行为，应按目标负载测量。
 
 ## 高级网站协议与边界
 
@@ -316,3 +316,53 @@ api_token = "REPLACE_WITH_SCOPED_API_TOKEN"
 ACME 协议请求（包括 EAB JWS、nonce 重试、订单和 ARI）统一由 instant-acme 处理，DNS 操作由内置 Porkbun 或 Cloudflare 适配器完成，无 shell hooks。账户私钥在联网前持久化；遇到一次性 EAB 注册响应丢失，先用同一私钥查找既有账户，再决定是否注册。旧版仅保存 account_id/key 的日志仍可恢复。
 
 固定版本的 instant-acme 已随 vendor 提供。唯一 API 补丁允许使用已保存的私钥和 EAB 调用其原有注册实现，来源与差异见[接口补丁说明](../vendor/instant-acme/MOON-PATCH.md)。无需删除状态目录或重新申请 EAB。
+
+## 资源与恢复配置（本轮可靠性修复）
+
+`[limits]` 新增可选项：`max_pending_requests=100`、
+`max_tunnels_per_user=100`、`max_total_buffer_bytes=67108864`。
+旧配置省略这些字段时采用上述默认值。正在处理的请求总名额仍为
+`2 * max_streams`；等待名额是它的子集，活跃 tunnel 和网站 WebSocket
+共享 `max_streams` 名额；逐用户上限适用于认证 CONNECT，不是连接登录状态。
+
+连接滚动接收窗口为
+`clamp(stream_window * max_streams, 65535, clamp(total_receive/max_connections,65535,16MiB))`。
+默认每连接预留 512 KiB、全局 64 MiB，保守容量为 128 条 H2/H3 连接，
+仍受 listener 连接名额约束。H1 和未完成 TCP TLS 握手不预留 H2 信用；
+QUIC 经 Retry 验证后申请信用。信用由连接持有至协议状态销毁，
+不会因认证流结束而退款。H2 初始连接窗口的 65535 下界不可调低。
+
+QUIC 请求流窗口另受 `(connection_window-control_reserve)/max_streams` 约束，
+control reserve 为 `min(connection_window/4,64KiB)`；初始窗口还不超过 early-data
+上限。QPACK 动态表和 blocked streams 显式为零。调整的是流控/容量策略，
+不改变 revision 4 的认证与 framing，也不代表吞吐提升。并发多、窗口小的
+吞吐及尾延迟需要部署方测量，再决定是否提高预算或降低连接槽位。
+
+`max_total_buffer_bytes` 独立覆盖应用持有的 tunnel DATA、H3 网站 bridge
+队列和 pending DATA；额度跟随 Bytes 的克隆和切片，在最后持有者释放时归还。
+满额时保留背压。它不是 RSS 硬上限：H1/H2 网站的 Pingora 内部缓冲、
+头部、codec 状态、TLS/QUIC 元数据、内核缓冲分别受原有大小/并发限制约束。
+`check-transport` 输出实际连接、等待、tunnel、H3 信用和缓冲池容量。
+
+`[listener] public_addresses=[]` 可列出 NAT 公网入口地址。固定源站使用
+具体解析地址检查自反代，包括本机地址、mapped IPv6 和这些公网地址；
+合法的不同端口本地后端继续可用。无法从本地接口推导的 NAT 地址必须显式配置。
+
+ECH outer 到期时，已配置 ECH 的服务暂停所有新 TLS/QUIC 握手；不静默关闭 ECH。
+已有连接按原有 idle/grace 规则运行。inner 续期仍可载入，outer 修复后使用最新
+inner。outer 也执行 SAN、密钥、用途、链验证。`certificates/TLS-LOADED`
+记录进程 ID、载入 generation、有效期和新握手准入状态；它可能陈旧，不是实时
+握手证明。`status` 会明确标注这一点。刷新错误限速输出。
+
+ACME journal 写入版本 2，保留版本 1 的读取迁移。创建结果不确定且查询为空
+不会删除 lease；必须继续对账，已发现创建先持久化再进入 DeleteUncertain。
+这可能在无法证明远端操作终结时阻止后续签发，不能通过清空 journal 解决。
+遇到此情况应先向 provider 核实最终结果并保留 marker/订单证据。
+
+永久错误或原因不确定的 completed certificate 会保留公有证书材料、摘要和
+分类，暂停重复下载；future notBefore 验证后等到时间再重试；obsolete 仍持久
+退役和冷却。链错误可能来自材料或本地信任配置，不自动归责于 CA。
+修正信任配置并调查后，可停止运行中的控制器，执行
+`moon-naive acme retry-certificate <config.toml>`，显式重试原订单的验证。
+该命令不自动创建替代订单。回滚到旧二进制前必须处理 journal v2 迁移，
+不能让旧程序丢弃 DNS lease 或 blocked certificate。

@@ -430,7 +430,17 @@ where
             Err(e) => return (false, Some(e)),
         };
 
-        let client_session = self.client_upstream.get_http_session(&*peer).await;
+        // Include pool acquisition and protocol-session initialization, not only
+        // TCP/TLS, in the caller's remaining connection deadline. No HTTP request
+        // has been handed to an upstream session at this point.
+        let client_session = if let Some(limit) = peer.options.total_connection_timeout {
+            match tokio::time::timeout(limit, self.client_upstream.get_http_session(&*peer)).await {
+                Ok(result) => result,
+                Err(_) => Err(Error::new(ConnectTimedout)),
+            }
+        } else {
+            self.client_upstream.get_http_session(&*peer).await
+        };
         match client_session {
             Ok((client_session, client_reused)) => {
                 let (server_reused, error) = match client_session {

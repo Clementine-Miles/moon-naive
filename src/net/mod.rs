@@ -5,6 +5,8 @@ mod h2;
 mod h3;
 mod outbound;
 mod redirect;
+pub(crate) mod resolve;
+mod resources;
 mod site;
 #[cfg(test)]
 mod tests;
@@ -18,7 +20,7 @@ use moon_naive_core::{
     config::Config,
     config::TransportProfile,
     ingress::{self, Dispatch, RequestHead},
-    policy::{Budget, Permit},
+    policy::Budget,
 };
 use serde::Deserialize;
 use std::{
@@ -30,7 +32,7 @@ use std::{
 };
 use tokio::{
     net::{TcpListener, UdpSocket},
-    sync::{Semaphore, watch},
+    sync::watch,
 };
 
 pub(crate) const CHUNK: usize = 16 * 1024;
@@ -172,7 +174,7 @@ pub(crate) enum Plan {
         target: outbound::Stream,
         framed: Option<moon_naive_core::codec::Mode>,
         response: Reply,
-        _permit: Permit,
+        _permit: resources::TunnelLease,
     },
 }
 #[derive(Default)]
@@ -203,13 +205,11 @@ pub(crate) struct App {
     credentials: Credentials,
     site: Arc<site::Site>,
     egress: egress::Egress,
-    tunnels: Budget,
-    requests: Budget,
+    resources: resources::Resources,
     pub stats: Arc<Stats>,
     pub profile: TransportProfile,
     pub idle: Duration,
     pub graceful: Duration,
-    receive: Arc<Semaphore>,
     early: u32,
     tcp_congestion: moon_naive_core::config::TcpCongestion,
     h1: bool,
@@ -248,17 +248,18 @@ impl App {
                 .collect::<Vec<_>>(),
         )?;
         let stats = Arc::new(Stats::default());
+        let resources = resources::Resources::new(config, users.users.len())?;
+        let mut site = site::Site::load(config)?;
+        site.buffers = resources.buffers.clone();
         Ok(Self {
             credentials,
-            site: Arc::new(site::Site::load(config)?),
+            site: Arc::new(site),
             egress: egress::Egress::new(config, stats.clone())?,
-            tunnels: Budget::new(config.limits.max_streams)?,
-            requests: Budget::new(config.limits.max_streams.saturating_mul(2))?,
+            resources,
             stats,
             profile: TransportProfile::from_config(config)?,
             idle: Duration::from_secs(config.limits.idle_timeout_secs),
             graceful: Duration::from_secs(config.limits.graceful_timeout_secs),
-            receive: Arc::new(Semaphore::new(config.limits.max_total_receive_bytes)),
             early: config.limits.max_early_data_bytes as u32,
             tcp_congestion: config.transport.tcp_congestion,
             h1: config.listener.h1,
@@ -267,6 +268,9 @@ impl App {
         })
     }
     async fn prepare(&self, head: &Head) -> Result<Plan> {
+        let Some(_waiting) = self.resources.waiting.acquire() else {
+            return Ok(Plan::Site(Reply::error(503)));
+        };
         if !head.valid() {
             return Ok(Plan::Site(Reply::error(400).head(head.method == "HEAD")));
         }
@@ -278,11 +282,11 @@ impl App {
             {
                 return Ok(Plan::Site(Reply::error(400)));
             }
-            let prepared = match site::websocket::prepare(&self.config, head) {
+            let prepared = match site::websocket::prepare(&self.config, head, &self.site) {
                 Ok(prepared) => prepared,
                 Err(status) => return Ok(Plan::Site(Reply::error(status))),
             };
-            let Some(permit) = self.tunnels.acquire() else {
+            let Some(permit) = self.resources.tunnel(None) else {
                 return Ok(Plan::Site(Reply::error(503)));
             };
             return match tokio::time::timeout(
@@ -392,7 +396,7 @@ impl App {
             Ok(Dispatch::Tunnel(tunnel)) => tunnel,
             Err(_) => return Ok(Plan::Site(Reply::error(400))),
         };
-        let Some(permit) = self.tunnels.acquire() else {
+        let Some(permit) = self.resources.tunnel(Some(tunnel.principal())) else {
             return Ok(Plan::Site(Reply::error(503)));
         };
         match self.egress.dial(tunnel.target()).await {
@@ -449,9 +453,10 @@ impl Prepared {
         let Self { mut app, config } = self;
         let local = config.clone();
         let tls = tokio::task::spawn_blocking(move || tls::Slot::load(&local)).await??;
+        tls.current()?;
         if let Ok(Ok(addresses)) = tokio::time::timeout(
             Duration::from_secs(5),
-            tokio::net::lookup_host((config.domain.as_str(), config.listener.tcp.port())),
+            crate::net::resolve::lookup(config.domain.as_str(), config.listener.tcp.port()),
         )
         .await
         {
@@ -465,7 +470,7 @@ impl Prepared {
             Some(addr) => Some(TcpListener::bind(addr).await?),
             None => None,
         };
-        let connections = Budget::new(config.limits.max_connections)?;
+        let connections = app.resources.connections.clone();
         let stats = app.stats.clone();
         Ok(Network {
             app: Arc::new(app),
@@ -587,10 +592,26 @@ pub fn flow_control_report(config: &Config) -> Result<String> {
         .limits
         .max_early_data_bytes
         .min(profile.stream_window() as usize);
+    let capacity = config
+        .limits
+        .max_connections
+        .min(config.limits.max_total_receive_bytes / profile.connection_window() as usize);
     Ok(format!(
-        "tcp_congestion_effective={}\ntcp_socket_buffers=system_managed\nquic_pacing=quiche_send_time\nh2_initial_stream_receive_bytes={initial}\nh3_initial_stream_receive_bytes={initial}\nh3_max_stream_receive_bytes={}\nconnection_receive_bytes={}\ntotal_receive_budget_bytes={}",
+        "receive_connection_capacity={capacity}\nwaiting_request_capacity={}\nactive_tunnel_capacity={}\nper_user_tunnel_capacity={}\napplication_buffer_pool_bytes={}\nquic_control_reserve_bytes={}\napplication_buffers=separate_from_wire_credit\ntcp_congestion_effective={}\ntcp_socket_buffers=system_managed\nquic_pacing=quiche_send_time\nh2_initial_stream_receive_bytes={initial}\nh3_initial_stream_receive_bytes={}\nh3_max_stream_receive_bytes={}\nconnection_receive_bytes={}\ntotal_receive_budget_bytes={}",
+        config
+            .limits
+            .max_pending_requests
+            .min(config.limits.max_streams.saturating_mul(2)),
+        config.limits.max_streams,
+        config
+            .limits
+            .max_tunnels_per_user
+            .min(config.limits.max_streams),
+        config.limits.max_total_buffer_bytes,
+        profile.h3_control_reserve(),
         congestion::effective(config.transport.tcp_congestion)?,
-        profile.stream_window(),
+        initial.min(profile.h3_stream_window() as usize),
+        profile.h3_stream_window(),
         profile.connection_window(),
         config.limits.max_total_receive_bytes,
     ))

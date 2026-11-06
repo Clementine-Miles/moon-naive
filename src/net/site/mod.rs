@@ -2,6 +2,7 @@
 mod bridge;
 mod forward;
 mod generation;
+mod transform;
 mod upstream;
 pub(super) mod websocket;
 use super::{Head, Reply, Result};
@@ -180,6 +181,8 @@ fn valid_h1_framing(raw: &[u8]) -> bool {
 type Proxy = HttpProxy<Router>;
 pub(crate) struct Site {
     proxy: Arc<Proxy>,
+    pools: Vec<Arc<upstream::Pool>>,
+    pub(super) buffers: Arc<super::resources::BufferPool>,
     bridge: generation::Generations<bridge::Bridge>,
     max_streams: u32,
     #[cfg(test)]
@@ -199,7 +202,7 @@ struct Router {
     config: Website,
     domain: String,
     public_name: Option<String>,
-    pools: Vec<upstream::Pool>,
+    pools: Vec<Arc<upstream::Pool>>,
     routes: Vec<(moon_naive_core::website::Route, usize)>,
     alt_svc: String,
     forward: Option<forward::Origin>,
@@ -219,6 +222,7 @@ struct Context {
     attempt: usize,
     path: Option<String>,
     uploaded: usize,
+    deadline: Option<tokio::time::Instant>,
 }
 impl Site {
     pub fn load(config: &Config) -> Result<Self> {
@@ -230,7 +234,7 @@ impl Site {
             .website
             .upstreams
             .iter()
-            .map(|p| upstream::Pool::load(p, config))
+            .map(|p| upstream::Pool::load(p, config).map(Arc::new))
             .collect::<Result<Vec<_>>>()?;
         let mut routes: Vec<_> = config
             .website
@@ -254,7 +258,7 @@ impl Site {
             config: config.website.clone(),
             domain: config.domain.clone(),
             public_name: config.ech.as_ref().map(|ech| ech.public_name.clone()),
-            pools,
+            pools: pools.clone(),
             routes,
             stats: Arc::clone(&stats),
             forward: None,
@@ -274,6 +278,8 @@ impl Site {
         proxy.server_options = Some(options);
         Ok(Self {
             proxy: Arc::new(proxy),
+            pools,
+            buffers: super::resources::BufferPool::new(config.limits.max_total_buffer_bytes),
             bridge: generation::Generations::new(config.limits.max_streams),
             max_streams: config.limits.max_streams as u32,
             #[cfg(test)]
@@ -306,6 +312,8 @@ impl Site {
         bridge.share_shutdown(&website.bridge);
         Ok(Self {
             proxy: Arc::new(pingora_proxy::http_proxy(&conf, router)),
+            pools: vec![],
+            buffers: website.buffers.clone(),
             bridge,
             max_streams: config.limits.max_streams as u32,
             #[cfg(test)]
@@ -357,7 +365,13 @@ impl Site {
                 let bridge = site
                     .bridge
                     .get(bridge::Bridge::healthy, || {
-                        bridge::Bridge::new(site.proxy.clone(), site.max_streams)
+                        let site = site.clone();
+                        async move {
+                            let mut bridge =
+                                bridge::Bridge::new(site.proxy.clone(), site.max_streams).await?;
+                            bridge.buffers = Some(site.buffers.clone());
+                            Ok(bridge)
+                        }
                     })
                     .await?;
                 bridge
@@ -424,11 +438,7 @@ fn request_header(head: &Head) -> Result<RequestHeader> {
         request.insert_header("content-length", value.parse::<u64>()?.to_string())?;
     }
     request.insert_header("host", head.authority.as_str())?;
-    request.insert_header("x-forwarded-host", head.authority.as_str())?;
-    request.insert_header("x-forwarded-proto", "https")?;
-    if let Some(ip) = head.client_ip {
-        request.insert_header("x-forwarded-for", ip.to_string())?;
-    }
+    transform::metadata(&mut request, &head.authority, head.client_ip)?;
     Ok(request)
 }
 #[async_trait::async_trait]
@@ -468,7 +478,14 @@ impl ProxyHttp for Router {
             for name in remove {
                 req.remove_header(&name);
             }
-            req.insert_header("x-forwarded-proto", "https")?;
+            let authority = req
+                .headers
+                .get("host")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("")
+                .to_owned();
+            let ip = s.client_addr().and_then(|a| a.as_inet()).map(|a| a.ip());
+            transform::metadata(s.req_header_mut(), &authority, ip)?;
         }
         s.set_read_timeout(Some(Duration::from_secs(self.config.read_timeout_secs)));
         s.set_write_timeout(Some(Duration::from_secs(self.config.write_timeout_secs)));
@@ -486,6 +503,9 @@ impl ProxyHttp for Router {
         s: &mut Session,
         ctx: &mut Context,
     ) -> pingora_core::Result<bool> {
+        ctx.deadline.get_or_insert_with(|| {
+            tokio::time::Instant::now() + Duration::from_secs(self.config.connect_timeout_secs)
+        });
         let req = s.req_header();
         if req
             .headers
@@ -531,20 +551,7 @@ impl ProxyHttp for Router {
         for (route, pool) in &self.routes {
             if path.starts_with(&route.path_prefix) {
                 ctx.pool = Some(*pool);
-                let mut target = if route.strip_prefix {
-                    let suffix = &path[route.path_prefix.len()..];
-                    if route.path_prefix.ends_with('/') || !suffix.starts_with('/') {
-                        format!("/{suffix}")
-                    } else {
-                        suffix.to_owned()
-                    }
-                } else {
-                    path.to_owned()
-                };
-                if let Some(q) = req.uri.query() {
-                    target.push('?');
-                    target.push_str(q);
-                }
+                let target = transform::target(&req.uri, &route.path_prefix, route.strip_prefix);
                 ctx.path = Some(target);
                 return Ok(false);
             }
@@ -558,7 +565,17 @@ impl ProxyHttp for Router {
         ctx: &mut Context,
     ) -> pingora_core::Result<Box<pingora_core::upstreams::peer::HttpPeer>> {
         if let Some(origin) = &self.forward {
-            return origin.peer(&self.config).await;
+            let deadline = *ctx.deadline.get_or_insert_with(|| {
+                tokio::time::Instant::now() + Duration::from_secs(self.config.connect_timeout_secs)
+            });
+            let mut peer = tokio::time::timeout_at(deadline, origin.peer(&self.config))
+                .await
+                .map_err(|_| {
+                    pingora_core::Error::new_up(pingora_core::ErrorType::ConnectTimedout)
+                })??;
+            peer.options.total_connection_timeout =
+                Some(deadline.saturating_duration_since(tokio::time::Instant::now()));
+            return Ok(peer);
         }
         let pool = &self.pools[ctx.pool.expect("routed request")];
         let selection = if ctx.attempt == 0 {
@@ -566,7 +583,17 @@ impl ProxyHttp for Router {
         } else {
             (ctx.origin + 1) % pool.len()
         };
-        let (origin, mut peer) = pool.peer(selection, &self.config).await?;
+        let deadline = *ctx.deadline.get_or_insert_with(|| {
+            tokio::time::Instant::now() + Duration::from_secs(self.config.connect_timeout_secs)
+        });
+        let (origin, mut peer) =
+            tokio::time::timeout_at(deadline, pool.peer(selection, &self.config))
+                .await
+                .map_err(|_| {
+                    pingora_core::Error::new_up(pingora_core::ErrorType::ConnectTimedout)
+                })??;
+        peer.options.total_connection_timeout =
+            Some(deadline.saturating_duration_since(tokio::time::Instant::now()));
         if s.req_header().headers.contains_key("upgrade") {
             peer.options.alpn = pingora_core::protocols::ALPN::H1;
         }
