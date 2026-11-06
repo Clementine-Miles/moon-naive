@@ -14,6 +14,9 @@ keywords = ["async", "proxy", "http", "pingora"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
+test = false
+doctest = false
+bench = false
 name = "pingora"
 path = "src/lib.rs"
 
@@ -33,28 +36,6 @@ pingora-cache = { version = "0.9.0", path = "../pingora-cache", optional = true,
 # Only used for documenting features, but doesn't work in any other dependency 
 # group :(
 document-features = { version = "0.2.10", optional = true }
-
-[dev-dependencies]
-clap = { version = "4.5", features = ["derive"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
-env_logger = "0.11"
-reqwest = { version = "0.12", features = ["rustls-tls", "http2"], default-features = false }
-hyper = { version = "1", features = ["client", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2"] }
-http-body-util = "0.1"
-async-trait = { workspace = true }
-http = { workspace = true }
-log = { workspace = true }
-pingora-prometheus = { version = "0.9.0", path = "../pingora-prometheus" }
-prometheus = "0.14"
-once_cell = { workspace = true }
-bytes = { workspace = true }
-regex = "1"
-
-[target.'cfg(unix)'.dev-dependencies]
-hyperlocal = "0.9"
-# Match foundations' allocator so workspace all-features tests link one jemalloc.
-jemallocator = { package = "tikv-jemallocator", version = "0.6" }
 
 [features]
 default = []

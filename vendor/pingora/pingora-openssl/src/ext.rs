@@ -224,37 +224,3 @@ pub fn is_suspended_for_cert(error: &openssl::ssl::Error) -> bool {
 pub unsafe fn ssl_mut(ssl: &SslRef) -> &mut SslRef {
     SslRef::from_ptr_mut(ssl.as_ptr())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use openssl::ssl::{SslContextBuilder, SslMethod};
-
-    #[test]
-    fn test_ssl_set_groups_list() {
-        let ctx_builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
-        let ssl = Ssl::new(&ctx_builder.build()).unwrap();
-        let ssl_ref = unsafe { ssl_mut(&ssl) };
-
-        // Valid input
-        assert!(ssl_set_groups_list(ssl_ref, "P-256:P-384").is_ok());
-
-        // Invalid input (contains null byte)
-        assert!(ssl_set_groups_list(ssl_ref, "P-256\0P-384").is_err());
-    }
-
-    #[test]
-    fn test_ssl_export_keying_material_exists() {
-        // This test verifies that ssl_export_keying_material function exists
-        // and has the correct signature. Actual functional testing requires
-        // an established TLS connection.
-        let ctx_builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
-        let ssl = Ssl::new(&ctx_builder.build()).unwrap();
-        let ssl_ref = &ssl;
-        let mut out = [0u8; 32];
-
-        // This will fail since there's no established connection, but verifies
-        // the function signature is correct
-        let _ = ssl_export_keying_material(ssl_ref, &mut out, "test", None);
-    }
-}

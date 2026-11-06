@@ -44,31 +44,6 @@ thiserror = "2.0.3"
 tokio = { version = "1.22", features = ["time"] }
 x509-parser = { version = "0.18", default-features = false, optional = true }
 
-[dev-dependencies]
-anyhow = "1.0.66"
-clap = { version = "4.0.29", features = ["derive"] }
-rustls = { version = "0.23", default-features = false }
-tempfile = "3"
-tokio = { version = "1.22.0", features = ["macros", "rt", "rt-multi-thread", "time"] }
-tracing = "0.1.37"
-tracing-subscriber =  { version = "0.3.16", features = ["env-filter"] }
-
-[[example]]
-name = "provision"
-required-features = ["hyper-rustls", "rcgen", "aws-lc-rs"]
-
-[[example]]
-name = "certgen"
-required-features = ["rcgen", "aws-lc-rs"]
-
-# Pebble integration test.
-# Ignored by default because it requires pebble & pebble-challtestsrv.
-# Run with:
-#  PEBBLE=path/to/pebble CHALLTESTSRV=path/to/pebble-challtestsrv cargo test -- --ignored
-[[test]]
-name = "pebble"
-required-features = ["hyper-rustls", "rcgen"]
-
 [package.metadata.docs.rs]
 # all non-default features except fips (cannot build on docs.rs environment)
 features = ["aws-lc-rs", "x509-parser", "time"]
@@ -103,3 +78,8 @@ manual_let_else = "warn"
 or_fun_call = "warn"
 upper_case_acronyms = "warn"
 use_self = "warn"
+
+[lib]
+test = false
+doctest = false
+bench = false

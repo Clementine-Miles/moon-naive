@@ -183,8 +183,6 @@ pub(crate) struct Site {
     pub(super) buffers: Arc<super::resources::BufferPool>,
     bridge: bridge::Generations<bridge::Bridge>,
     max_streams: u32,
-    #[cfg(test)]
-    stats: Arc<WebStats>,
 }
 pub(super) enum Input {
     Data(Bytes),
@@ -283,8 +281,6 @@ impl Site {
             buffers: super::resources::BufferPool::new(config.limits.max_total_buffer_bytes),
             bridge: bridge::Generations::new(config.limits.max_streams),
             max_streams: config.limits.max_streams as u32,
-            #[cfg(test)]
-            stats,
         })
     }
     pub(super) fn forward(
@@ -318,8 +314,6 @@ impl Site {
             buffers: website.buffers.clone(),
             bridge,
             max_streams: config.limits.max_streams as u32,
-            #[cfg(test)]
-            stats: Arc::default(),
         })
     }
     pub fn stop_bridge(&self) {
@@ -403,10 +397,6 @@ impl Site {
             task,
             completion,
         }
-    }
-    #[cfg(test)]
-    pub fn stats(&self) -> &Arc<WebStats> {
-        &self.stats
     }
 }
 fn request_header(head: &Head) -> Result<RequestHeader> {

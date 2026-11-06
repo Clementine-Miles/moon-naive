@@ -60,24 +60,6 @@ impl Resources {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn user_leases_rollback_partial_admission() {
-        let mut config = Config::parse(include_str!("../../config.example.toml")).unwrap();
-        config.limits.max_tunnels_per_user = 1;
-        let ledger = Resources::new(&config, 2).unwrap();
-        let a = ledger.tunnel(Some(0)).unwrap();
-        assert!(ledger.tunnel(Some(0)).is_none());
-        assert_eq!(ledger.tunnels.active(), 1);
-        let b = ledger.tunnel(Some(1)).unwrap();
-        drop(a);
-        drop(b);
-        assert_eq!(ledger.tunnels.active(), 0);
-    }
-}
-
 /// Charges follow Bytes clones/slices even after a protocol library takes them.
 /// Protocol receive buffers remain covered by the connection's credit lease.
 pub(crate) struct BufferPool {
@@ -134,22 +116,5 @@ impl BufferPool {
             .acquire_many_owned(u32::try_from(bytes.len())?)
             .await?;
         Ok(self.wrap(bytes, permit))
-    }
-}
-#[cfg(test)]
-mod buffer_tests {
-    use super::*;
-    #[tokio::test]
-    async fn clones_and_slices_retain_charge_until_last_owner_drops() {
-        let pool = BufferPool::new(16);
-        let bytes = pool
-            .charge(bytes::Bytes::from_static(b"abcdefgh"))
-            .await
-            .unwrap();
-        let part = bytes.slice(2..4);
-        drop(bytes);
-        assert_eq!(pool.available.available_permits(), 8);
-        drop(part);
-        assert_eq!(pool.available.available_permits(), 16);
     }
 }

@@ -135,39 +135,9 @@ where
 /// The type of any established transport layer connection
 pub type Stream = Box<dyn IO>;
 
-// Implement IO trait for 3rd party types, mostly for testing
-mod ext_io_impl {
+// IO adapters for in-memory streams.
+mod buffer_io_impl {
     use super::*;
-    use tokio_test::io::Mock;
-
-    #[async_trait]
-    impl Shutdown for Mock {
-        async fn shutdown(&mut self) -> () {}
-    }
-    impl UniqueID for Mock {
-        fn id(&self) -> UniqueIDType {
-            0
-        }
-    }
-    impl Ssl for Mock {}
-    impl GetTimingDigest for Mock {
-        fn get_timing_digest(&self) -> Vec<Option<TimingDigest>> {
-            vec![]
-        }
-    }
-    impl GetProxyDigest for Mock {
-        fn get_proxy_digest(&self) -> Option<Arc<raw_connect::ProxyDigest>> {
-            None
-        }
-    }
-    impl GetSocketDigest for Mock {
-        fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
-            None
-        }
-    }
-
-    impl Peek for Mock {}
-
     use std::io::Cursor;
 
     #[async_trait]
@@ -229,7 +199,7 @@ mod ext_io_impl {
 }
 
 #[cfg(unix)]
-pub mod ext_test {
+mod unix_io_impl {
     use std::sync::Arc;
 
     use async_trait::async_trait;

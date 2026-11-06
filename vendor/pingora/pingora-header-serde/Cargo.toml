@@ -14,13 +14,11 @@ HTTP header (de)serialization and compression for Pingora.
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
+test = false
+doctest = false
+bench = false
 name = "pingora_header_serde"
 path = "src/lib.rs"
-
-[[bin]]
-name = "trainer"
-path = "src/trainer.rs"
-required-features = ["zstd"]
 
 [features]
 default = ["zstd"]

@@ -8,6 +8,8 @@ publish.workspace = true
 autobins = false
 
 [[bin]]
+test = false
+bench = false
 name = "moon-naive"
 path = "src/main.rs"
 
@@ -92,7 +94,8 @@ pingora-timeout = { path = "vendor/pingora/pingora-timeout" }
 [patch."https://github.com/djc/instant-acme.git"]
 instant-acme = { path = "vendor/instant-acme" }
 
-[dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
-tempfile = "3"
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[lib]
+test = false
+doctest = false
+bench = false

@@ -13,6 +13,9 @@ Foundations telemetry integration for pingora services.
 """
 
 [lib]
+test = false
+doctest = false
+bench = false
 name = "pingora_foundations"
 path = "src/lib.rs"
 
@@ -38,9 +41,6 @@ service = ["dep:async-trait", "dep:log", "dep:parking_lot", "dep:pingora-core"]
 tracing = ["foundations/tracing"]
 telemetry-server = ["foundations/telemetry-server", "metrics"]
 full = ["logging", "memory-profiling", "sentry", "service", "tracing", "telemetry-server"]
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [lints]
 workspace = true

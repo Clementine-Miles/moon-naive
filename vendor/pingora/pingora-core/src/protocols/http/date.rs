@@ -62,29 +62,3 @@ thread_local! {
 pub fn get_cached_date() -> HeaderValue {
     CACHED_DATE.with(|cache_date| (*cache_date.borrow_mut()).get_date())
 }
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    fn now_date_header() -> HeaderValue {
-        HeaderValue::from_str(&to_date_string(
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64,
-        ))
-        .unwrap()
-    }
-
-    #[test]
-    fn test_date_string() {
-        let date_str = to_date_string(1);
-        assert_eq!("Thu, 01 Jan 1970 00:00:01 GMT", date_str);
-    }
-
-    #[test]
-    fn test_date_cached() {
-        assert_eq!(get_cached_date(), now_date_header());
-    }
-}

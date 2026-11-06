@@ -25,15 +25,30 @@ Wire tests exercise slow header drips, smuggling, trailers and TLS pool isolatio
 
 `SHA256SUMS` covers every vendored file except itself. `xtask audit-native` checks
 the baseline, inventory, contents and resolved package paths. Release BUILD-INFO
-records the manifest hash. Source archives include fixtures ignored by Git.
+records the manifest hash. Source archives contain the retained runtime files, licensing and provenance.
 Retain upstream licensing. Only the BoringSSL backend is enabled in Cargo's graph;
-other backend source in this complete upstream snapshot is not linked.
+other retained backend source is not linked.
 
-When changing this patch set, review the diff against UPSTREAM_REVISION, run the
-wire-level regression tests, and regenerate SHA256SUMS before release auditing.
+When changing this patch set, review the diff against UPSTREAM_REVISION and
+regenerate SHA256SUMS before release auditing.
 
-Two upstream test-key directory symlinks are materialized as regular files for
-portable, complete source archives. These are upstream test fixtures only.
+## Runtime-only source distribution
+
+Tests (including inline unit tests), benchmarks, fixtures, examples, the
+pingora-test-utils crate and test CI have been removed at the repository owner's
+request. Cargo test/doctest/bench harnesses and development dependencies are
+disabled/removed. This is no longer a complete upstream source snapshot.
+
+Test-only public helpers were removed too: pingora-cache::MemCache, the mock
+Session<()> constructors, RangeType test helpers and tokio-test::io::Mock trait
+adapters. The dictionary-training binary, which required test fixtures, was
+removed; production dictionaries and real buffer/Unix IO adapters remain.
+These removed helper APIs are a compatibility change for consumers of this
+trimmed vendor tree. They were not used by moon-naive's production paths.
+
+Regression descriptions below and above refer to historical coverage in
+moon-naive commit bcf418ea1f99900da64ed2abbee292d2484dbbc7. Those tests are absent
+from this checkout; compilation and source auditing do not replace that coverage.
 
 
 ## Rust codec profile (RC4)

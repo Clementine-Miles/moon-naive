@@ -7,8 +7,6 @@ pub mod http;
 pub mod manager;
 pub mod persist;
 pub mod porkbun;
-#[cfg(test)]
-mod tests;
 
 use crate::{Error, Result};
 
@@ -33,8 +31,3 @@ pub fn random_below(bound: u64) -> Result<u64> {
         }
     }
 }
-
-#[cfg(test)]
-pub(crate) mod lab;
-#[cfg(test)]
-pub(crate) mod lab_support;

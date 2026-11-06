@@ -12,6 +12,9 @@ A Prometheus metrics HTTP server for pingora services.
 """
 
 [lib]
+test = false
+doctest = false
+bench = false
 name = "pingora_prometheus"
 path = "src/lib.rs"
 

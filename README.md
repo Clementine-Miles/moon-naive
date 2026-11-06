@@ -24,12 +24,10 @@ cargo build --release --locked -p moon-naive
 
 ## 开发工具
 
-构建使用 Cargo；审计和源码打包统一使用 `cargo xtask audit-native`、`cargo xtask source dist`。Rust 工具位于 `tools/xtask/`。BoringSSL 仍需要上述 C/C++ 工具链，普通构建无需 Python、Go 或 Docker；同平台重复构建可[复用 BoringSSL](docs/VPS-GUIDE.md#复用-boringssl避免重复调用-cmake)，避免再次调用 CMake。
+构建使用 Cargo；审计和源码打包统一使用 `cargo xtask audit-native`、`cargo xtask source dist`。Rust 工具位于 `tools/xtask/`。BoringSSL 仍需要上述 C/C++ 工具链，普通构建无需实验工具或容器环境；同平台重复构建可[复用 BoringSSL](docs/PROJECT.md#复用-boringssl避免重复调用-cmake)，避免再次调用 CMake。
 
 ## 文档
 
-- [配置与证书](docs/CONFIGURATION.md) · [VPS 部署](docs/VPS-GUIDE.md)
-- [协议与架构](docs/PROTOCOL.md)
-- [验证范围与已知限制](docs/VERIFICATION.md)
+配置、协议、ACME 恢复、原生构建与部署统一见 [项目手册](docs/PROJECT.md)。
 
-本地测试不代表公网 CA 签发、长期稳定性或 DPI 不可识别。许可证：Apache-2.0。
+当前源码不含自动化测试、基准、实验与容器入口；编译检查不等同运行验收。许可证：Apache-2.0。

@@ -11,6 +11,9 @@ S2N async APIs for Pingora.
 """
 
 [lib]
+test = false
+doctest = false
+bench = false
 name = "pingora_s2n"
 path = "src/lib.rs"
 

@@ -48,4 +48,6 @@ If both `ring` and `aws-lc-rs` are enabled, `aws-lc-rs` will be used.
 
 ## Getting started
 
-See the [examples](examples) directory for an example of how to use instant-acme.
+This checkout retains the runtime library only. Examples and tests were removed;
+see [the pinned upstream examples](https://github.com/djc/instant-acme/tree/4a9b80fdc22f23ab39b78dfd20ff5d4c92938e52/examples)
+and [local patch and source-trimming notes](MOON-PATCH.md).

@@ -13,6 +13,9 @@ A connection pool system for connection reuse.
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
+test = false
+doctest = false
+bench = false
 name = "pingora_pool"
 path = "src/lib.rs"
 
@@ -26,12 +29,5 @@ crossbeam-queue = "0.3"
 futures = { workspace = true }
 pingora-timeout = { version = "0.9.0", path = "../pingora-timeout" }
 
-[dev-dependencies]
-tokio-test = "0.4"
-
 [lints]
 workspace = true
-
-[[bench]]
-name = "connection_pool"
-harness = false

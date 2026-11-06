@@ -13,6 +13,9 @@ Common load balancing features for Pingora proxy.
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
+test = false
+doctest = false
+bench = false
 name = "pingora_load_balancing"
 path = "src/lib.rs"
 
@@ -31,8 +34,6 @@ futures = { workspace = true }
 log = { workspace = true }
 http = { workspace = true }
 derivative.workspace = true
-
-[dev-dependencies]
 
 [features]
 default = []

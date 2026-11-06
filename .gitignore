@@ -15,15 +15,7 @@
 /secrets/
 /config.toml
 /config.local.toml
-# Optional offline DPI lab outputs; the adapter sources remain in source archives.
-/tools/packet-lab/opengfw/opengfw-pcap
-/tools/packet-lab/opengfw/controls.*
-/tools/packet-lab/opengfw/nontls-control.*
-__pycache__/
-
-# ACME laboratory secrets and raw captures stay outside source archives.
-/acme-lab-artifacts/
-**/wire.pcap
-**/tls.keys
-**/h3.keys
-**/analysis.keys
+# Local diagnostics and private transport secrets stay outside source archives.
+*.pcap
+*.pcapng
+*.keys

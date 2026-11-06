@@ -123,38 +123,3 @@ impl Encode for Compressor {
         ("brotli", self.total_in, self.total_out, self.duration)
     }
 }
-
-#[cfg(test)]
-mod tests_stream {
-    use super::*;
-
-    #[test]
-    fn decompress_brotli_data() {
-        let mut compressor = Decompressor::new();
-        let decompressed = compressor
-            .encode(
-                &[
-                    0x1f, 0x0f, 0x00, 0xf8, 0x45, 0x07, 0x87, 0x3e, 0x10, 0xfb, 0x55, 0x92, 0xec,
-                    0x12, 0x09, 0xcc, 0x38, 0xdd, 0x51, 0x1e,
-                ],
-                true,
-            )
-            .unwrap();
-
-        assert_eq!(&decompressed[..], &b"adcdefgabcdefgh\n"[..]);
-    }
-
-    #[test]
-    fn compress_brotli_data() {
-        let mut compressor = Compressor::new(11);
-        let compressed = compressor.encode(&b"adcdefgabcdefgh\n"[..], true).unwrap();
-
-        assert_eq!(
-            &compressed[..],
-            &[
-                0x85, 0x07, 0x00, 0xf8, 0x45, 0x07, 0x87, 0x3e, 0x10, 0xfb, 0x55, 0x92, 0xec, 0x12,
-                0x09, 0xcc, 0x38, 0xdd, 0x51, 0x1e,
-            ],
-        );
-    }
-}

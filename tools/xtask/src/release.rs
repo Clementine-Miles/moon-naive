@@ -5,10 +5,8 @@ use std::{
     collections::{BTreeSet, HashSet},
     fs,
     io::Read,
-    os::unix::fs::MetadataExt,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::Command,
 };
 const TARGET: &str = "x86_64-unknown-linux-musl";
 fn checksum(path: &Path) -> Result<String> {
@@ -199,6 +197,7 @@ pub fn dist(binary: &Path, directory: &Path) -> Result<()> {
     copy(&binary, &stage.join("moon-naive"), true)?;
     for (source, destination, executable) in [
         ("README.md", "README.md", false),
+        ("docs/PROJECT.md", "docs/PROJECT.md", false),
         ("LICENSE", "LICENSE", false),
         (
             "deploy/moon-naive.service",
@@ -206,12 +205,7 @@ pub fn dist(binary: &Path, directory: &Path) -> Result<()> {
             false,
         ),
         ("deploy/moon-naive.openrc", "deploy/moon-naive.openrc", true),
-        ("docs/VPS-GUIDE.md", "docs/VPS-GUIDE.md", false),
         ("config.example.toml", "config.example.toml", false),
-        ("deploy/Dockerfile.musl", "deploy/Dockerfile.musl", false),
-        ("docs/VERIFICATION.md", "docs/VERIFICATION.md", false),
-        ("docs/CONFIGURATION.md", "docs/CONFIGURATION.md", false),
-        ("docs/PROTOCOL.md", "docs/PROTOCOL.md", false),
     ] {
         copy(&root().join(source), &stage.join(destination), executable)?;
     }
@@ -387,98 +381,4 @@ pub fn source(directory: &Path) -> Result<()> {
         copy(&path, &stage.join(path.strip_prefix(root())?), false)?;
     }
     archive(&stage, &output)
-}
-fn docker(args: &[String]) -> Result<String> {
-    let output = Command::new("docker")
-        .env_remove("DOCKER_HOST")
-        .env_remove("DOCKER_CONTEXT")
-        .env_remove("DOCKER_TLS")
-        .env_remove("DOCKER_TLS_VERIFY")
-        .env_remove("DOCKER_CERT_PATH")
-        .arg("--host=unix:///var/run/docker.sock")
-        .args(args)
-        .output()?;
-    check(
-        output.status.success(),
-        &format!(
-            "platform container failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ),
-    )?;
-    Ok(String::from_utf8(output.stdout)?)
-}
-pub fn platform_smoke(binary: &Path, ca_bundle: Option<&Path>) -> Result<()> {
-    let binary = fs::canonicalize(binary)?;
-    let example = super::private_example(&binary, None)?;
-    let config = fs::canonicalize(&example.0)?;
-    let mut report = String::new();
-    for (name, image) in [
-        (
-            "alpine-3.22",
-            "alpine@sha256:d406446bc05b82480756ce8f1287964d28768c23955fa9480d2a74a2eae7a654",
-        ),
-        (
-            "debian-12",
-            "debian@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8",
-        ),
-        (
-            "archlinux-base",
-            "archlinux@sha256:52dfbd5afb23a220d5ee92dafcb4c788d96c026ed04179890c23adef4c897fa0",
-        ),
-    ] {
-        report.push_str(&format!("platform={name}\nimage={image}\n"));
-        let base = vec![
-            "run".into(),
-            "--rm".into(),
-            "--read-only".into(),
-            "--cap-drop=ALL".into(),
-            "--security-opt=no-new-privileges".into(),
-            "--user".into(),
-            format!(
-                "{}:{}",
-                fs::metadata(&config)?.uid(),
-                fs::metadata(&config)?.gid()
-            ),
-            "--mount".into(),
-            format!(
-                "type=bind,src={},dst=/moon-naive,readonly",
-                binary.display()
-            ),
-            "--mount".into(),
-            format!(
-                "type=bind,src={},dst=/config.toml,readonly",
-                config.display()
-            ),
-        ];
-        for args in [
-            vec!["--version"],
-            vec!["check-config", "/config.toml"],
-            vec!["check-transport", "/config.toml"],
-        ] {
-            println!("platform={name} check={}", args[0]);
-            let mut command = base.clone();
-            command.extend(["--network=none".into(), image.into(), "/moon-naive".into()]);
-            command.extend(args.into_iter().map(str::to_owned));
-            report.push_str(&docker(&command)?);
-        }
-        if let Some(ca_bundle) = ca_bundle {
-            println!("platform={name} check=read-only-ca-directory");
-            let mut command = base.clone();
-            command.extend([
-                "--mount".into(),
-                format!(
-                    "type=bind,src={},dst=/etc/ssl/certs/ca-certificates.crt,readonly",
-                    ca_bundle.display()
-                ),
-                image.into(),
-                "/moon-naive".into(),
-                "acme".into(),
-                "check-ca".into(),
-                "/config.toml".into(),
-            ]);
-            report.push_str(&docker(&command)?);
-        }
-        println!("platform={name} result=passed");
-    }
-    super::save_report("platform-smoke", &report)
 }

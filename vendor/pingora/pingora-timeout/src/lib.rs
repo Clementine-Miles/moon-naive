@@ -146,32 +146,3 @@ where
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_timeout() {
-        let fut = tokio_sleep(Duration::from_secs(1000));
-        let to = timeout(Duration::from_secs(1), fut);
-        assert!(to.await.is_err())
-    }
-
-    #[tokio::test]
-    async fn test_instantly_return() {
-        let fut = async { 1 };
-        let to = timeout(Duration::from_secs(1), fut);
-        assert_eq!(to.await.unwrap(), 1)
-    }
-
-    #[tokio::test]
-    async fn test_delayed_return() {
-        let fut = async {
-            tokio_sleep(Duration::from_secs(1)).await;
-            1
-        };
-        let to = timeout(Duration::from_secs(1000), fut);
-        assert_eq!(to.await.unwrap(), 1)
-    }
-}

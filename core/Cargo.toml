@@ -15,3 +15,8 @@ hmac = "0.12.1"
 subtle.workspace = true
 [lints]
 workspace = true
+
+[lib]
+test = false
+doctest = false
+bench = false

@@ -1,3 +1,0 @@
-
-# Unified diffs preserve context prefixes before Go tabs and blank lines.
-tools/acme-lab/pebble-lab.patch -whitespace

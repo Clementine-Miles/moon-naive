@@ -27,7 +27,6 @@ members = [
     "pingora-memory-cache",
     "pingora-prometheus",
     "pingora-foundations",
-    "pingora-test-utils",
     "tinyufo",
 ]
 
@@ -50,6 +49,3 @@ ahash = ">=0.8.9"
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
-
-[profile.bench]
-debug = true

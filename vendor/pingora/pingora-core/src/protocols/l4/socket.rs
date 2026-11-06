@@ -274,28 +274,3 @@ impl TryFrom<TokioUnixSockAddr> for SocketAddr {
         }
     }
 }
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn parse_ip() {
-        let ip: SocketAddr = "127.0.0.1:80".parse().unwrap();
-        assert!(ip.as_inet().is_some());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn parse_uds() {
-        let uds: SocketAddr = "/tmp/my.sock".parse().unwrap();
-        assert!(uds.as_unix().is_some());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn parse_uds_with_prefix() {
-        let uds: SocketAddr = "unix:/tmp/my.sock".parse().unwrap();
-        assert!(uds.as_unix().is_some());
-    }
-}

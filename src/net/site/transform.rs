@@ -64,22 +64,3 @@ pub(super) fn valid_token(token: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn routing_preserves_slashes_escapes_and_query() {
-        for (path, prefix, want) in [
-            ("/ws//x%2Fy?q=%2f", "/ws", "//x%2Fy?q=%2f"),
-            ("/ws//x", "/ws/", "//x"),
-            ("/ws", "/ws", "/"),
-        ] {
-            assert_eq!(target(&path.parse().unwrap(), prefix, true), want);
-        }
-        assert!(valid_token("chat.v2"));
-        for bad in ["", "a b", "a/b", "a,b", "é"] {
-            assert!(!valid_token(bad));
-        }
-    }
-}

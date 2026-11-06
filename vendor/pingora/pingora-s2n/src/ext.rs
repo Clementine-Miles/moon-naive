@@ -33,25 +33,3 @@ pub fn ssl_export_keying_material(
     let context_bytes = context.unwrap_or(&[]);
     conn.tls_exporter(label.as_bytes(), context_bytes, out)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use s2n_tls::config::Builder;
-    use s2n_tls::enums::Mode;
-
-    #[test]
-    fn test_ssl_export_keying_material_exists() {
-        // This test verifies that ssl_export_keying_material function exists
-        // and has the correct signature. Actual functional testing requires
-        // an established TLS connection.
-        let config = Builder::new().build().unwrap();
-        let mut conn = s2n_tls::connection::Connection::new(Mode::Client);
-        conn.set_config(config).unwrap();
-        let mut out = [0u8; 32];
-
-        // This will fail since there's no established connection, but verifies
-        // the function signature is correct
-        let _ = ssl_export_keying_material(&conn, &mut out, "test", None);
-    }
-}

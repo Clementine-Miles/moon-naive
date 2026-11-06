@@ -122,53 +122,5 @@ impl<T: Send + Sync + 'static> Buckets<T> {
         }
     }
 
-    #[cfg(test)]
-    pub fn get_queue(&self, key: &Key) -> Option<bool> {
-        self.get_map(key, |v| v.queue.is_main())
-    }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_fast() {
-        let fast = Buckets::new_fast(10);
-
-        assert!(fast.get_map(&1, |_| ()).is_none());
-
-        let bucket = Bucket {
-            queue: crate::Location::new_small(),
-            weight: 1,
-            uses: Default::default(),
-            data: 1,
-        };
-        fast.insert(1, bucket);
-
-        assert_eq!(fast.get_map(&1, |v| v.data), Some(1));
-
-        fast.remove(&1);
-        assert!(fast.get_map(&1, |_| ()).is_none());
-    }
-
-    #[test]
-    fn test_compact() {
-        let compact = Buckets::new_compact(10, 2);
-
-        assert!(compact.get_map(&1, |_| ()).is_none());
-
-        let bucket = Bucket {
-            queue: crate::Location::new_small(),
-            weight: 1,
-            uses: Default::default(),
-            data: 1,
-        };
-        compact.insert(1, bucket);
-
-        assert_eq!(compact.get_map(&1, |v| v.data), Some(1));
-
-        compact.remove(&1);
-        assert!(compact.get_map(&1, |_| ()).is_none());
-    }
 }

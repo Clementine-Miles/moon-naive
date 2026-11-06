@@ -13,6 +13,9 @@ OpenSSL async APIs for Pingora.
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
+test = false
+doctest = false
+bench = false
 name = "pingora_openssl"
 path = "src/lib.rs"
 
@@ -22,7 +25,3 @@ openssl = { version = "0.10.72", features = ["vendored"] }
 tokio-openssl = { version = "0.6" }
 libc = "0.2.70"
 foreign-types = { version = "0.3"}
-
-[dev-dependencies]
-tokio-test = "0.4"
-tokio = { workspace = true, features = ["full"] }

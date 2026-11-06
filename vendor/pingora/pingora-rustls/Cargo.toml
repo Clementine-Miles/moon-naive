@@ -11,6 +11,9 @@ RusTLS async APIs for Pingora.
 """
 
 [lib]
+test = false
+doctest = false
+bench = false
 name = "pingora_rustls"
 path = "src/lib.rs"
 

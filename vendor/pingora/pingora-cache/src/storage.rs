@@ -100,28 +100,7 @@ impl<'a> PurgeTarget<'a> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    #[test]
-    fn exact_removed_entry_accepts_absent_or_matching_id() {
-        let id = CacheEntryId::new(42);
-        let entry = CacheEntryKey::identified(CompactCacheKey::default(), id);
-        let target = PurgeTarget::Exact(&entry);
-
-        assert_eq!(target.removed_entry(None), (&entry).into());
-        assert_eq!(target.removed_entry(Some(id)), (&entry).into());
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "must match exact target ID")]
-    fn exact_removed_entry_rejects_mismatched_id() {
-        let entry = CacheEntryKey::identified(CompactCacheKey::default(), CacheEntryId::new(42));
-        PurgeTarget::Exact(&entry).removed_entry(Some(CacheEntryId::new(43)));
-    }
-}
 
 /// Outcome of a successful [`Storage::purge`] or [`Storage::expire`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

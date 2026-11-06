@@ -14,6 +14,9 @@ HTTP caching APIs for Pingora proxy.
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
+test = false
+doctest = false
+bench = false
 name = "pingora_cache"
 path = "src/lib.rs"
 
@@ -48,27 +51,6 @@ httparse = { workspace = true }
 strum = { version = "0.26", features = ["derive"] }
 rand = "0.8"
 arrayvec = "0.7"
-
-[dev-dependencies]
-cf-rustracing = "1.0"
-cf-rustracing-jaeger = "1.0"
-tokio-test = "0.4"
-tokio = { workspace = true, features = ["fs"] }
-env_logger = "0.11"
-dhat = "0"
-futures = { workspace = true }
-
-[[bench]]
-name = "simple_lru_memory"
-harness = false
-
-[[bench]]
-name = "lru_memory"
-harness = false
-
-[[bench]]
-name = "lru_serde"
-harness = false
 
 [features]
 default = ["header-compression"]

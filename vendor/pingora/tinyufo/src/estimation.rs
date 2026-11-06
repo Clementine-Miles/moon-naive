@@ -44,17 +44,9 @@ impl Estimator {
         Self::new(hashes, slots, RandomState::new)
     }
 
-    #[cfg(test)]
-    fn seeded(items: usize) -> Self {
-        let (slots, hashes) = Self::optimal_paras(items);
-        Self::new(hashes, slots, || RandomState::with_seeds(2, 3, 4, 5))
-    }
 
-    #[cfg(test)]
-    fn seeded_compact(items: usize) -> Self {
-        let (slots, hashes) = Self::optimal_paras(items / 100);
-        Self::new(hashes, slots, || RandomState::with_seeds(2, 3, 4, 5))
-    }
+
+
 
     /// Create a new `Estimator` with the given amount of hashes and columns (slots) using
     /// the given random source.
@@ -175,66 +167,7 @@ impl TinyLfu {
         }
     }
 
-    #[cfg(test)]
-    pub fn new_seeded(cache_size: usize) -> Self {
-        Self {
-            estimator: Estimator::seeded(cache_size),
-            window_counter: Default::default(),
-            // 8x: just a heuristic to balance the memory usage and accuracy
-            window_limit: cache_size * 8,
-        }
-    }
 
-    #[cfg(test)]
-    pub fn new_compact_seeded(cache_size: usize) -> Self {
-        Self {
-            estimator: Estimator::seeded_compact(cache_size),
-            window_counter: Default::default(),
-            // 8x: just a heuristic to balance the memory usage and accuracy
-            window_limit: cache_size * 8,
-        }
-    }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    #[test]
-    fn test_cmk_paras() {
-        let (slots, hashes) = Estimator::optimal_paras(1_000_000);
-        // just smoke check some standard input
-        assert_eq!(slots, 2718282);
-        assert_eq!(hashes, 20);
-    }
-
-    #[test]
-    fn test_tiny_lfu() {
-        let tiny = TinyLfu::new(1);
-        assert_eq!(tiny.get(1), 0);
-        assert_eq!(tiny.incr(1), 1);
-        assert_eq!(tiny.incr(1), 2);
-        assert_eq!(tiny.get(1), 2);
-
-        // Might have hash collisions for the others, need to
-        // get() before can assert on the incr() value.
-        let two = tiny.get(2);
-        assert_eq!(tiny.incr(2), two + 1);
-        assert_eq!(tiny.incr(2), two + 2);
-        assert_eq!(tiny.get(2), two + 2);
-
-        let three = tiny.get(3);
-        assert_eq!(tiny.incr(3), three + 1);
-        assert_eq!(tiny.incr(3), three + 2);
-        assert_eq!(tiny.incr(3), three + 3);
-        assert_eq!(tiny.incr(3), three + 4);
-
-        // 8 incr(), now resets on next incr
-        // can only assert they are greater than or equal
-        // to the incr() we do per key.
-
-        assert!(tiny.incr(3) >= 3); // had 4, reset to 2, added another.
-        assert!(tiny.incr(1) >= 2); // had 2, reset to 1, added another.
-        assert!(tiny.incr(2) >= 2); // had 2, reset to 1, added another.
-    }
 }

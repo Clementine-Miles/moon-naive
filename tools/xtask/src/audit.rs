@@ -100,7 +100,7 @@ pub fn sources() -> Result<()> {
 }
 
 /// Server sources must not grow a Go sidecar or a second Go network stack.
-/// External research checkouts and Pebble test executables are not runtime inputs.
+/// External tooling checkouts are not runtime build inputs.
 fn no_go_sources() -> Result<()> {
     fn visit(path: &Path) -> Result<()> {
         for entry in fs::read_dir(path)? {
@@ -134,7 +134,7 @@ fn no_go_sources() -> Result<()> {
     Ok(())
 }
 
-/// Validate every vendored file, including additions and fixtures ignored by Git.
+/// Validate every retained vendored file, including additions ignored by Git.
 pub fn vendor_digest() -> Result<String> {
     digest_directory(&root().join("vendor/instant-acme"))?;
     digest_directory(&root().join("vendor/pingora"))

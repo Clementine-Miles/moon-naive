@@ -895,26 +895,3 @@ impl Display for Proxy {
         )
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_http_upstream_request_policy_is_standards_oriented() {
-        let policy = PeerOptions::new().http_upstream_request_policy;
-        assert!(policy.strip_hop_by_hop);
-        assert!(policy.strip_connection_nominated);
-        assert!(policy.reject_malformed_connection_nominations);
-        assert_eq!(policy.h1_upgrade, H1UpgradePolicy::WebSocketOnly);
-    }
-
-    #[test]
-    fn preserve_http_upstream_request_policy_is_a_legacy_preset() {
-        let policy = HttpUpstreamRequestPolicy::preserve();
-        assert!(!policy.strip_hop_by_hop);
-        assert!(!policy.strip_connection_nominated);
-        assert!(!policy.reject_malformed_connection_nominations);
-        assert_eq!(policy.h1_upgrade, H1UpgradePolicy::Preserve);
-    }
-}

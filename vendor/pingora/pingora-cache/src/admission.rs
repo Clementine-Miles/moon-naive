@@ -14,15 +14,11 @@
 
 //! Admission policies for deciding whether cache misses should be stored.
 
-#[cfg(test)]
-use crate::key::CompactCacheKey;
+
 use crate::CacheKey;
-#[cfg(test)]
-use std::collections::HashMap;
-#[cfg(test)]
-use std::num::NonZeroU32;
-#[cfg(test)]
-use std::sync::Mutex;
+
+
+
 
 /// The result of observing an absent cache key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,41 +59,4 @@ pub trait AdmissionPolicy: Send + Sync {
     /// Policies that retain the key beyond this call may convert it to a compact or
     /// policy-specific representation.
     fn observe(&self, key: &CacheKey) -> Decision;
-}
-
-/// Simple configurable policy used to exercise admission plumbing in tests.
-#[cfg(test)]
-pub(crate) struct MinUsesAdmissionPolicy {
-    min_uses: NonZeroU32,
-    observations: Mutex<HashMap<CompactCacheKey, u32>>,
-}
-
-#[cfg(test)]
-impl MinUsesAdmissionPolicy {
-    pub(crate) fn new(min_uses: NonZeroU32) -> Self {
-        Self {
-            min_uses,
-            observations: Mutex::new(HashMap::new()),
-        }
-    }
-}
-
-#[cfg(test)]
-impl AdmissionPolicy for MinUsesAdmissionPolicy {
-    fn observe(&self, key: &CacheKey) -> Decision {
-        let mut observations = self.observations.lock().unwrap();
-        let observed = observations
-            .entry(key.to_compact())
-            .and_modify(|observed| *observed = observed.saturating_add(1).min(self.min_uses.get()))
-            .or_insert(1);
-        if *observed >= self.min_uses.get() {
-            Decision::Ready {
-                observed: *observed,
-            }
-        } else {
-            Decision::Defer {
-                observed: *observed,
-            }
-        }
-    }
 }

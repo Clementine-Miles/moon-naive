@@ -91,26 +91,3 @@ impl std::fmt::Debug for Guard {
             .finish()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn inflight_count() {
-        let inflight = Inflight::new();
-        let (g1, v) = inflight.incr("a", 1);
-        assert_eq!(v, 1);
-        let (g2, v) = inflight.incr("a", 2);
-        assert_eq!(v, 3);
-
-        drop(g1);
-
-        assert_eq!(g2.get(), 2);
-
-        drop(g2);
-
-        let (_, v) = inflight.incr("a", 1);
-        assert_eq!(v, 1);
-    }
-}

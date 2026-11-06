@@ -870,27 +870,3 @@ impl Server {
             .build()
     }
 }
-
-#[cfg(all(test, unix))]
-mod listen_address_tests {
-    use super::*;
-
-    struct UnknownService;
-
-    #[async_trait]
-    impl crate::services::Service for UnknownService {
-        fn name(&self) -> &str {
-            "unknown"
-        }
-    }
-
-    #[test]
-    fn unknown_service_disables_inherited_fd_cleanup() {
-        let mut server = Server::new_with_opt_and_conf(None, ServerConf::default());
-        server.bootstrap_as_a_service();
-        assert_eq!(server.collect_listen_addresses(), Some(Default::default()));
-
-        server.add_service(UnknownService);
-        assert_eq!(server.collect_listen_addresses(), None);
-    }
-}

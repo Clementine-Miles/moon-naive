@@ -49,9 +49,6 @@ pub struct Http {
     tls: SslConnector,
     pub retry_after: Arc<AtomicU64>,
     timeout: Duration,
-    allow_local_http: bool,
-    #[cfg(test)]
-    lab_tasks: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl Http {
     pub fn new(ca_file: Option<&Path>, timeout: Duration) -> Result<Self> {
@@ -69,17 +66,8 @@ impl Http {
             tls: builder.build(),
             retry_after: Arc::new(AtomicU64::new(0)),
             timeout,
-            allow_local_http: false,
-            #[cfg(test)]
-            lab_tasks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
-    /// Test-CA control endpoints only; production CLI never enables cleartext.
-    pub fn with_loopback_http(mut self) -> Self {
-        self.allow_local_http = true;
-        self
-    }
-
     pub async fn request<B>(&self, request: Request<B>) -> Result<Response<Full<Bytes>>>
     where
         B: hyper::body::Body<Data = Bytes> + Send + Unpin + 'static,
@@ -99,15 +87,14 @@ impl Http {
             .host()
             .ok_or("HTTP host missing")?
             .trim_matches(['[', ']']);
-        let secure = uri.scheme_str() == Some("https");
         let loopback = host.eq_ignore_ascii_case("localhost")
             || host
                 .parse::<std::net::IpAddr>()
                 .is_ok_and(|ip| ip.is_loopback());
-        if !(secure || self.allow_local_http && loopback && uri.scheme_str() == Some("http")) {
+        if uri.scheme_str() != Some("https") {
             return Err("control endpoints require HTTPS".into());
         }
-        let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
+        let port = uri.port_u16().unwrap_or(443);
         let authority = uri.authority().ok_or("HTTP authority missing")?.as_str();
         if authority.contains('@') {
             return Err("HTTP URL userinfo forbidden".into());
@@ -133,11 +120,8 @@ impl Http {
             let (mut sender, connection) =
                 hyper::client::conn::http1::handshake::<_, Full<Bytes>>(TokioIo::new(stream))
                     .await?;
-            #[cfg(test)]
-            let tracked = LabTask::new(self.lab_tasks.clone());
+
             let task = AbortTask(tokio::spawn(async move {
-                #[cfg(test)]
-                let _tracked = tracked;
                 let _ = connection.with_upgrades().await;
             }));
             let destination = if host.contains(':') {
@@ -160,24 +144,17 @@ impl Http {
         } else {
             Box::new(control_socket(host, port).await?)
         };
-        let io: BoxIo = if secure {
-            Box::new(
-                tokio_boring::connect(self.tls.configure()?, host, io)
-                    .await
-                    .map_err(|_| "control TLS handshake/hostname verification failed")?,
-            )
-        } else {
-            io
-        };
+        let io: BoxIo = Box::new(
+            tokio_boring::connect(self.tls.configure()?, host, io)
+                .await
+                .map_err(|_| "control TLS handshake/hostname verification failed")?,
+        );
         let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
             .max_buf_size(64 * 1024)
             .handshake(TokioIo::new(io))
             .await?;
-        #[cfg(test)]
-        let tracked = LabTask::new(self.lab_tasks.clone());
+
         let _task = AbortTask(tokio::spawn(async move {
-            #[cfg(test)]
-            let _tracked = tracked;
             let _ = connection.await;
         }));
         *request.uri_mut() = uri
@@ -310,27 +287,5 @@ impl HttpClient for Http {
                 .map(BytesResponse::from)
                 .map_err(instant_acme::Error::Other)
         })
-    }
-}
-
-#[cfg(test)]
-struct LabTask(Arc<std::sync::atomic::AtomicUsize>);
-#[cfg(test)]
-impl LabTask {
-    fn new(count: Arc<std::sync::atomic::AtomicUsize>) -> Self {
-        count.fetch_add(1, Ordering::SeqCst);
-        Self(count)
-    }
-}
-#[cfg(test)]
-impl Drop for LabTask {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-#[cfg(test)]
-impl Http {
-    pub(crate) fn laboratory_active_drivers(&self) -> usize {
-        self.lab_tasks.load(Ordering::SeqCst)
     }
 }

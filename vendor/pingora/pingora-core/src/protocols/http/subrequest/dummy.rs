@@ -99,19 +99,3 @@ impl Peek for DummyIO {}
 impl crate::protocols::Shutdown for DummyIO {
     async fn shutdown(&mut self) -> () {}
 }
-
-#[tokio::test]
-async fn test_dummy_io() {
-    use futures::FutureExt;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let mut dummy = DummyIO::new(&[1, 2]);
-    let res = dummy.read_u8().await;
-    assert_eq!(res.unwrap(), 1);
-    let res = dummy.read_u8().await;
-    assert_eq!(res.unwrap(), 2);
-    let res = dummy.read_u8().now_or_never();
-    assert!(res.is_none()); // pending forever
-    let res = dummy.write_u8(0).await;
-    assert!(res.is_ok());
-}

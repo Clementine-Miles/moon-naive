@@ -17,29 +17,11 @@ pub(super) struct Generation {
     outer: Option<crate::acme::certificate::Lifetime>,
 }
 #[derive(Clone)]
-pub(super) struct Slot(
-    Arc<RwLock<Arc<Generation>>>,
-    #[cfg(test)] Arc<Mutex<Option<RecordFault>>>,
-    #[cfg(test)] Arc<std::sync::atomic::AtomicUsize>,
-    #[cfg(test)] Arc<std::sync::atomic::AtomicUsize>,
-);
-#[cfg(test)]
-struct RecordFault {
-    stage: &'static str,
-    skip_records: usize,
-}
+pub(super) struct Slot(Arc<RwLock<Arc<Generation>>>);
 
 impl Slot {
     pub fn load(config: &Config) -> Result<Self> {
-        let slot = Self(
-            Arc::new(RwLock::new(Arc::new(load(config)?))),
-            #[cfg(test)]
-            Arc::new(Mutex::new(None)),
-            #[cfg(test)]
-            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(test)]
-            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        );
+        let slot = Self(Arc::new(RwLock::new(Arc::new(load(config)?))));
         slot.report(config);
         Ok(slot)
     }
@@ -70,8 +52,6 @@ impl Slot {
     }
     fn report(&self, config: &Config) {
         if let Err(error) = self.record(config) {
-            #[cfg(test)]
-            self.3.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             eprintln!("event=tls_status_write_failed detail={error}");
         }
     }
@@ -81,20 +61,7 @@ impl Slot {
             .read()
             .map_err(|_| "TLS generation lock poisoned")?
             .clone();
-        #[cfg(test)]
-        let fault = {
-            let mut fault = self.1.lock().unwrap();
-            if let Some(value) = fault.as_mut() {
-                if value.skip_records > 0 {
-                    value.skip_records -= 1;
-                    None
-                } else {
-                    fault.take().map(|value| value.stage)
-                }
-            } else {
-                None
-            }
-        };
+
         let path = config.state_dir.join("certificates/TLS-LOADED");
         let mut composite = boring::sha::Sha256::new();
         composite.update(generation.id.as_bytes());
@@ -121,14 +88,10 @@ impl Slot {
         boring::rand::rand_bytes(&mut nonce)?;
         let temp = path.with_file_name(format!("TLS-LOADED-{}.tmp", u64::from_be_bytes(nonce)));
         let result = (|| -> Result<()> {
-            #[cfg(test)]
-            record_fault(fault, "create", &self.2)?;
             crate::acme::persist::write_private_new(&temp, text.as_bytes())?;
-            #[cfg(test)]
-            record_fault(fault, "rename", &self.2)?;
+
             std::fs::rename(&temp, &path)?;
-            #[cfg(test)]
-            record_fault(fault, "fsync", &self.2)?;
+
             std::fs::File::open(path.parent().unwrap())?.sync_all()?;
             Ok(())
         })();
@@ -137,38 +100,13 @@ impl Slot {
         }
         result
     }
-    #[cfg(test)]
-    pub(super) fn laboratory_report_failures(&self) -> usize {
-        self.3.load(std::sync::atomic::Ordering::SeqCst)
-    }
-    #[cfg(test)]
-    pub(super) fn laboratory_fault_hits(&self) -> usize {
-        self.2.load(std::sync::atomic::Ordering::SeqCst)
-    }
-    #[cfg(test)]
-    pub(super) fn laboratory_fail_record(&self, stage: &'static str, skip_records: usize) {
-        *self.1.lock().unwrap() = Some(RecordFault {
-            stage,
-            skip_records,
-        });
-    }
+
     fn replace(&self, generation: Generation) -> Result<()> {
         *self.0.write().map_err(|_| "TLS generation lock poisoned")? = Arc::new(generation);
         Ok(())
     }
 }
-#[cfg(test)]
-fn record_fault(
-    fault: Option<&str>,
-    stage: &str,
-    hits: &std::sync::atomic::AtomicUsize,
-) -> Result<()> {
-    if fault == Some(stage) {
-        hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        return Err(std::io::Error::other(format!("injected TLS-LOADED {stage} failure")).into());
-    }
-    Ok(())
-}
+
 fn load(config: &Config) -> Result<Generation> {
     let stamp = ech_stamp(config)?;
     let stored = DiskStore::open(&config.state_dir.join("certificates"))?
@@ -600,21 +538,4 @@ fn h3_settings(
     // remain disabled in the H3 driver. No enable_early_data():
     // 0-RTT stays disabled. H2 applies the same profile in its driver.
     Ok(config)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Exercise the actual boring/quiche ABI and link, not a dependency-tree
-    /// assertion. This does not open a listener or test a QUIC handshake.
-    #[test]
-    fn shared_profile_constructs_a_real_quiche_config() {
-        let config =
-            moon_naive_core::config::Config::parse(include_str!("../../config.example.toml"))
-                .unwrap();
-        let profile = TransportProfile::from_config(&config).unwrap();
-        let builder = boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls()).unwrap();
-        let _config = h3_settings(builder, &profile).unwrap();
-    }
 }

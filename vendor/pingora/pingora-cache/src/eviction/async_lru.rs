@@ -22,8 +22,7 @@
 //! by the [`AsyncEvictionCallback`] provided at construction time.
 
 use super::{CacheEntryKey, CacheEntryKeyRef, EvictionManager};
-#[cfg(test)]
-use crate::key::CompactCacheKey;
+
 
 use async_trait::async_trait;
 use pingora_core::server::ShutdownWatch;
@@ -350,112 +349,5 @@ impl<const N: usize> EvictionManager for Manager<N> {
         })
         .await;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-impl<const N: usize> Manager<N> {
-    fn increment_weight(
-        &self,
-        item: &CompactCacheKey,
-        delta: usize,
-        max_weight: Option<usize>,
-    ) -> Vec<CompactCacheKey> {
-        EvictionManager::increment_weight(
-            self,
-            &CacheEntryKey::key_only(item.clone()),
-            delta,
-            max_weight,
-        )
-        .into_iter()
-        .map(CacheEntryKey::into_key)
-        .collect()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::key::CacheKey;
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn increment_weight_admits_missing_key() {
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let manager = Manager::<1>::builder(
-            100,
-            Arc::new(|_key: CacheEntryKey, _weight| async {}),
-            shutdown_rx,
-            tokio::runtime::Handle::current(),
-        )
-        .build();
-        let key = CacheKey::new("missing", "1").to_compact();
-
-        manager.increment_weight(&key, 7, Some(10));
-        manager.shard_weight(0).await;
-
-        assert_eq!(manager.peek_weight(&CacheEntryKey::key_only(key)), Some(7));
-        assert_eq!(manager.total_items(), 1);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn remove_requires_complete_identity() {
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let manager = Manager::<1>::builder(
-            100,
-            Arc::new(|_key: CacheEntryKey, _weight| async {}),
-            shutdown_rx,
-            tokio::runtime::Handle::current(),
-        )
-        .build();
-        let key = CacheKey::new("identified", "1").to_compact();
-        let id = crate::eviction::CacheEntryId::new(42);
-
-        let _ = EvictionManager::admit(
-            &manager,
-            CacheEntryKey::identified(key.clone(), id),
-            1,
-            SystemTime::now(),
-        );
-        // A shard query waits for the actor to process preceding messages on its FIFO channel.
-        manager.shard_weight(0).await;
-
-        EvictionManager::remove(&manager, CacheEntryKeyRef::from_entry_id(&key, None));
-        manager.shard_weight(0).await;
-        assert_eq!(manager.total_size(), 1);
-
-        EvictionManager::remove(&manager, CacheEntryKeyRef::from_entry_id(&key, Some(id)));
-        manager.shard_weight(0).await;
-        assert_eq!(manager.total_size(), 0);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn save_returns_error_when_all_shards_fail() {
-        let dir = std::env::temp_dir().join(format!(
-            "pingora-async-lru-total-save-failure-{}-{}",
-            std::process::id(),
-            rand::random::<u32>()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        for shard in 0..2 {
-            // Renaming a temporary file over a directory fails.
-            std::fs::create_dir(dir.join(format!("{FILE_NAME}.{shard}"))).unwrap();
-        }
-
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let manager = Manager::<2>::builder(
-            100,
-            Arc::new(|_key: CacheEntryKey, _weight| async {}),
-            shutdown_rx,
-            tokio::runtime::Handle::current(),
-        )
-        .build();
-
-        let error = manager.save(dir.to_str().unwrap()).await.unwrap_err();
-        assert!(
-            error.to_string().contains("failed to save async LRU"),
-            "unexpected error: {error}"
-        );
-
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

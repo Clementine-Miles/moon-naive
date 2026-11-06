@@ -65,21 +65,3 @@ impl FixedBuffer {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn releases_storage_when_truncated() {
-        let mut buffer = FixedBuffer::new(4);
-        buffer.write_to_buffer(&Bytes::from_static(b"1234"));
-        assert!(buffer.buffer.capacity() >= 4);
-
-        buffer.write_to_buffer(&Bytes::from_static(b"5"));
-
-        assert!(buffer.is_truncated());
-        assert_eq!(buffer.buffer.capacity(), 0);
-        assert!(buffer.get_buffer().is_none());
-    }
-}

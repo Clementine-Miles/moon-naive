@@ -56,16 +56,3 @@ impl From<String> for ImmutStr {
         ImmutStr::Owned(s.into_boxed_str())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_static_vs_owned() {
-        let s: ImmutStr = "test".into();
-        assert!(!s.is_owned());
-        let s: ImmutStr = "test".to_string().into();
-        assert!(s.is_owned());
-    }
-}

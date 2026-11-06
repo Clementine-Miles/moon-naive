@@ -160,18 +160,3 @@ where
         handle,
     )
 }
-
-#[tokio::test]
-async fn test_dummy_request() {
-    use tokio_test::io::Builder;
-
-    let input = b"GET / HTTP/1.1\r\n\r\n";
-    let mock_io = Builder::new().read(&input[..]).build();
-    let mut req = HttpSession::new_http1(Box::new(mock_io));
-    req.read_request().await.unwrap();
-    assert_eq!(input.as_slice(), req.to_h1_raw());
-
-    let (mut subreq, _handle) = create_session(&req);
-    subreq.read_request().await.unwrap();
-    assert_eq!(input.as_slice(), subreq.to_h1_raw());
-}

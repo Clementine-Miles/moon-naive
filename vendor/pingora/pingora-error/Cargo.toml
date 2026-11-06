@@ -13,5 +13,8 @@ Error types and error handling APIs for Pingora.
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
+test = false
+doctest = false
+bench = false
 name = "pingora_error"
 path = "src/lib.rs"

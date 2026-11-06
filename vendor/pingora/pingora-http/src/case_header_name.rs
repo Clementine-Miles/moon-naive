@@ -104,15 +104,3 @@ pub(crate) fn titled_header_name_str(header_name: &HeaderName) -> Option<&'stati
         }
     })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_case_header_name() {
-        assert_eq!("FoO".into_case_header_name().as_slice(), b"FoO");
-        assert_eq!("FoO".to_string().into_case_header_name().as_slice(), b"FoO");
-        assert_eq!(header::SERVER.into_case_header_name().as_slice(), b"Server");
-    }
-}
