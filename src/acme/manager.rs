@@ -3,16 +3,17 @@ use super::{
     certificate::{self, Validator},
     dns::DnsProvider,
     http::Http,
-    now, random_below,
-    state::{Journal, Lease, Order as SavedOrder, State},
+    now,
+    persist::{Journal, Lease, Order as SavedOrder, State},
+    random_below,
 };
 use super::{
-    certificate::{Candidate, CertificateSlot},
-    store::{DiskStore, StoreFailure},
+    certificate::{Candidate, VerifiedBundle},
+    persist::{DiskStore, StoreFailure},
 };
 use instant_acme::{
     Account, AuthorizationStatus, CertificateIdentifier, ChallengeType, Identifier, NewOrder,
-    OrderStatus, RetryPolicy,
+    OrderStatus,
 };
 use moon_naive_core::config::Config;
 use rustls_pki_types::CertificateDer;
@@ -27,7 +28,7 @@ pub enum Tick {
 /// Run on a dedicated control runtime/process: journal fsync never runs on a
 /// future data-plane worker. No listener is opened by this manager.
 pub struct Manager<P> {
-    pub slot: CertificateSlot,
+    bundle: Option<VerifiedBundle>,
     provider: P,
     http: Http,
     validator: Validator,
@@ -43,6 +44,7 @@ pub struct Manager<P> {
     poll_interval: Duration,
     suspended: bool,
     phase: &'static str,
+    deadline: tokio::time::Instant,
 }
 impl<P: DnsProvider> Manager<P> {
     pub fn open(config: &Config, provider: P, http: Http) -> Result<Self> {
@@ -72,7 +74,7 @@ impl<P: DnsProvider> Manager<P> {
             dns_identity: provider.identity(),
             ..Journal::default()
         });
-        if !matches!(journal.version, 1 | 2)
+        if !matches!(journal.version, 1..=3)
             || journal.domain != domain
             || journal.directory != directory
             || journal.dns_identity != provider.identity()
@@ -82,13 +84,13 @@ impl<P: DnsProvider> Manager<P> {
                 "ACME journal identity/version mismatch; do not discard pending DNS cleanup".into(),
             );
         }
-        journal.version = 2;
+        journal.version = 3;
         if journal.account.is_none()
             && journal.account_id.is_none()
             && journal.account_key.is_empty()
             && let Some(path) = config.acme.eab_credentials_file.as_deref()
         {
-            super::eab::load_credentials(path)?;
+            super::account::load_credentials(path)?;
         }
         if journal.account.is_none()
             && journal.account_id.is_none()
@@ -99,9 +101,8 @@ impl<P: DnsProvider> Manager<P> {
         }
         let validator = Validator::for_config(config)?;
         let store = DiskStore::open(&config.state_dir.join("certificates"))?;
-        let slot = CertificateSlot::default();
         let mut manager = Self {
-            slot,
+            bundle: None,
             provider,
             http: http.clone(),
             validator,
@@ -117,6 +118,7 @@ impl<P: DnsProvider> Manager<P> {
             poll_interval: Duration::from_secs(config.acme.poll_interval_secs),
             suspended: false,
             phase: "startup",
+            deadline: tokio::time::Instant::now(),
         };
         if let Some(stored) = manager.store.read_current()? {
             // Never trust the plaintext lifetime metadata for readiness.
@@ -142,7 +144,7 @@ impl<P: DnsProvider> Manager<P> {
                     manager.journal.ari_selected = None;
                     manager.journal.ari_check_at = 0;
                 }
-                manager.slot.restore(bundle);
+                manager.bundle = Some(bundle);
             }
         }
         manager.persist()?;
@@ -166,18 +168,100 @@ impl<P: DnsProvider> Manager<P> {
     pub fn renew_at(&self) -> u64 {
         self.journal.renew_at
     }
+    pub fn current(&self, at: u64) -> Option<&VerifiedBundle> {
+        self.bundle.as_ref().filter(|b| b.lifetime().valid_at(at))
+    }
     pub fn ready(&self) -> bool {
-        self.slot.current(now()).is_some()
+        self.current(now()).is_some()
     }
     pub fn last_failure_phase(&self) -> &str {
         self.journal.last_failure_phase.as_deref().unwrap_or("none")
     }
     pub async fn cleanup(&mut self) -> Result<()> {
+        if self.suspended {
+            return Err("ACME state durability uncertain; cleanup suspended".into());
+        }
+        if self.journal.leases.iter().any(|lease| {
+            matches!(
+                lease.phase,
+                super::persist::LeasePhase::Created | super::persist::LeasePhase::Validating
+            )
+        }) {
+            if self.journal.next_attempt > now()
+                || self.http.retry_after.load(Ordering::Relaxed) > now()
+            {
+                return Ok(());
+            }
+            let Some(url) = self
+                .journal
+                .order
+                .as_ref()
+                .filter(|o| !o.url.is_empty())
+                .map(|o| o.url.clone())
+            else {
+                return Err(
+                    "validation lease has no original order; retain for investigation".into(),
+                );
+            };
+            self.account().await?;
+            match self.account.as_ref().unwrap().order(url.clone()).await {
+                Ok(mut order) => {
+                    if order.state().status == OrderStatus::Pending {
+                        let mut found = false;
+                        let mut authorizations = order.authorizations();
+                        while let Some(authorization) = authorizations.next().await {
+                            let mut authorization = authorization?;
+                            found = true;
+                            if authorization.identifier().to_string() != self.journal.domain {
+                                return Err("cleanup authorization identity mismatch".into());
+                            }
+                            if authorization.status == AuthorizationStatus::Pending {
+                                let challenge = authorization
+                                    .challenge(ChallengeType::Dns01)
+                                    .ok_or("original DNS challenge missing")?;
+                                if challenge.key_authorization()?.dns_value()
+                                    != self.journal.leases[0].value
+                                {
+                                    return Err(
+                                        "cleanup DNS challenge changed; retain ownership".into()
+                                    );
+                                }
+                                if matches!(
+                                    challenge.status,
+                                    instant_acme::ChallengeStatus::Pending
+                                        | instant_acme::ChallengeStatus::Processing
+                                ) {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        if !found {
+                            return Err("pending order has no authorization evidence".into());
+                        }
+                    }
+                }
+                Err(instant_acme::Error::Response {
+                    url: failed,
+                    status: 404,
+                    method: http::Method::POST,
+                    ..
+                }) if failed == url => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        self.cleanup_finished().await
+    }
+    async fn cleanup_finished(&mut self) -> Result<()> {
         while let Some(lease) = self.journal.leases.first().cloned() {
             let mut lease = lease;
+            if lease.phase == super::persist::LeasePhase::Preparing {
+                self.journal.leases.remove(0);
+                self.persist()?;
+                continue;
+            }
             self.provider.recover(&mut lease).await?;
-            if lease.phase == super::state::LeasePhase::Created || lease.record_id.is_some() {
-                lease.phase = super::state::LeasePhase::DeleteUncertain;
+            if lease.phase == super::persist::LeasePhase::Created || lease.record_id.is_some() {
+                lease.phase = super::persist::LeasePhase::DeleteUncertain;
                 self.journal.leases[0] = lease.clone();
                 self.persist()?;
             }
@@ -196,6 +280,7 @@ impl<P: DnsProvider> Manager<P> {
             return Ok(Tick::Idle);
         }
         self.http.retry_after.store(0, Ordering::Relaxed);
+        self.deadline = tokio::time::Instant::now() + self.operation_timeout;
         let result = tokio::time::timeout(self.operation_timeout, self.reconcile())
             .await
             .map_err(|_| -> Error { "ACME operation deadline exceeded".into() })
@@ -204,12 +289,8 @@ impl<P: DnsProvider> Manager<P> {
             Ok(tick) => Ok(tick),
             Err(_) if !self.suspended => {
                 self.journal.last_failure_phase = Some(self.phase.into());
-                // A dropped/failed DNS POST remains recoverable by its durable
-                // marker. Clean up before another order is allowed.
-                let _ = tokio::time::timeout(Duration::from_secs(30), self.cleanup()).await;
-                if self.suspended {
-                    return Err("ACME journal persistence failed during recovery".into());
-                }
+                // Preserve mutation/validation state. Recovery runs inside the next
+                // operation's budget; timeout must not start another 30s network phase.
                 let base = self
                     .initial_retry
                     .saturating_mul(
@@ -249,7 +330,9 @@ impl<P: DnsProvider> Manager<P> {
     }
     async fn reconcile(&mut self) -> Result<Tick> {
         self.phase = "dns-cleanup";
-        self.cleanup().await?;
+        if self.journal.order.is_none() {
+            self.cleanup().await?;
+        }
         if let Some(blocked) = &self.journal.blocked_certificate {
             if blocked.retry_at.is_none_or(|at| now() < at) {
                 return Ok(Tick::Idle);
@@ -298,7 +381,6 @@ impl<P: DnsProvider> Manager<P> {
         }
         let saved = self.journal.order.as_ref().unwrap();
         self.phase = "recover-order";
-        self.http.last_status.store(0, Ordering::Relaxed);
         let mut order = match self
             .account
             .as_ref()
@@ -308,7 +390,9 @@ impl<P: DnsProvider> Manager<P> {
         {
             Ok(order) => order,
             Err(error) => {
-                if self.http.last_status.load(Ordering::Relaxed) == 404 {
+                if matches!(&error, instant_acme::Error::Response {url,status:404,method:http::Method::POST,..} if url == &saved.url)
+                {
+                    self.cleanup_finished().await?;
                     self.journal.order = None;
                     self.persist()?;
                 }
@@ -316,6 +400,7 @@ impl<P: DnsProvider> Manager<P> {
             }
         };
         if order.state().status == OrderStatus::Invalid {
+            self.cleanup_finished().await?;
             self.journal.order = None;
             self.persist()?;
             return Err("ACME order invalid; retry will create a fresh order".into());
@@ -340,20 +425,51 @@ impl<P: DnsProvider> Manager<P> {
                     .ok_or("CA did not offer DNS-01")?;
                 let name = format!("_acme-challenge.{domain}");
                 let value = challenge.key_authorization()?.dns_value();
-                let marker = format!("moon-naive-acme-{:016x}", random_below(u64::MAX)?);
-                self.journal.leases.push(Lease {
-                    name,
-                    value,
-                    marker,
-                    record_id: None,
-                    borrowed: false,
-                    ..Lease::default()
-                });
-                self.persist()?;
-                let mut lease = self.journal.leases[0].clone();
-                self.phase = "dns-present";
-                self.provider.present(&mut lease).await?;
-                lease.phase = super::state::LeasePhase::Created;
+                let mut lease = if let Some(lease) = self.journal.leases.first() {
+                    if lease.name != name || lease.value != value {
+                        return Err(
+                            "original DNS challenge identity changed; retain ownership evidence"
+                                .into(),
+                        );
+                    }
+                    lease.clone()
+                } else {
+                    Lease {
+                        name,
+                        value,
+                        marker: format!("moon-naive-acme-{:016x}", random_below(u64::MAX)?),
+                        phase: super::persist::LeasePhase::Preparing,
+                        ..Lease::default()
+                    }
+                };
+                if self.journal.leases.is_empty() {
+                    self.journal.leases.push(lease.clone());
+                    self.persist()?;
+                }
+                if lease.phase == super::persist::LeasePhase::Validating {
+                    // The durable ACK intent may precede the actual POST after a crash.
+                    // Repeating set_ready on a still-Pending challenge is permitted.
+                    if challenge.status == instant_acme::ChallengeStatus::Pending {
+                        challenge.set_ready().await?;
+                    }
+                    continue;
+                }
+                if lease.phase == super::persist::LeasePhase::CreateUncertain {
+                    self.provider.recover(&mut lease).await?;
+                }
+                if lease.phase == super::persist::LeasePhase::Preparing {
+                    self.phase = "dns-prepare";
+                    self.provider.prepare(&mut lease).await?;
+                    lease.phase = super::persist::LeasePhase::CreateUncertain;
+                    self.journal.leases[0] = lease.clone();
+                    self.persist()?;
+                    self.phase = "dns-present";
+                    let result = self.provider.present(&mut lease).await;
+                    self.journal.leases[0] = lease.clone();
+                    self.persist()?;
+                    result?;
+                }
+                lease.phase = super::persist::LeasePhase::Created;
                 self.journal.leases[0] = lease.clone();
                 self.persist()?;
                 self.phase = "dns-propagation";
@@ -361,20 +477,22 @@ impl<P: DnsProvider> Manager<P> {
                     tokio::time::sleep(self.poll_interval).await;
                 }
                 self.phase = "challenge-ready";
+                lease.phase = super::persist::LeasePhase::Validating;
+                self.journal.leases[0] = lease;
+                self.persist()?;
                 challenge.set_ready().await?;
             }
             self.phase = "order-ready";
-            let status = order
-                .poll_ready(&RetryPolicy::new().timeout(self.operation_timeout))
-                .await?;
+            let status = self.poll_order(&mut order, OrderStatus::Pending).await?;
             if status != OrderStatus::Ready {
+                self.cleanup_finished().await?;
                 self.journal.order = None;
                 self.persist()?;
                 return Err("ACME order failed validation".into());
             }
         }
         self.phase = "dns-cleanup";
-        self.cleanup().await?;
+        self.cleanup_finished().await?;
         if order.state().status == OrderStatus::Ready {
             self.phase = "finalize";
             order
@@ -382,9 +500,8 @@ impl<P: DnsProvider> Manager<P> {
                 .await?;
         }
         self.phase = "certificate-download";
-        let chain = order
-            .poll_certificate(&RetryPolicy::new().timeout(self.operation_timeout))
-            .await?;
+        self.poll_order(&mut order, OrderStatus::Processing).await?;
+        let chain = order.certificate().await?.ok_or("certificate not ready")?;
         let candidate = Candidate {
             chain_pem: chain.into_bytes(),
             key_pem: self
@@ -397,7 +514,7 @@ impl<P: DnsProvider> Manager<P> {
                 .to_vec(),
         };
         self.phase = "certificate-validation";
-        let evidence = candidate.chain_pem.clone();
+        let evidence = super::persist::BlockedCertificate::evidence(&candidate.chain_pem);
         let outcome = self
             .validator
             .download(candidate, now(), self.window)
@@ -419,14 +536,10 @@ impl<P: DnsProvider> Manager<P> {
         let bundle = match outcome {
             certificate::Download::Usable(bundle) => bundle,
             certificate::Download::Blocked { category, retry_at } => {
-                self.journal.blocked_certificate = Some(super::state::BlockedCertificate {
-                    sha256: boring::sha::sha256(&evidence)
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect(),
+                self.journal.blocked_certificate = Some(super::persist::BlockedCertificate {
                     category: category.into(),
-                    chain_pem: evidence,
                     retry_at,
+                    ..evidence
                 });
                 self.journal.last_failure_phase = Some(category.into());
                 self.persist()?;
@@ -455,7 +568,7 @@ impl<P: DnsProvider> Manager<P> {
             }
             return Err("certificate generation commit failed".into());
         }
-        self.slot.restore(bundle);
+        self.bundle = Some(bundle);
         self.journal.order = None;
         self.journal.next_attempt = 0;
         self.journal.failures = 0;
@@ -470,8 +583,50 @@ impl<P: DnsProvider> Manager<P> {
         self.persist()?;
         Ok(Tick::Installed)
     }
+    // Manager owns durable scheduling; the library still owns every ACME/JWS request.
+    // Persist before sleeping, including refresh waits, so cancellation cannot erase them.
+    async fn poll_order(
+        &mut self,
+        order: &mut instant_acme::Order,
+        waiting: OrderStatus,
+    ) -> Result<OrderStatus> {
+        // Preserve the library's default 250ms, 2x fallback; DNS propagation
+        // has its separate configured poll interval.
+        let mut fallback = Duration::from_millis(250);
+        while order.state().status == waiting {
+            let delay = match order.retry_after() {
+                instant_acme::RetryAfter::At(at) => at
+                    .duration_since(std::time::SystemTime::now())
+                    .unwrap_or(Duration::ZERO),
+                instant_acme::RetryAfter::Absent | instant_acme::RetryAfter::Malformed => {
+                    let delay = fallback;
+                    fallback = fallback.checked_mul(2).ok_or("order backoff overflow")?;
+                    delay
+                }
+                instant_acme::RetryAfter::Unrepresentable => {
+                    return Err("unrepresentable Retry-After".into());
+                }
+            };
+            let next = tokio::time::Instant::now()
+                .checked_add(delay)
+                .ok_or("unrepresentable order deadline")?;
+            self.journal.next_attempt = now()
+                .checked_add(delay.as_secs())
+                .and_then(|at| at.checked_add(u64::from(delay.subsec_nanos() != 0)))
+                .ok_or("unrepresentable persisted order deadline")?
+                .max(self.http.retry_after.load(Ordering::Relaxed));
+            self.persist()?;
+            if next > self.deadline {
+                self.phase = "order-deferred";
+                return Err("order wait exceeds operation deadline".into());
+            }
+            tokio::time::sleep_until(next).await;
+            order.refresh().await?;
+        }
+        Ok(order.state().status)
+    }
     fn certificate_id(&self) -> Option<CertificateIdentifier<'static>> {
-        let bundle = self.slot.current(now())?;
+        let bundle = self.current(now())?;
         let cert = boring::x509::X509::stack_from_pem(&bundle.material().chain_pem)
             .ok()?
             .into_iter()
@@ -489,24 +644,35 @@ impl<P: DnsProvider> Manager<P> {
         let Some(account) = self.account.as_ref() else {
             return;
         };
-        let (info, check_after) = match account.renewal_info(&id).await {
+        let previous_wait = self.http.retry_after.swap(0, Ordering::Relaxed);
+        let result = account.renewal_info(&id).await;
+        let ari_wait = self.http.retry_after.swap(previous_wait, Ordering::Relaxed);
+        let (info, check_after) = match result {
             Ok(info) => info,
-            Err(_) => {
-                self.journal.ari_check_at = self
-                    .journal
-                    .ari_check_at
-                    .max(self.http.retry_after.load(Ordering::Relaxed));
+            Err(error) => {
+                let wait = if matches!(
+                    error,
+                    instant_acme::Error::Response {
+                        status: 429 | 503,
+                        ..
+                    }
+                ) {
+                    ari_wait
+                } else {
+                    ari_wait.min(now().saturating_add(86400))
+                };
+                self.journal.ari_check_at = self.journal.ari_check_at.max(wait);
                 return;
             }
         };
-        self.journal.ari_check_at = now().saturating_add(check_after.as_secs().max(60));
+        self.journal.ari_check_at = now().saturating_add(check_after.as_secs().clamp(60, 86400));
         let (Ok(start), Ok(end)) = (
             u64::try_from(info.suggested_window.start.unix_timestamp()),
             u64::try_from(info.suggested_window.end.unix_timestamp()),
         ) else {
             return;
         };
-        let Some(bundle) = self.slot.current(now()) else {
+        let Some(bundle) = self.current(now()) else {
             return;
         };
         let lifetime = bundle.lifetime();

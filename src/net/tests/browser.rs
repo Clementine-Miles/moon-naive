@@ -56,7 +56,7 @@ async fn chromium_discovers_h3_from_alt_svc_and_falls_back_to_h2() {
                     tokio::select! {_=stop.changed()=>break,accepted=tcp.accept()=>{let(socket,_)=accepted?;let app=app.clone();let slot=slot.clone();let stop=stop.clone();tasks.spawn(async move {let _=super::super::h2::serve(socket,app,slot,stop).await;});}}
                 }
                 tasks.abort_all();
-                Ok::<_, crate::acme::Error>(())
+                Ok::<_, crate::Error>(())
             })
         };
         let output = f._root.path().join("browser.html");
@@ -149,7 +149,7 @@ impl Drop for Browser {
         let _ = self.0.wait();
     }
 }
-async fn page_title(port: u16) -> crate::acme::Result<String> {
+async fn page_title(port: u16) -> crate::Result<String> {
     let mut socket = TcpStream::connect(("127.0.0.1", port)).await?;
     socket
         .write_all(b"GET /json/list HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")

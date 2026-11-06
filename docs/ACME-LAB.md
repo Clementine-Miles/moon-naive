@@ -1,226 +1,164 @@
-# ACME 专项审查与隔离实验
+# ACME 正确性修复与实验入口
 
-本轮对照 `13e2271f5ec994af510af4b7606de09f05bb1b5a`，开始时本地 HEAD 和远端 main 均为该提交，工作区干净。没有把历史测试记录当作本次通过。本次修改仅实现隔离夹具、回归断言、测试专用观测及报告；下述生产修复尚未实施。revision 4、逐流认证、exporter/transcript/proof、代理拨号顺序和代理数据路径保持原样。
+审阅和修改基线为 `d0f6a082eeaabd7dac2e976fff09e6c7baf3fbe5`。开始时 HEAD 与参考提交相同，工作区干净；没有额外的 AGENTS.md。先核对旧报告、生产代码和测试判据，再修改。旧报告的失败数不是独立缺陷数，也不是本轮执行结果；旧版本可直接从该提交读取。
 
-## 固定依赖与兼容性
+本轮实现生产修复、回归修正和模块合并。revision 4、逐流认证、exporter/transcript/proof、成功拨号后才回复 CONNECT、ACL、证书验证和请求不可隐式重放的约束保留。没有新增代理协议、TLS 后端、provider 注册表或工作流框架。
 
-| 项目 | 当前源码/契约 | 本次验证与边界 |
+## 固定集成契约
+
+| 项目 | 当前实现与验证契约 |
+|---|---|
+| instant-acme | 0.9.0，`UPSTREAM_REVISION=4a9b80fdc22f23ab39b78dfd20ff5d4c92938e52`；两个 Cargo.lock 和 features 不变；`default-features=false`，仅 `time,x509-parser` |
+| 本地补丁 | [MOON-PATCH.md](../vendor/instant-acme/MOON-PATCH.md)：持久密钥注册、请求归因、可检查的 Retry-After 与轮询时序；源码摘要同步更新 |
+| CryptoProvider | [crypto.rs](../src/acme/crypto.rs)：BoringSSL P-256/ES256，JOSE 原始 64 字节 r\|\|s、PKCS#8 恢复、JWK thumbprint；继续使用库内 nonce/JWS/EAB |
+| HTTP | [http.rs](../src/acme/http.rs)：BoringSSL/Tokio/Hyper HTTP/1；保留 CA/主机名校验、HTTPS CONNECT 代理、path/query；请求期限覆盖 DNS、TCP、TLS、头和有限 body；取消释放 driver/socket |
+| CSR/EAB | [certificate.rs](../src/acme/certificate.rs) 生成带 DNS SAN 的 DER CSR，原样传入 finalize_csr；[account.rs](../src/acme/account.rs) 管理持久账户 key、一次性 EAB/HS256 和恢复 |
+| 类型依赖 | rustls-pki-types 仅用于 DER/密钥类型；没有启用 ring、rcgen、hyper-rustls 或第二套运行时 TLS |
+| 本地 CA | Pebble v2.8.0，commit `d52948ce25e7c1576bcd18ff0e20a1c24ec7c44b`；[测试补丁](../tools/acme-lab/pebble-lab.patch) 只提供 keylog、验证/查询屏障及修正 0% 授权复用的随机边界，不进入服务端生产依赖 |
+
+规范依据：[RFC 8555 的 nonce、POST-as-GET、挑战与订单](https://www.rfc-editor.org/rfc/rfc8555)、[RFC 9110 Retry-After](https://www.rfc-editor.org/rfc/rfc9110#section-10.2.3)、[RFC 9773 ARI](https://www.rfc-editor.org/rfc/rfc9773)。下文的 ARI 上下界和证据预算是项目本地政策，不宣称由协议规定。
+
+## 已修复行为
+
+| 条件与原故障 | 当前边界及结果 | 对应回归 |
 |---|---|---|
-| instant-acme | 0.9.0；UPSTREAM_REVISION `4a9b80fdc22f23ab39b78dfd20ff5d4c92938e52`；Cargo.lock 与 vendor 独立 Cargo.lock 均保持原样 | 固定提交与本地目录 patch，不以最新上游行为替代本版源码 |
-| 本地补丁 | `vendor/instant-acme/MOON-PATCH.md`：增加 `AccountBuilder::create_with_key`，委托 `create_inner` | 保留持久 PKCS#8 密钥注册及一次性 EAB 恢复；本轮未改 vendor 协议代码 |
-| 生产 feature graph | 根 Cargo.toml：default-features=false，仅 time、x509-parser | 不启用 ring、rcgen、hyper-rustls 默认后端；rustls-pki-types 是 DER/密钥类型，不是第二套运行时 TLS |
-| CryptoProvider | `src/acme/crypto.rs::CRYPTO` 使用 BoringSSL P-256、SHA-256、HMAC | 单元测试、独立服务端验证与 pcap 的独立 Python verifier 检查 ES256 64 字节 r\|\|s、JWK thumbprint、PKCS#8 恢复；不将 DER ECDSA 签名误当 JOSE |
-| HttpClient | `src/acme/http.rs::Http`，BoringSSL + Tokio/Hyper HTTP/1，验证 CA 和逻辑主机名，保留 URL 的 path/query | 真实 HTTPS、超时/取消/有限 body；library 的 nonce/JWS/EAB 继续复用。连接逐请求关闭，没有增加生产连接池 |
-| CSR/finalize | `certificate.rs::csr` 返回 PKCS#8 PEM 私钥和 DER CSR；`Order::finalize_csr` 内部 base64url 编码 | 真实 Pebble 接受；独立解析请求 CSR 的签名及 DNS SAN；不额外 base64 编码 DER 入参 |
-| EAB | `eab.rs::register` 使用持久账户 key 和库内 HS256/JWS | Pebble 要求 EAB；独立从解密请求验证 HS256。EAB 文件移除后凭账户恢复；不逐次续期重新注册 |
-| 订单恢复 | `manager.rs::reconcile` 复用保存 URL/key/CSR，Ready 才 finalize，Processing/Valid 直接取证书 | future-notBefore 恢复不重复 finalize；404 归因仍有缺陷，见下表 |
-| 依赖独立测试 | vendor 自有锁文件和生产 feature 组合 | 仅适用的无默认后端 library 测试；没有为了扩大测试数启用默认 TLS/签发后端 |
+| 恢复订单前 HEAD newNonce 返回 404，被共享 last_status 误认成订单消失 | [account.rs](../vendor/instant-acme/src/account.rs) 在真正订单 POST-as-GET 的响应处附加 `Error::Response {method,url,status,source}`；[Manager::reconcile](../src/acme/manager.rs) 只凭该订单 URL 的 POST 404 退役。适配器继续把 ACME Problem/badNonce 交给库处理 | nonce404 保留 URL/key/CSR；order404 对照确实请求订单端点 |
+| Retry-After 极大数导致时间加法 panic，外层又饱和保存极大时间 | [RetryAfter](../vendor/instant-acme/src/lib.rs) 区分 Absent/Malformed/At/Unrepresentable；库与 HTTP 共用解析，检查 SystemTime/Instant 和指数退避算术；不持久化溢出值 | 秒数、HTTP-date、过去/缺失/非法值、u64::MAX 与超过 u64；order/ARI 路径 |
+| finalize/recovery 丢失等待头；首次 poll 提前；等待中重启可丢失调度 | [order.rs](../vendor/instant-acme/src/order.rs) 保留各响应等待；[Manager::poll_order](../src/acme/manager.rs) 每次刷新后的等待先写 UTC next_attempt，再用单调时钟等待。本轮剩余期限不足则持久延期；保留原订单，不重复 finalize Processing/Valid | 120 秒首轮等待、超出 operation budget、恢复首轮、等待中取消后重开不产生请求 |
+| 只读发现/列表失败也留下 CreateUncertain | [dns.rs](../src/acme/dns.rs)、[porkbun.rs](../src/acme/porkbun.rs)：prepare 只读，Preparing 可恢复；写入 CreateUncertain 后才调用 present。只有结构化 401/403 权限拒绝才确认为无副作用 | 两真实 provider 的发现、列表、拒绝、准备取消、真实持久 intent/send gap、晚提交/空 cleanup/重启 |
+| challenge ACK 后超时/退出立即删除 TXT | [Manager::cleanup](../src/acme/manager.rs) 查询原 order/authz/challenge；Pending/Processing 验证继续保留，确定终态才清理。Validating 在 ACK 前持久化；Pending ACK 间隙可以重发 set_ready，Processing 不重发 | Pebble 屏障下 timeout、SIGTERM、SIGKILL/重启；先观测保留，再释放 CA，最后检查原订单进度和持久清理 |
+| HTTP 内的异常证书经 Vec JSON 膨胀超过 journal 上限 | [BlockedCertificate::evidence](../src/acme/persist.rs) 在复制/序列化前仅取 16 KiB prefix，保存原长、完整 body SHA-256、分类和 retry_at。HTTP 4 MiB、证书 1 MiB、journal 8 MiB 各自保留；正常拒绝不再误作持久化不确定 | 可解析/不可解析材料的 1 MiB、+1、2/3/4 MiB、4 MiB+1；完整摘要、长度、journal <128 KiB、旧证书可用 |
+| control panic/error 停止仍有有效证书的 listener | [runtime.rs](../src/runtime.rs) 捕获 unwind，丢弃失败 Manager，结束控制 runtime；已有网络继续有效性准入并报告 renewal_stopped，不自动恢复潜在不一致的 Manager。初始无证书仍无法启动；已启动后的控制清理错误独立报告，不因 shutdown/control 先后顺序改变正常网络关闭的返回值 | invalid renewal 和 control panic 后真实新 H2/H3 握手仍取旧有效身份，driver 为零，显式关闭成功 |
+| TLS-LOADED 写失败阻止加载或掩盖已完成的替换 | [Slot::refresh](../src/net/tls.rs) 构建/验证完整不可变 H2/H3/ECH generation 后原子替换，独立尽力写诊断。report 错误单独记录，失败清理临时文件 | create/rename/fsync 命名故障必须命中；实际 rename 失败时新 H2/H3 leaf 已改变；持续两次续期 |
+| H1 网站 Upgrade 没有与 H2/H3 共用 tunnel 准入 | [Router::request_filter](../src/net/site/mod.rs) 在合法网站路由/Upgrade 校验后、打开 upstream 前取共享 lease；Context 保持至完整双工结束。[Pingora 补丁](../vendor/pingora/MOON-NAIVE-PATCHES.md) 保留 Upgrade 两个半方向 | max_streams=1、足量连接；H1/H2/H3 混用，满额不打开源站，拒绝/reset/EOF 回收，upload 半关闭仍占用 |
+| H3 本地队列的四项预算耗尽后依赖新的外部事件，合并通知可留下已排队工作 | [drive_stream/drive_website](../src/net/h3.rs) 返回本地工作是否用尽预算；driver 主动 yield 后继续。空队列、流控阻塞与已关闭方向不忙轮询；四项预算不变 | 九个不产生 QUIC 包的合法 Body 任务：旧行为处理四个后不再调度；新行为有界排空且恢复 request/active 资源 |
 
-本次完整代码检查覆盖 account/crypto/eab/http/manager/dns/porkbun/state/store/certificate、runtime/TLS/CLI/配置与 xtask 入口；引用只针对下列具体路径，不声称穷尽所有库代码。
+DNS read-only prepare/传播各有 15 秒总预算；候选解析最多 5 秒，传播候选最多 1 秒，最多 32 个地址。HTTP 控制请求也改用根 resolver 的独立控制预算。已运行的系统阻塞解析 job 持有 permit 至实际结束；取消 async waiter 不会提前返还。同步 fsync 不能被普通 async timeout 抢占。
 
-实验环境为 Rust 1.93.0、Linux GNU x86_64；完整 rustc、内核/CPU、feature graph、锁文件摘要和工具二进制摘要在每次运行的 `baseline.json`。Pebble v2.8.0 固定 commit `d52948ce25e7c1576bcd18ff0e20a1c24ec7c44b`，仅应用仓库可审阅的 keylog/barrier 测试补丁。Go 1.27.3、tcpdump 4.99.5、tshark 4.4.18；版本和下载清单保留在工作区。没有真实 CA 订单、公网 DNS 修改或生产凭据实验。
+ARI 成功响应的重新检查间隔限制为 60 秒至 24 小时；429/503 的有效 Retry-After 不套用该 cap。订单和限流等待同样不受 ARI 本地上界截断。没有可用等待头时保留原库 250 ms、倍增退避，DNS 传播另用 poll_interval。无法表示的远端时间返回错误并保留订单，随后按有界错误退避重试，不转换成 u64::MAX。
 
-## 当前代码结论
+证书 invalid-material、本地 I/O/trust-config、链或本地信任待调查、future-notBefore、暂态 HTTP 与真实 durability uncertainty 分开处理。future-notBefore 保留原订单/key/CSR；永久异常材料有界阻塞供调查，不无限下载/创建订单。链错误无法单凭验证失败归责远端或本地；保留待调查分类。持久化不确定令 Manager suspended，不继续副作用；网络独立检查身份有效性。
 
-下列源码位置相对于本轮测试改动后的文件；生产逻辑与参考 HEAD 一致。具体 case/帧号和 journal 对照见后文证据。P1 表示可阻断签发/恢复或现有服务，P2 表示调度/诊断策略问题；不据此宣称存在可公网利用的攻击。
+outer 文件不变也继续按时间检查；outer 到期暂停新握手，inner 更新仍可加载，恢复 outer 后重新准入；不静默关闭 ECH，旧连接按原生命周期继续。CURRENT、内存 loaded generation 和 TLS-LOADED 是三种事实，status writer 明示未进行握手探测。
 
-| 优先级/分类 | 文件、符号 | 前置条件与触发顺序 | 后果、状态与置信度 |
-|---|---|---|---|
-| P1 确定缺陷 | [manager.rs:311](../src/acme/manager.rs#L311) `reconcile`、[http.rs:181](../src/acme/http.rs#L181) `last_status` | 已有有效订单；账户恢复成功；之后 HEAD newNonce 单次 404，订单 URL 正常且未被请求 | 用共享最后状态清空 journal.order，丢失原 URL/key/CSR；已复现，高 |
-| P1 确定缺陷 | [vendor lib.rs:208](../vendor/instant-acme/src/lib.rs#L208) `retry_after` | 订单 refresh 或 ARI 的 Retry-After 为 u64::MAX | `SystemTime + Duration` panic；控制线程中的 panic 可停止仍有有效证书的网络服务；已复现，高 |
-| P1 确定缺陷 | [manager.rs:422](../src/acme/manager.rs#L422) BlockedCertificate、[state.rs:215](../src/acme/state.rs#L215) `save` | HTTP 200 body ≤4 MiB，但证书不可用；全文 Vec<u8> 转 JSON | 诊断超过 8 MiB journal 限额，使 Manager suspended；原磁盘证书仍有效并不保证 serve 继续运行。已复现，高 |
-| P1 恢复设计缺陷 | [manager.rs:344](../src/acme/manager.rs#L344) lease/present；[dns.rs:288](../src/acme/dns.rs#L288)、[porkbun.rs:231](../src/acme/porkbun.rs#L231) recover | zone/NS 发现、TXT 读取或确认无副作用的创建拒绝；尚未创建即被记为 CreateUncertain | 空查询不能解除状态，后续 tick/cleanup 无法推进；两真实 provider 均复现，高。不能用默认 recover=Ok 的 TestDns 推导这个结论 |
-| P1 条件性恢复问题 | [manager.rs:175](../src/acme/manager.rs#L175) `cleanup`、[runtime.rs:66](../src/runtime.rs#L66) shutdown | challenge ACK 后 CA 尚未查 DNS；超时、SIGTERM 或崩溃后恢复 | cleanup 可先删除验证所需 TXT；需按原订单/授权/挑战状态决定清理。单次签发通过不覆盖该时序 |
-| P2 确定调度缺陷 | [vendor order.rs:191](../vendor/instant-acme/src/order.rs#L191) `poll_certificate` | finalize 返回 Processing 和 Retry-After，随后第一次 poll | 入口清除 retry_after，约默认初始退避后提前刷新；秒数及未来 HTTP-date 复现。没有证明 CA 一定因此拒绝，但违反该等待目标 |
-| P2 已知无上界策略 | [manager.rs:502](../src/acme/manager.rs#L502) `update_ari` | 可表示但极长的 ARI Retry-After | ari_check_at 可能被排到约百年后；24 小时上界是本报告的本地调度决策，不能用它截短订单/429 的等待要求 |
-| P1/P2 策略耦合 | [tls.rs:49](../src/net/tls.rs#L49) `Slot::refresh/record` | 新 CURRENT 已发布；前置 TLS-LOADED create/rename/fsync 失败 | 有效 generation 未加载；而第二次 record 失败可能在替换后返回错误。实际 rename 错误和测试专用 syscall 边界注入均覆盖；诊断是否准入条件必须明确，高 |
+## 状态、所有权与合并
 
-已纠正的历史前提：当前 Cloudflare 不是“每个 NS 只取一个 IPv4 并永久缓存”。`dns.rs::authorities` 保存每个 NS 的多地址候选，缓存 60 秒；传播阶段逐候选 1 秒、总 15 秒，失败清缓存。已有对应测试本次重跑。**发现阶段**仍按 NS 顺序最多每个 5 秒，没有覆盖整个发现+API+解析+传播的 provider 总 deadline；系统阻塞解析不能靠普通 timeout 停止。Porkbun 的传播检查也需要单独总期限。
+DNS 单域名单订单状态为 `Preparing → CreateUncertain → Created → Validating → DeleteUncertain → removed`。可借用记录保留 borrowed，始终不删除；marker/record ID 仅允许清理自己记录，foreign TXT 保留。默认 recover 也拒绝无证据的不确定创建。两 provider 共用 adopt/recover/cleanup 所有权政策，保留各自认证与 API 语义。
 
-当前两生产 provider 的不确定创建空查询会保留 marker/lease，不再按一次空列表忘记晚提交。本轮实际发送一次创建、丢失响应、首次 cleanup 查空、随后远端提交、重新打开 Manager：能够按 marker 删除自己记录并保留同名 foreign TXT。它已修复的是晚提交遗忘；不是前置失败过早进入不确定状态。
+必须保留崩溃间隙：持久 intent 后、POST 前崩溃，与 POST 后响应丢失可能磁盘状态相同。空列表不是未发送证明；无服务端幂等/提交期限承诺时保留对账和人工调查路径，不清 journal、不删除所有同名 TXT。
 
-outer 文件不变到期仍会在新握手准入及 watcher 中重新校验；过期 outer 不阻止新 inner 构建/替换；watcher 记录并限频错误；CURRENT/TLS-LOADED 能核对。本次持续服务与新握手验证这些行为，不重复列为未修复缺陷。outer 无效时暂停新握手，保持 ECH 配置；不是静默关闭 ECH。现有连接继续生命周期。
+Manager 直接拥有本地 `Option<VerifiedBundle>`；只有网络 TLS generation 仍需共享不可变 Arc。持久化模块保留 journal、generation/CURRENT 提交、no-overwrite import 三类不同失败语义，没有把它们伪装成一个事务。
 
-completed order 的 SAN/key/EKU/不受信链结果会持久阻塞并保留原订单，不会每 tick 重下或无限新建；future-notBefore 保留 retry_at，之后复用同一结果/订单成功激活，不再 finalize。旧结果过期/过旧的退役和持久 cooldown 在参考 HEAD 已实现。链错误目前归到 `chain-or-local-trust-needs-investigation`，尚不能精确区分远端链错误和本地信任策略。
+| 删除/迁移的源文件 | 现在的职责位置 |
+|---|---|
+| acme/eab.rs | acme/account.rs：账户、EAB 导入/注册 |
+| acme/state.rs + acme/store.rs | acme/persist.rs：锁、journal、发布、私密导入 |
+| net/outbound.rs | net/egress.rs：已验证候选、固定下一跳、Stream |
+| net/site/forward.rs | net/site/upstream.rs：共用 peer/timeout/TLS 构建，公共转发 ACL 与配置源站政策仍不同 |
+| net/site/generation.rs | net/site/bridge.rs：有界 single-flight 重建、冷却、共享 shutdown、无重放 |
+| net/resolve.rs | src/resolve.rs：控制/数据独立预算，没有中间转发层 |
+| tools/acme-lab/env.sh | 私有 run.py 的工具发现和参数；没有第二套 suite 定义 |
+| tools/acme-lab/README.md | 本文的运行说明 |
+| 四个 docs/acme-lab-*-index.json | 先归档可用原始工件，再移出维护源码；不计为生产复杂度下降 |
 
-`tools/xtask/src/main.rs:183` 的 verify 已区分 host、指定 target 的 compile-only，以及显式 verify-run runner；历史“交叉编译后直接执行目标二进制”前提不再成立。本轮没有安装/执行其他 target，GNU host 的检查结果不能代替交叉运行。
+公共 Rust 路径随合并调整：`acme::eab` 改为 account 中的函数，state/store 改为 persist；通用 Error/Result 在 crate 根；Http.last_status 与 certificate::CertificateSlot 移除；Manager::slot 改为 current(now)。本包 publish=false，但源码嵌入者需更新调用。CLI 配置和 revision 4 wire 不变。vendor 新 Error 变体影响穷尽匹配，轮询等待现在遵守响应头。
 
-当前控制线程与网络处于同一进程/UID。隔离 Tokio runtime 让部分阻塞工作不挤占网络 executor，但不构成 OS 权限边界。`runtime.rs::serve_with` 会因 control 错误/终止停止网络；错误退避能处理的暂态故障留在 Manager 内，panic/持久化 suspended 则升级到服务停止。
+journal 写入版本 3，读取旧版本 1/2 并保守迁移未标注 lease；旧全文证据在读入后截断再保存。旧二进制不能安全读取新状态；回滚必须使用事先备份并对账的完整状态目录，不能降级版本号或只删除 lease。已经超过旧 8 MiB 读取限额的历史损坏文件仍需保留调查，不能自动清空。
 
-## 实际执行与证据
+## 源码计量
 
-本次最终证据按命令分组，计数不能相加当作唯一测试数（legacy 包含已有 ACME 单元测试）：
+按 Git 基线文件与当前文件逐项计数（不含 target/reports/外部工件），物理行用 `len(bytes.splitlines())`，包含注释和空白。src/core 中 runtime-bearing Rust 与独立测试文件分开；内联 cfg(test) 项/字段/语句及 test 项按 Rust AST 区间单列，不能把它们算作生产代码增长。旧 codec 的 `&raw` 解析器诊断位于完整排除的未改测试模块，已核对边界。
 
-| 运行目录（均在 `/workspace/acme-lab-artifacts/`） | 实际命令/组 | 结果、原始退出码 |
-|---|---|---|
-| `verified-unit` | `cargo test --locked -p moon-naive --lib acme::` | 54 通过、25 失败、0 ignored；101 |
-| `pebble-final` | 要求的 `acme_pebble --ignored --test-threads=1 --nocapture` | 4 通过、3 个清理时序断言失败；101 |
-| `reviewed` | `acme_live` | 4 通过、4 个 TLS-LOADED 准入断言失败；101 |
-| `reviewed` | legacy workspace library | moon-naive 127 通过、9 个原有可选测试 ignored；core 30 通过；0 |
-| `reviewed` | vendor 独立锁文件/生产 feature 组合 | 7 通过；0 |
-| `system-resolver` | 真实 libc DNS 请求取消与 runtime shutdown | 1 通过；0；实际 DNS 阻塞，不是仅用 sleep 代替解析 |
-| `quality` | CLI integration、Manager 竞争锁 | 2 通过、1 通过；各 0 |
-| `quality` | production `cargo check --locked --lib`、Clippy all-targets -D warnings、audit-native | 各 0；本轮没有执行 release 性能测量 |
+| 类别 | 文件数：前 → 后 | 物理行：前 → 后 |
+|---|---:|---:|
+| 运行相关 Rust（含内联测试） | 41 → 36 | 14571 → 15083 |
+| 独立测试 Rust | 12 → 12 | 10433 → 11214 |
+| 工具及其说明 | 12 → 10 | 1655 → 1747 |
+| 生成 JSON（含未改的 packet-lab-results） | 5 → 1 | 46968 → 36856 |
+| vendor（含其测试/文档/清单） | 474 → 474 | 204942 → 205048 |
 
-25 个 ACME 失败包括：DNS 前置/拒绝/取消 8 个、nonce 404 归因 1 个、轮询等待 4 个、时间溢出 2 个、证据预算 9 个、ARI 本地上界决策 1 个。它们仍在默认测试内。生产修复没有完成，完整 CI 仍会报告这些失败。环境依赖的 Pebble 和真实 resolver 测试保留显式 ignored 入口，但本次已实际运行，未用 ignored 隐藏确定性缺陷。
+运行相关文件中，内联测试为 3788 → 3928 行；扣除后的生产物理行估计为 10783 → 11155（增加 372）。生产正确性修复增加了代码；本轮减少的是文件数、重复职责和无用共享所有权，不声称生产代码整体缩短。另有 28 个配置/文档/许可等第一方文件；第一方文件合计 98 → 87。生成索引单独减少 4 文件/10112 行，不能计作生产简化。
 
-`reviewed` 的 ACME 初次组曾有两个额外的夹具时限失败：在并行构建/分析期间，800 ms 的通用 mock 请求期限导致 wrong-key case 尚未下载证书，以及约 2.08 秒的调度延迟超过测试 2 秒容差。没有据此新增产品发现。通用合成 CA 请求期限改为 5 秒；专门超时/晚提交 case 保持 800 ms 期限、3 秒调度上界；`verified-unit` 已重跑。更早的配置错误、空抓包和缺 mock endpoint 试运行也保留在工作区，未计为产品证据或测试通过。
+工具行数增加包含严格证据失败判据；删除重复的 Rust 隔离编排和 env.sh，保留唯一 Python orchestrator，避免维护两套流程。完整逐文件计量及一次性计数脚本在外部 `source-metrics.json`/`measure.py`，没有新增维护中的计量系统。
 
-索引：[最终 ACME 单元实验](acme-lab-unit-index.json)、[最终 Pebble 实验](acme-lab-pebble-index.json)、[持续服务/旧回归及完整 reviewed 运行](acme-lab-reviewed-index.json)、[真实系统解析](acme-lab-resolver-index.json)。索引仅含路径、长度、SHA-256 与分析计数；原始资料在对应目录的 `*.stdout.log`、`*.stderr.log`、`*.result.json`、case `events.jsonl`、`journal-*.json`、`wire.pcap`、`tls.keys`、`timeline.json` 和 `handshake-analysis.json`。
+## 回归判据修正
 
-最终单元实验取得 51 个 pcap，解码 790 条 HTTP/DNS 行、独立验证 196 个 JOSE 签名；最终 Pebble 7 个 pcap 解码 566 行、98 个 JOSE 签名、1 个 EAB HS256，包含 160 个 DNS 帧。两组均未发现 protected.url 与实际 URL 不符或签名验证失败。统计的是可解码行，不是全部网络帧，也不是性能样本。newAccount 使用 jwk；已知账户使用 kid；POST-as-GET 的 payload 是空字节；challenge POST 的 payload 是非空 JSON `{}`。这些分别来自解密后的请求，不能互相混同。
+- keylog 现在不再暗中把测试客户端接收窗口从 64 KiB 扩大至 1 MiB；网站/codec 抓包沿用原窗口和 5 秒断言。旧 packet-lab 摘要属于旧 profile，不作当前性能对照。
+- intent_cancel 现在取消显式只读 prepare；另两个 case 单独保留真正 durable-intent/send 间隙。后者空查询必须仍不确定。
+- Pebble 重启先等待 control_restored，不等待本不应发生的 cleanup。释放验证屏障前检查 TXT/lease 和删除标记；释放后同时等待 provider 完成与 journal 持久清空，避免把两者间隙误判成未清理。
+- 隔离 mock 的“确定未发送”故障位于 prepare；不再用默认 recover=Ok 假装恢复创建。生产 Cloudflare/Porkbun 的实际恢复路径由单独 HTTPS mock 覆盖。
+- retry_case 必须到达 finalize、返回预期 Tick、且等待 case 真正发生 poll；None 不满足计时断言。溢出 case 则必须有界延期。
+- panic 测试改为有效网络继续、控制器不自动复活；Drop 屏障固定“用户关闭先于控制退出”，仍保留命中和真实握手断言；命名 IO/API/nonce 故障均断言实际命中，避免重构绕开故障点。
+- 保留既有 codec、认证、预算、取消、半关闭、桥重建/POST 不重放、证书及权限回归；不以 ignored、通用重试或延长 sleep 隐藏失败。
 
-固定 Pebble 的 `wfe.go:1558` 用 `rand.Intn(100) > authzReusePercent`，因此配置 0 仍可能复用。最终 harness 对成功复用允许跳过 DNS outage 路径并明确记录 `outage_was_not_exercised`；专门的 100% reuse case 检查无需第二次 DNS create。100% nonce 拒绝 case 检查有界失败，未要求它签发成功。
+## 唯一实验入口
 
-### 最小复现与帧/journal 对照
+普通 `cargo test --locked --workspace` 不要求抓包工具。`ACME_LAB_CAPTURE=optional` 可尝试抓包并保留失败原因；显式实验由下列入口强制要求证据：
 
-先按 [入口说明](../tools/acme-lab/README.md) 安装工具、启用环境并运行对应组。缩小复现可在同样的 namespace 中执行 `cargo test --locked -p moon-naive --lib acme::lab::nonce_endpoint_404_preserves_existing_order -- --nocapture`；设置新的 ACME_LAB_ARTIFACTS，保留该命令的退出码。所有以下帧号均局限于指定 case 的 wire.pcap：
-
-| case/原始运行 | 可核对的网络与日志证据 | journal/可见后果 |
-|---|---|---|
-| `verified-unit/nonce404-86989-1793941549172381966` | 帧 63 HEAD `/new-nonce` →65 HTTP 404；此前账户恢复 200；没有 POST `/order/1` | journal-before 有原 order，journal-after.order=null；高置信度归因缺陷 |
-| `verified-unit/retry-after-86989-1793941546712469239` | finalize 帧 99→101：Processing、Retry-After:120；帧 118 已 POST order | 首次等待约 300 ms；提前 Installed。beyond-deadline case 的 operation=30 秒仍提前查询，订单被清空而非持久延期 |
-| `reviewed/dns-cloudflare-discover-74354-1793932621379165508` | 帧 114 GET zone 发现失败；无创建 POST；随后列表帧 131→133 与148→150 都为空 | CreateUncertain lease 保留，cleanup 失败；不是晚提交发生过的证明 |
-| `reviewed/dns-porkbun-reject-74354-1793932652691863044` | 帧 148 创建 POST，mock 明确定义 403 无副作用；后续空列表 | 仍不能解除 lease。生产 recover 被实际调用；不是 TestDns 默认 recover 的结果 |
-| `reviewed/dns-cloudflare-late-74354-1793932622997607373` | 帧150 POST；166/183 列表为空；UTC epoch 1793932625.019732 远端延迟提交；200/217 列表出现记录；236 DELETE 自己的 bbbb | empty-before-late-commit 仍有 lease；after-restart-reconcile 无 lease；foreign TXT 留下。Porkbun 最终组有同样的通过对照 |
-| `pebble-final/pebble-plain-sigterm-88765-1793941740051931155` | 帧252 challenge ACK 请求；262 clear-txt；barrier 在 epoch 1793941741.279226 才释放；之后权威答复无 TXT；原订单 Invalid | challenge-acked 快照有 lease；after-cancel 已清。真实子进程 SIGTERM，调用生产 serve/control 生命周期 |
-| `pebble-final/pebble-plain-crash-88765-1793941736907312998` | 帧253 challenge；真实 SIGKILL；重启后263 clear-txt；epoch1793941739.267321 放行；原订单 Invalid | after-crash 仍保留 key/order/CSR/lease，重启清理过早；不等同于 journal 丢失 |
-| `pebble-final/pebble-plain-timeout-88765-1793941741486675806` | worker 启动后约30.3秒清理：帧258 challenge、276 order 请求被测试 CA barrier 挂起、284 clear-txt；epoch1793941772.141272 放行；原订单 Invalid | 此专门 case 的 HTTP 期限45秒、Manager操作期限30秒，故由操作级期限取消。早期 reviewed case 只触发库内轮询超时，未冒充这一实验 |
-
-权威 facade 的 TC 回退在真正 UDP/TCP 上进行。例如最终 SIGTERM case，帧214 为 AA+TC 的 UDP 答复，220/233 是客户端的 TCP DNS 查询/答复；放行后 UDP 的零 TXT 答复来自后续 CA 验证。facade 给 challtestsrv 增加 AA，必要时给出 TC，同时保留生产事务、AA 和 TCP 校验；不把所有 DNS 都误称为 CA 查询。固定 Pebble 的自定义 resolver 本身读取 UDP Answer，不据此声称 CA 做了 TCP 回退。
-
-badNonce 可重复计数：1 次拒绝+新 nonce 为2个账户 POST；3次拒绝+新 nonce 为4个 POST；3次拒绝且无替换 nonce 为4个 POST并增加 HEAD；持续拒绝被限制为5个 POST。每次重签的 signature SHA-256 不同，签名验证均通过。完整 nonce/签名摘要、Replay-Nonce 与响应状态在 timeline；没有仅由“最终成功”推断重签正确。
-
-### 证书体积和实际激活
-
-HTTP 上限4 MiB，验证器证书上限1 MiB，journal 上限8 MiB。下表字节值取 reviewed，各边界类别已由 verified-unit 再次复核；原始 RSS/HWM 记录包括测试夹具和完整 journal 的 serde_json 解析开销，不能当作生产进程内存基准。
-
-| HTTP 200 长度 | 不可解析材料 | 可解析链+换行填充 |
-|---|---|---|
-| 1 MiB | Blocked 全文，journal约3,147,836字节 | 可通过验证并安装，journal恢复小体积 |
-| 1 MiB+1 | 超证书限额，但全文仍保存约3.15 MB | 同样保存约3.15 MB |
-| 2 MiB | journal约6,293,569字节 | 约6.29 MB |
-| 3 MiB | `ACME journal exceeds limit`，旧 journal约1.9 KB | 同样 suspended；没有持久化新的 blocked 证据 |
-| 4 MiB | 同上 | 同上 |
-| 4 MiB+1 | HTTP BodyLimit 拒绝，正常 RetryScheduled | 同样拒绝，journal保持小体积 |
-
-持续服务 case `reviewed/live-renew-75103-1793932764652765341` 和 `live-renew-outer-75103-1793932741507970568` 均完成两次轮转。新 H2/H3 握手实际 leaf serial 为11→12→13，各次 fingerprint 相同、对应 CURRENT/TLS-LOADED；旧 H2/H3 持续请求仍200。outer case 先观察 `new_handshakes_allowed=false` 与新 inner 已载入，修复 outer 后新握手取得最新 inner。`handshake-analysis.json` 从 pcap 导出的 H2 证书帧可核对11/12/13，例如普通 case 的360/1128/2067；本次 tshark 未导出 QUIC 证书帧，H3身份依据是完成证书验证的 quiche peer_cert 与握手日志，不能冒称为独立的 H3 证书抓包证据。
-
-实际 TLS-LOADED rename 失败 case `reviewed/tls-loaded-failure-*` 中 CURRENT 已更新，Slot仍旧；**新的真实 H2/H3 握手仍拿 serial2**。另有 create/rename/fsync 返回错误的测试专用注入：替换前失败保留旧 generation，替换后失败则内存已是新 generation，返回 Err 不能代表未激活。没有把注入 io::Error 说成真实磁盘 fsync 永久卡住。
-
-控制线程 panic case 的原证书尚余约3秒有效期，实际出现 `ACME control thread panicked`、网络监听停止、owned Hyper drivers=0；CURRENT仍在。证明的是现有错误耦合，不能据此认为重启控制线程可安全重放未知副作用。
-
-
-## 最小生产修复设计（未实施）
-
-### 1. 先隔离错误归因和远端时间输入
-
-`http.rs` 为每次请求形成不可变 `RequestContext {operation, method, endpoint, request_id, deadline}`；Transport/Tls/Timeout/HttpProblem/BodyLimit 都携带该 context。不要用 `last_status` 或跨 CA/DNS 请求共享的最后事件作订单存在性的证据。最小先行修复是停止在恢复错误上清空订单；最终仅对 **该订单 URL 的 POST-as-GET 404** 生成 `OrderMissing` 后退役。
-
-为了保留库内 badNonce 重签实现，不能在 HttpClient 收到所有非 2xx 时提前抛错绕过库的 Problem 分支。可作可追踪的小型 vendor 补丁：在 `Client::nonce/post`、Order 查询的最终错误出口附上 method/URL/status/阶段；先执行现有 badNonce 识别/重试，再生成带 context 的最终错误。`create_with_key` 和已有 JWS/EAB 保持。更新 MOON-PATCH.md 与 vendor 摘要；不重写 ACME 客户端。验收：nonce 404 保留 URL/key/CSR，真正 order 404 对照仍能正确退役。
-
-统一解析 `RetryAfter::{Absent, Invalid, At(SystemTime), Unrepresentable}`，使用 checked_add，禁止远端数值触发 panic。Order 在 finalize 后的第一次 poll 保留有效等待期限，不在 poll_certificate 入口重置它；后续请求同样继承响应的 not-before。若晚于本次总 deadline，返回可持久化的 `Deferred {not_before, operation, order_url}`，而非先查询再超时。Manager 把 not-before 存入 journal，跨 tick/重启解释一致；本地错误指数退避取 max，不能以 retry_max 截短服务端等待。
-
-ARI 检查采用独立本地调度区间，建议 60 秒至 24 小时；极端不可表示值归为输入错误并记录，使用有界本地 ARI 重试。此上界只约束 ARI 再检查，不影响证书实际 renew_at 的有效窗口，也不适用于 ACME order/rate-limit Retry-After。时钟回拨/HTTP-date 舍入需有测试；操作中使用单调 deadline，持久化使用带原因的绝对 UTC。
-
-### 2. DNS 准备、发送与验证拥有不同的状态
-
-新增 `PreparedDns` 是 provider 完成 zone/委托验证、NS 发现、TXT 列表读取后返回的只读创建计划/借用结果；它解决当前无法辨认“前置失败”与“POST 可能提交”的问题。Manager 保存订单仍早于网络副作用，lease 流程建议：
-
-```mermaid
-stateDiagram-v2
-    [*] --> Preparing
-    Preparing --> NotCreated: 前置失败或确认未发送
-    Preparing --> Borrowed: 已有相同 TXT
-    Preparing --> Created: 找到本 marker 的记录
-    Preparing --> CreateUncertain: POST 意图持久后发送
-    CreateUncertain --> Created: 按 marker 找到远端记录
-    CreateUncertain --> NeedsReconcile: 空查询/响应丢失
-    NeedsReconcile --> Created: 晚提交出现
-    Created --> ValidationInFlight: challenge ACK
-    ValidationInFlight --> CleanupEligible: 原授权/订单到达可清理状态
-    CleanupEligible --> DeleteUncertain: 删除意图先持久化
-    DeleteUncertain --> Done: 可证明已删除自己记录
-    Borrowed --> Done: 保留借用记录
-    NotCreated --> Done
+```sh
+cargo xtask lab --run /absolute/path/outside-checkout/run-id
+# 缩小范围；suite 定义只在私有 run.py 一处
+cargo xtask lab --only acme --run /absolute/path/outside-checkout/acme-id
+cargo xtask lab --only pebble --run /absolute/path/outside-checkout/pebble-id
 ```
 
-确认无副作用的拒绝仅在 provider 合约/明确响应足以证明时转 NotCreated；网络超时不作此推断。旧 journal 没有新字段时保守迁移为 CreateUncertain。保留 owner marker、具体 record ID、借用标记及 original order/authz/challenge URL。
+默认一次运行 oracles、workspace、Pebble、生产 features 的 vendor library、真实系统 resolver。可选择 `network/vendor/resolver/oracles`；`test-isolated` 只是同一入口的兼容命令。xtask 委托唯一 Python orchestrator；analyze.py 仅处理 tshark/独立密码验证，不维护第二套命令清单。
 
-**必须承认发送的崩溃间隙**：持久化 CreateUncertain 后、实际 POST 前崩溃，与发送后响应丢失可留下同一磁盘状态。不能凭一次空查询证明未发送；若 provider 没有明确的幂等创建/提交期限契约，不存在自动、安全地忘记所有此类 intent 的办法。Porkbun 的 Idempotency-Key 是否提供服务器端承诺要独立确认，不能由客户端发送了该首部推导；Cloudflare comment 只是所有权 marker。NeedsReconcile 持久重查、有限队列/退避和明确调查状态，保留晚提交清理能力；确认的 Preparing/NotCreated 不再阻塞。仍无法确定的个别操作需要有证据的人工处置，不清空 journal 或全删同名 TXT。
+需要 Rust/native 构建环境、Python 3 与 cryptography、Linux unshare/user+network namespace、iproute2、tcpdump、tshark，以及指定版本的 Pebble/challtestsrv。环境不支持时明确失败，不把日志当 pcap。工具可显式提供：
 
-`cleanup()` 必须先恢复原订单/授权和 challenge 的状态，再判断哪些 lease 可清理。challenge ACK 后超时/SIGTERM：保留 ValidationInFlight，关闭进程而不立即删除；重启继续观察原订单。Ready/Valid/Invalid/Expired 或明确验证结束后才清理自己的记录。AuthorizationStatus、ChallengeStatus、OrderStatus 分别保存，不能由其中一种替代另两种；重复 set_ready 本身不等于协议违规。Processing/Valid 不重复 finalize，Ready 才 finalize。
+```sh
+cargo xtask lab --home /absolute/lab-home \
+  --pebble-source /path/pebble-source --pebble /path/pebble \
+  --challtestsrv /path/pebble-challtestsrv \
+  --tcpdump /path/tcpdump --tshark /path/tshark \
+  --run /absolute/artifacts/run-id
+```
 
-给 DNS provider 一条请求级绝对 deadline，API/NS 发现/候选解析/UDP/TCP 共享剩余时间；候选有单次上限。缓存记录获取时间/TTL/候选失败，失败刷新保持现有多地址能力。系统解析任务持有的 permit 在真正返回时释放，不能在取消等待者时提前释放。
+也接受 `PEBBLE_SOURCE/PEBBLE_BIN/CHALLTESTSRV_BIN/ACME_LAB_TCPDUMP/ACME_LAB_TSHARK`；命令行优先。默认 home `/workspace/.moon-naive-acme-lab`，无 env.sh。`--bootstrap` 是可选的 Debian/Linux amd64 开发机工具安装，要求 curl/git/apt-get/dpkg-deb、Debian keyring 与网络；仅下载/解包到 home，不安装系统包。固定 Go 1.27.3/Pebble commit，校验下载和补丁。其他平台自行提供工具，不能把 GNU 实测当交叉目标执行。
 
-### 3. 有界诊断和失败分层
+实验只使用本地测试 CA、合成 EAB/DNS 凭据、测试域名和独立状态目录。实际监听端口、PID、版本/摘要、命令、退出码、UTC/单调基准、日志、journal 快照和证书摘要保留。CA 端 keylog 或测试客户端 BoringSSL callback 明确写入 NSS 行并补换行；不假设 SSLKEYLOGFILE 自动生效，不关闭证书验证，release 没有 keylog 开关。
 
-`state.rs::BlockedCertificate` 改为有版本的 `CertificateEvidence {sha256, original_bytes, reason, verification_code/depth, order_hash, trust_bundle_hash, retained_prefix}`。建议 prefix 上限 16 KiB；在复制和 JSON 编码前截断，总证据预算远小于 8 MiB journal。完整异常 body 如需保留，独立有界诊断文件、明确保留策略，不能嵌入 Vec JSON。HTTP 4 MiB 与验证器 1 MiB 的各自用途写清；正常的 BodyLimit/MaterialLimit 进入有限证据，不能升级为持久化故障。
+`result.json` 是唯一权威运行结果，包含每条原命令退出码、预期 named case、证据错误和最终 success。baseline.json 是环境/源码摘要，timeline/analysis/decoder 文件是证据，不覆盖命令结果。缺 case/capture、tshark 失败、JOSE/URL/CSR/EAB 校验失败或未执行、目标 outage 被跳过、零相关测试都会令验证失败。独立 oracle 实际测试空 pcap、失败 decoder、失败/未执行的密码验证及“索引成功不能覆盖原失败”。每条命令有 600 秒进程组期限，原始错误码保留。
 
-错误 SAN/key/EKU/结构等归 `TerminalMaterial`，保留原订单及有界证据，等待显式调查/重试；future-notBefore 归 `DeferredUntil`，沿用原 URL/key/CSR；网络/nonce/CA 5xx 为暂态；本地 CA 文件读错/权限错误为 LocalTrustConfiguration。链不信任在证据不足时保留“不确定”分类，记录验证码和 trust 摘要，避免武断地怪 CA 或自动新建订单。
+## 本轮执行与工件
 
-已有有效证书时，远端异常响应和诊断失败应降级续期并保留现有 listener；真实 journal/CURRENT 提交不确定则停止新的状态推进并报告，但是否继续已有有效证书应与网络服务生命周期分开。无有效身份、私钥/证书不匹配、身份到期必须拒绝新握手。控制线程 panic 需监督并持久记录；不能盲目重启、重放未知副作用。
+最终命令均实际执行于应用本轮改动的工作树，HEAD 仍为审阅基线；工件的 src SHA-256 已逐项与最终源码核对一致。提交只封装该已验证源码。没有将旧报告的结果算入本轮成功。
 
-### 4. 发布、激活和权限分期
+| 实际命令/检查 | 本轮结果 |
+|---|---|
+| `cargo test --locked --workspace`（由 `cargo xtask lab` 调用） | server 198、CLI 2、core 30、xtask 1 通过，0 失败；10 个 server 可选项、7 个 Pebble 项在普通 workspace 中 ignored |
+| `cargo test --locked --test acme_pebble -- --ignored --test-threads=1 --nocapture` | 7 通过，0 失败；包含 nonce 100% 拒绝的预期有界失败，而非要求签发成功 |
+| `cargo test --manifest-path vendor/instant-acme/Cargo.toml --locked --no-default-features --features time,x509-parser --lib` | 9 通过，0 失败 |
+| `actual_system_dns_cancellation -- --ignored --nocapture` | 1 通过；隔离 namespace 中实际 libc DNS 请求、取消及 permit 回收 |
+| Python evidence oracles | 3 通过；空抓包、decoder 失败、密码验证失败/未执行，以及原命令失败/零测试/缺 suite 不能被索引覆盖 |
+| `cargo clippy --locked --workspace --all-targets -- -D warnings`；`cargo fmt --all -- --check`；`cargo xtask audit-native` | 各通过；正常依赖图、源 pin 和 vendor 摘要通过；图审计本身不等于原生编译 |
+| `cargo check --locked -p moon-naive --lib`；`cargo build --locked --release -p moon-naive` | 各通过；GNU host 产物，不是 musl 发布物 |
+| release CLI `--help/--version/status/config init/check-config/serve` 冒烟 | 成功；配置私密/no-overwrite，默认未授权 ACME 的 serve 拒绝且未开 listener |
 
-明确状态：Issued → Validated → Published(CURRENT) → Loaded(H2+H3) → Probed(真实新握手)；Expired 是按时间计算的准入状态；Rollback 指显式发布另一个仍有效、验证通过的 generation；Retired 仅在无连接引用且超出回滚保留窗口后回收。磁盘写成功不是 Loaded，更不是 Probed。
+最终入口的 oracles/workspace/Pebble/vendor/resolver 原始退出码全部为 0，verification errors=[]。74 份 pcap 解码得到 1641 条 HTTP/DNS 行、独立验证 372 个 JOSE 签名和 1 个 EAB HS256，错误签名和 protected.url 不一致均为 0；有 164 条 DNS 帧。214 是解码的证书项数，包含链和重复项，不等同握手次数或性能样本。
 
-`Slot::record` 改为返回独立诊断结果，刷新首先构建完整不可变 H2/H3+ECH bundle，再原子替换。若 TLS-LOADED 仅作观测，其写失败不阻断加载，记录可见错误/内存 loaded ID，重试诊断；若决定它是强制审计提交，则要设计真正一致的状态事务，不能前置失败阻断、后置失败已经激活却只报失败。推荐前者。发布权限/诊断权限分开，真实握手验收继续独立。
+以下帧号局限于对应 case 的 wire.pcap；源为 pcap 的字段与测试日志事件在 timeline 中明确区分：
 
-当前 outer 失效策略保持：新握手暂停，ECH 不取消，旧连接继续；inner 可以加载，outer 修复后重新准入。后续独立 outer 管理必须是单列决策。
+| case | 本轮可核对证据 |
+|---|---|
+| `nonce404-133161-1793961001795973598` | 帧 63 HEAD newNonce →65 HTTP 404；没有 POST /order/1；journal 前后 URL/key/CSR 相同 |
+| `retry-after-133161-1793960881042076612` | finalize 帧 97→99，Processing、Retry-After:120；下一次 order POST 为114；服务端单调实测 120073 ms，Installed |
+| `retry-after-beyond-deadline-133161-1793961015122193112` | finalize 97→99；没有后续 order poll，日志为 RetryScheduled，保留原订单和 UTC next_attempt=1793961136 |
+| `dns-cloudflare-late-133161-1793960865136986665` | 创建提交 epoch 1793960865.820851；空 cleanup 的 journal 在 1793960866.594318；远端提交在 1793960867.022518，重开后按原 marker 对账，foreign TXT 保留 |
+| `live-renew-outer-133161-1793961055564780278` | 实际新 H2/H3 leaf serial 均为 11→12→13，CURRENT/TLS-LOADED 跟随 generation，旧连接持续请求；handshake-analysis 有独立解码的证书项 |
 
-后续控制面进程/UID 拆分：DNS/ACME 凭据仅控制进程可读；网络 UID 仅读已发布的必要证书材料；发布目录通过最小权限和原子提交控制，不能让网络 UID 改 CURRENT 或源密钥；Unix socket 上验证发布元数据/epoch。单独进程需要 crash/锁/权限回归，不能只移动 Tokio thread 就声称完成隔离。
+试运行目录 `pebble-corrected`、`final-lab`、`verified-consolidation`、`acceptance` 的非零退出码全部保留；分别暴露了 provider mock/清理观察时序、我引入的备用等待间隔错误、control/shutdown 顺序竞态及旧 H3 时限反例。`coalesced-wake-before.log` 为确定性队列反例 0 通过/1 失败，修复后通过；不是按失败条数累加独立缺陷。
+- 当前证据目录：`/workspace/consolidation-evidence/`（私密，源码树外）。
+- 历史原始工件及被删除的四索引：`baseline-evidence.tar.gz`；本环境中旧报告引用的六组原始资料均可归档。旧结果仍属于旧提交。
+- 最终入口输出：`verification-final/result.json` 与 `verification-final.tar.gz`；pcap、测试 keylog、完整 journal 只在外部私密工件，不进入 Git/source archives。
+- 每个 case 的 timeline 明确区分 `pcap` 帧和 `test_log` 事件；网络激活依据实际新 H2/H3 握手 leaf serial/fingerprint，文件/Manager 变化不足以证明激活。
 
-## 分阶段实现与验收
+## 验证边界
 
-| 顺序 | 文件/依赖 | 最小任务及验收 | 兼容与回滚风险 |
-|---|---|---|---|
-| 1 | manager.rs；依赖现有回归 | 先取消共享 last_status 退役推断；nonce404 完全保留订单 | 暂时可能反复尝试真正丢失的订单，需明确诊断；不改变 wire |
-| 2 | vendor lib.rs/order.rs、MOON-PATCH.md | checked 时间解析及首次 poll 继承；120 秒/HTTP-date/极大值/超 deadline 全通过 | 旧的提前查询行为改变；保持库内 JWS/nonce/EAB |
-| 3 | state.rs/manager.rs/certificate.rs | 有界诊断、错误分类、原始长度摘要；1–4 MiB 所有边界不 suspended | 需兼容读取旧全文字段，写入新版后回滚需迁移读取支持 |
-| 4 | dns.rs/porkbun.rs/state.rs/manager.rs | PreparedDns 与明确 NotCreated；两 provider 前置/拒绝/晚提交/取消用例 | 旧不确定 intent 不能降级丢弃；不承诺跨崩溃 exactly-once |
-| 5 | manager.rs/runtime.rs | ValidationInFlight 延迟清理；ACK barrier 的 timeout/SIGTERM/crash 全通过，原订单续跑 | shutdown 后可能暂留 TXT；须有重启对账与证据，不全删 |
-| 6 | net/tls.rs/cli.rs | 激活和诊断分离；每个 I/O 失败点有确定结果，真实 H2/H3 验收 | 保持 outer 失效策略；诊断格式版本化 |
-| 7 | resolve.rs/http.rs/runtime.rs | 请求总期限、真实阻塞任务预算、控制错误降级监督 | 不假设 fsync/getaddrinfo 可被 async timeout 抢占；真实提交不确定不能自动重放 |
-| 后续 | 进程入口/配置/部署权限 | 双 UID、独立密钥、发布 ACL 与 OS 权限回归 | 单独迁移方案；本轮未实施或部署 |
+旧网站和 codec 用例各出现过一次间歇 H3 超时。补齐原窗口抓包后的 20 次隔离诊断均通过，未捕获同一次停滞；有界队列进度缺陷另由确定性组件反例证实并修复。不能据此证明该修复解释了所有时限失败，或以后不会复现；原始失败与诊断工件保留。
 
-## 测试规格、客户端和性能边界
+独立 Pingora 上游全套、其他 target/MSRV/musl 静态 ELF 门禁本轮未执行；改动的三个 Pingora 文件由本仓库真实网络回归覆盖。
 
-| 输入/故障时序 | 实际检查或目标断言 | 资源/时间边界；状态 |
-|---|---|---|
-| CF/Porkbun 发现503、列表503、确认创建拒绝 | 实际创建次数0/0/1；tick后cleanup；lease阶段/marker | 默认8个前置/取消相关断言失败；没有删除 foreign TXT |
-| intent持久后、present前取消 | abort请求Future、drop Manager、同目录重开，真实provider recover | 0创建仍被不确定状态阻塞；2个失败包含在上述8个内；不是OS崩溃证据 |
-| POST丢响应、第一次cleanup空、远端晚提交、重启 | 原创建仅一次、前后journal、真实provider按marker删除 | 客户端800ms，远端1200ms；两provider通过，foreign保留 |
-| nonce endpoint404 / order endpoint404 | 是否实际请求order、URL/key/CSR保留与退役对照 | 前者失败、后者通过；不同操作不混用状态 |
-| Retry-After秒/HTTP-date/过去/缺失/非法/120>30秒deadline | 首次poll时间、next_attempt、order不丢 | 秒/未来date/120/超deadline失败；过去/缺失/非法有界通过；极大值panic另列 |
-| order refresh与ARI：u64::MAX | 不能panic，应有结构化错误 | 两个默认失败；真实control线程输入也覆盖 |
-| ARI零下界/极长间隔 | 当前源码max(60)，新增24h上界契约 | 极长默认失败；下界按源码确认，未另造“已测”结论 |
-| 固定前1/3次拒绝、带/不带nonce、100%拒绝 | 重签次数/nonce来源/最终状态 | 库单次POST最多5次；mock与真实Pebble均实际运行 |
-| 证书六个边界×可解析/不可解析 | HTTP/证书/journal限制、原长度/摘要/旧身份、RSS/HWM | 12个case实际执行；9个证据预算断言失败 |
-| completed SAN/key/EKU/链错误；future-notBefore | 阻塞理由/原订单/不重复下载或下新单 | 五个case通过；future之后同订单安装，不重复finalize |
-| 恢复Processing/Valid订单 | 只poll/download、无newOrder/finalize | 两个case通过；库状态与授权/挑战状态分别处理 |
-| ACK后验证barrier：操作期限、SIGTERM、SIGKILL重启 | DNS create/clear、查询、原订单与journal同一时间线 | 30秒操作/45秒HTTP；3个失败，有真实进程信号与pcap |
-| TLS握手/响应头/body/chunked无终止、外部取消 | 返回错误、对端EOF、owned Hyper drivers=0 | 请求800ms，调度容差3秒；回收断言通过，FD为观测 |
-| 真正系统DNS查询已开始，再取消等待者并关闭runtime | namespace将系统nameserver映射到lo，先保留A/AAAA查询，再NXDOMAIN | shutdown_timeout100ms后permit仍0；响应后归还1；通过；不是系统工作被取消 |
-| 两Manager竞争同目录 | 第二个open错误、原key/journal不变；释放后可重开 | 单元及显式质量复核通过 |
-| 持续serve，两次续期、outer先过期 | CURRENT/LOADED/新H2/H3 leaf与旧连接请求 | 35秒轮转观察期限；2个通过，非停止服务后独立Manager替代 |
-| TLS-LOADED创建/rename/fsync错误 | 替换前后状态、真实新握手serial、错误可见 | 4个默认准入断言失败；post-load部分激活观测通过 |
-| 控制线程panic | serve Err、监听关闭、原证书仍有效、driver归零 | 真实HTTP输入触发；通过（观察当前行为，不表示策略理想） |
-| 旧codec、padding、半关闭、证书、权限与ECH接受 | 重新运行原有回归，包含真实H2/H3/ECH测试 | legacy157通过；旧可选测试没有补算为通过 |
+本轮主机为 Linux GNU x86_64、Rust 1.93.0。真实 Chromium revision 4 配套客户端仍未实现；没有用官方 Naive、TLS 成功或少量 pcap 推断兼容性或不可识别。没有真实 CA/DNS、生产凭据、独立进程/UID、自动 outer 签发、其他 target、长期 soak 或 release 性能实验。
 
-尚未完成/受阻的项目明确保留：
-
-- 内核级 fsync 永久阻塞/断电持久性实验：准备私有挂载的实测失败为 `mount: /: permission denied`（`kernel-probe/stderr.log` 和 result.json）。本次测试的是返回错误及原有原子存储回归，未验证阻塞文件系统下的35秒shutdown结局。同步fsync在控制线程上执行，async timeout不会抢占正在运行的系统调用；这是源码/运行时限制，不是已测的延迟上界。
-- 系统解析取消已用真实 libc DNS 查询验证，但没有声称测尽 NSS 插件、所有解析器实现或无响应超过OS全部重试期限；`Http::TcpStream::connect(host,port)` 的内部解析也不等同于显式8个permit的 provider NS解析，不能把一个计数器推广到全部后台任务。
-- ARI极长间隔的24小时上界、有界16KiB证据与诊断不阻断激活，是待实施的明确本地决策；不是RFC要求这些具体数值。订单等待不适用ARI上界。
-- TLS-LOADED返回错误注入未测试全部崩溃点、目录权限竞争、内核磁盘损坏和真实断电；真实rename失败与注入返回错误分别标注。
-- 未进行随机故障/长时间soak、多进程OS权限分离、真实CA/DNS、其他Rust/目标平台、真实revision4 Chromium互通或性能优化。它们不能由这次多次本地签发推导为可靠。
-
-首批可实施小任务按顺序是：停止共享404退役推断；checked时间解析与首次等待继承；有界诊断；两provider准备/结果状态；验证中的lease清理资格；激活/诊断分离。每一步先使对应默认失败回归通过，保持其他源码和wire不变，再进行下一步。详细依赖和回滚见前表。
-
-
-本次不是吞吐基准。记录的 RSS/HWM/FD/owned Hyper driver 仅为对应隔离 case 的观测；进程级 FD 与高水位不能归因到并发 case。本轮性能提升、p50/p95/p99、CPU/吞吐和长期 task/queue 趋势均未知。后续基线需固定硬件、内核、Rust/native 编译参数、TLS/QUIC 配置、证书大小、并发连接/stream/permit、bridge generation，再测成功率、延迟分位、吞吐、CPU、RSS、FD、任务/队列和容量；发现具体瓶颈后再讨论复制/channel/批处理。没有为了性能删除预算或校验。
-
-H2/H3 在线证书实验使用受信任本地 CA、真实 BoringSSL/quiche 握手测试客户端，不是 Chromium。配套 revision 4 Chromium 尚未实现，官方 Naive 不兼容是明确设计，不能声称互通通过。后续固定 Chromium commit、GN 参数、BoringSSL/quiche 版本和客户端 adapter 哈希，在独立 profile 装测试 CA，记录 NetLog/服务请求 ID：分别强制 H2/H3，核对实际协议、同连接网站/错误认证/合法 CONNECT 的逐流行为、证书指纹及 ECH accepted/retry/outer-expired 路径，并保持完整握手、目标策略与拨通后成功。核对旧连接与新握手的 generation 差异，故障后不重放已发送 POST；等待真实客户端实现后执行。TLS 握手成功、使用 BoringSSL 或少量 pcap 均不证明匿名性或不可识别。
-
-官方契约参照：[RFC 8555 §6.2 nonce、§6.3 POST-as-GET、§7.3.4 EAB、§7.5 验证、§7.4 订单](https://www.rfc-editor.org/rfc/rfc8555.html)、[RFC 7518 §3.4 ES256](https://www.rfc-editor.org/rfc/rfc7518.html#section-3.4)、[RFC 7638 JWK thumbprint](https://www.rfc-editor.org/rfc/rfc7638.html)、[RFC 9110 §10.2.3 Retry-After](https://www.rfc-editor.org/rfc/rfc9110.html#section-10.2.3)。本报告有关实际库行为均以固定 vendor 源码和本次证据为准。
+控制线程仍与网络同进程/UID，不能视为密钥权限隔离。静态 bounded 设计和测试 RSS/FD 观测不是吞吐优化证明。性能基线仍需匹配硬件/内核/编译/配置，测成功率、p50/p95/p99、吞吐、CPU/RSS/FD、task/queue、连接/stream/permit 和 bridge generation；没有这些测量，本轮不宣称提升，也不建议改队列/复制/批处理。

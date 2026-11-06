@@ -43,4 +43,4 @@ APT_CONFIG="$apt_root/apt.conf" /usr/bin/apt-get -o Debug::NoLocking=1 --downloa
 for package in "$apt_root"/cache/archives/*.deb; do dpkg-deb -x "$package" "$apt_root/prefix"; done
 sha256sum "$apt_root"/cache/archives/*.deb > "$apt_root/packages.sha256"
 for package in "$apt_root"/cache/archives/*.deb; do dpkg-deb -f "$package" Package Version; done > "$apt_root/packages.versions"
-printf 'Ready: source %s/tools/acme-lab/env.sh\n' "$repo_root"
+printf 'Ready: cargo xtask lab --home %s\n' "$lab_root"

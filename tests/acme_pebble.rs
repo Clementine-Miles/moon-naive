@@ -5,13 +5,14 @@ mod lab_support;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
+use moon_naive::Result;
 use moon_naive::acme::{
-    self, Result,
+    self,
     certificate::Validator,
     dns::{DnsProvider, authoritative_txt},
     http::Http,
     manager::{Manager, Tick},
-    state::Lease,
+    persist::Lease,
 };
 use serde_json::{Value, json};
 use std::{
@@ -44,6 +45,7 @@ struct TestDns {
     dns: std::net::SocketAddr,
     fail: Arc<AtomicBool>,
     creates: Arc<AtomicUsize>,
+    preparation_failures: Arc<AtomicUsize>,
     cleanups: Arc<AtomicUsize>,
     gate: Arc<tokio::sync::Semaphore>,
     started: Arc<tokio::sync::Notify>,
@@ -53,10 +55,24 @@ impl DnsProvider for TestDns {
     fn identity(&self) -> String {
         "pebble-loopback-test".into()
     }
-    async fn present(&mut self, lease: &mut Lease) -> Result<()> {
+    async fn prepare(&mut self, _: &mut Lease) -> Result<()> {
         if self.fail.load(Ordering::Relaxed) {
-            return Err("injected DNS API outage".into());
+            self.preparation_failures.fetch_add(1, Ordering::Relaxed);
+            return Err("injected read-only DNS preparation outage".into());
         }
+        Ok(())
+    }
+    async fn recover(&mut self, lease: &mut Lease) -> Result<()> {
+        if lease.phase == acme::persist::LeasePhase::CreateUncertain {
+            // This fixture has an isolated challtestsrv and no foreign writers.
+            if !authoritative_txt(self.dns, &lease.name, &lease.value).await? {
+                return Err("synthetic DNS creation remains uncertain".into());
+            }
+            lease.phase = acme::persist::LeasePhase::Created;
+        }
+        Ok(())
+    }
+    async fn present(&mut self, lease: &mut Lease) -> Result<()> {
         self.started.notify_one();
         self.gate.acquire().await?.forget();
         self.http
@@ -365,6 +381,7 @@ async fn exercise(eab: bool, scenario: &str) {
         dns: authoritative_address,
         fail: Arc::new(AtomicBool::new(false)),
         creates: Arc::new(AtomicUsize::new(0)),
+        preparation_failures: Arc::new(AtomicUsize::new(0)),
         cleanups: Arc::new(AtomicUsize::new(0)),
         gate: Arc::new(tokio::sync::Semaphore::new(0)),
         started: Arc::new(tokio::sync::Notify::new()),
@@ -531,8 +548,7 @@ async fn exercise(eab: bool, scenario: &str) {
     );
     assert!(manager.ready());
     assert_eq!(provider.creates.load(Ordering::Relaxed), 1);
-    let slot = manager.slot.clone();
-    let old = slot.current(acme::now()).unwrap();
+    let old = manager.current(acme::now()).unwrap().clone();
     let pointer = config.state_dir.join("certificates/CURRENT");
     let generation = std::fs::read(&pointer).unwrap();
     let first_state = evidence.journal(&config.state_dir, "initial-issued");
@@ -612,8 +628,9 @@ async fn exercise(eab: bool, scenario: &str) {
     let mut manager = Manager::open(&config, provider.clone(), http.clone()).unwrap();
     let renewal = manager.tick().await.unwrap();
     if renewal == Tick::Installed {
-        // Pebble v2.8.0 uses rand.Intn(100) > authzReusePercent: even 0
-        // permits a 1% reuse. A successful reused authz bypasses DNS correctly.
+        // An explicitly supplied, unpatched Pebble can reuse at 0% (upstream
+        // off-by-one). The pinned lab patch removes that nondeterminism; required
+        // verification still fails if this target outage was skipped.
         assert!(manager.ready());
         assert_eq!(provider.creates.load(Ordering::Relaxed), 1);
         assert_ne!(std::fs::read(&pointer).unwrap(), generation);
@@ -626,6 +643,15 @@ async fn exercise(eab: bool, scenario: &str) {
         return;
     }
     assert_eq!(renewal, Tick::RetryScheduled);
+    assert_eq!(
+        provider.preparation_failures.load(Ordering::Relaxed),
+        1,
+        "outage must reach the intended read-only phase"
+    );
+    assert_eq!(
+        journal(&config.state_dir)["leases"][0]["phase"],
+        "Preparing"
+    );
     assert!(manager.ready());
     assert_eq!(std::fs::read(&pointer).unwrap(), generation);
     let retry = manager.next_attempt();
@@ -640,8 +666,7 @@ async fn exercise(eab: bool, scenario: &str) {
     patch_journal(&config.state_dir, |state| state["next_attempt"] = json!(0));
     provider.fail.store(false, Ordering::Relaxed);
     let mut manager = Manager::open(&config, provider.clone(), http.clone()).unwrap();
-    let live_slot = manager.slot.clone();
-    let prior = live_slot.current(acme::now()).unwrap();
+    let prior = manager.current(acme::now()).unwrap().clone();
     assert_eq!(
         manager.tick().await.unwrap(),
         Tick::Installed,
@@ -650,14 +675,14 @@ async fn exercise(eab: bool, scenario: &str) {
     );
     assert_ne!(std::fs::read(&pointer).unwrap(), generation);
     assert!(manager.ready());
-    assert!(!Arc::ptr_eq(
-        &prior,
-        &live_slot.current(acme::now()).unwrap()
-    ));
+    assert_ne!(
+        prior.material().key_pem,
+        manager.current(acme::now()).unwrap().material().key_pem
+    );
     assert_eq!(prior.material().key_pem, original_key);
     assert_eq!(journal(&config.state_dir)["account"], account);
     assert_eq!(journal(&config.state_dir)["account_id"], account_id);
-    assert_eq!(old.material().key_pem, original_key); // Existing Arc remains valid.
+    assert_eq!(old.material().key_pem, original_key); // A copied verified bundle remains valid.
     assert!(
         journal(&config.state_dir)["leases"]
             .as_array()
@@ -776,6 +801,7 @@ async fn worker(path: &Path) {
         dns: options["dns"].as_str().unwrap().parse().unwrap(),
         fail: Arc::new(AtomicBool::new(false)),
         creates: Arc::new(AtomicUsize::new(0)),
+        preparation_failures: Arc::new(AtomicUsize::new(0)),
         cleanups: Arc::new(AtomicUsize::new(0)),
         gate: Arc::new(tokio::sync::Semaphore::new(100)),
         started: Arc::new(tokio::sync::Notify::new()),
@@ -886,9 +912,19 @@ async fn barrier_experiment(
             case.journal(&config.state_dir, "after-crash-before-restart");
             process = spawn("restart");
             case.event("worker_restarted", json!({"pid":process.0.id()}));
+            // Observe restored durable state, not a cleanup that must not happen.
             tokio::time::timeout(Duration::from_secs(10), async {
-                while !manifest.with_extension("cleanup").exists() {
+                loop {
                     assert!(process.0.try_wait().unwrap().is_none());
+                    let j = journal(&config.state_dir);
+                    if j["account_key"] == before["account_key"]
+                        && j["order"]["url"] == before["order"]["url"]
+                        && std::fs::read_to_string(case.path().join("worker-restart.stderr.log"))
+                            .unwrap()
+                            .contains("control_restored")
+                    {
+                        break;
+                    }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
@@ -914,8 +950,18 @@ async fn barrier_experiment(
             )
             .await
             .unwrap();
-    std::fs::write(barrier.join("release"), b"release").unwrap();
     let deleted_before_validation = manifest.with_extension("cleanup").exists();
+    assert!(
+        !deleted_before_validation,
+        "no cleanup while CA validation is blocked"
+    );
+    assert_eq!(canceled["leases"].as_array().unwrap().len(), 1);
+    assert_eq!(canceled["order"]["url"], before["order"]["url"]);
+    case.event(
+        "validation_retained_before_release",
+        json!({"lease_phase":canceled["leases"][0]["phase"]}),
+    );
+    std::fs::write(barrier.join("release"), b"release").unwrap();
     case.event(
         "validation_barrier_released",
         json!({"leases_remaining":canceled["leases"].as_array().unwrap().len(),"dns_deleted_before_ca_query":deleted_before_validation}),
@@ -933,6 +979,54 @@ async fn barrier_experiment(
     .await
     .unwrap();
     let status = order.state().status;
+    assert!(matches!(
+        status,
+        instant_acme::OrderStatus::Ready
+            | instant_acme::OrderStatus::Processing
+            | instant_acme::OrderStatus::Valid
+    ));
+    if process.0.try_wait().unwrap().is_some() {
+        let mut manager = Manager::open(config, provider.clone(), http.clone()).unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                manager.cleanup().await.unwrap();
+                if journal(&config.state_dir)["leases"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+    } else {
+        tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                // Provider completion precedes the Manager's durable journal rewrite.
+                if manifest.with_extension("cleanup").exists()
+                    && journal(&config.state_dir)["leases"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    assert!(
+        journal(&config.state_dir)["leases"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "finished validation must eventually release DNS ownership"
+    );
     case.event("original_order_after_authority",json!({"url":order_url,"status":format!("{status:?}"),"state":format!("{:?}",order.state())}));
     if process.0.try_wait().unwrap().is_none() {
         let _ = Command::new("kill")

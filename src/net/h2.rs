@@ -191,7 +191,7 @@ async fn process(
                 decoder.finish()?;
                 write.shutdown().await?;
                 activity.touch();
-                Ok::<_, crate::acme::Error>(())
+                Ok::<_, crate::Error>(())
             };
             let download = async {
                 let mut download = TunnelDownload::new(framed)?;
@@ -201,7 +201,7 @@ async fn process(
                     send_body(&mut writer, bytes, false, &activity).await?;
                 }
                 send_body(&mut writer, Bytes::new(), true, &activity).await?;
-                Ok::<_, crate::acme::Error>(())
+                Ok::<_, crate::Error>(())
             };
             activity
                 .run(app.idle, async {

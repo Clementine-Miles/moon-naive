@@ -8,10 +8,7 @@ use boring::{
         store::X509StoreBuilder, verify::X509CheckFlags,
     },
 };
-use std::{
-    path::Path,
-    sync::{Arc, RwLock},
-};
+use std::path::Path;
 
 // No Debug: key material must not enter diagnostic logs.
 #[derive(Clone)]
@@ -62,27 +59,6 @@ impl Lifetime {
     pub fn renew_at(self, window: u64) -> u64 {
         self.not_after
             .saturating_sub(window.min(self.not_after.saturating_sub(self.not_before) / 3))
-    }
-}
-
-#[derive(Clone, Default)]
-pub struct CertificateSlot(Arc<RwLock<Option<Arc<VerifiedBundle>>>>);
-impl CertificateSlot {
-    /// Startup recovery only: caller must read the durable CURRENT generation
-    /// and cryptographically validate it before publishing.
-    pub fn restore(&self, bundle: VerifiedBundle) {
-        *self
-            .0
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(bundle));
-    }
-    pub fn current(&self, now: u64) -> Option<Arc<VerifiedBundle>> {
-        let current = self
-            .0
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        current.filter(|bundle| bundle.lifetime().valid_at(now))
     }
 }
 
@@ -447,29 +423,40 @@ mod tests {
 #[cfg(test)]
 mod snapshot_tests {
     use super::*;
-    fn bundle(expiry: u64) -> VerifiedBundle {
-        VerifiedBundle::from_validator(
-            Candidate {
-                chain_pem: vec![1],
-                key_pem: vec![2],
-            },
-            Lifetime {
-                not_before: 0,
-                not_after: expiry,
-            },
-        )
-        .unwrap()
-    }
-    #[test]
-    fn swap_keeps_existing_snapshot_and_expires_current() {
-        let slot = CertificateSlot::default();
-        assert!(slot.current(0).is_none());
-        slot.restore(bundle(90));
-        let old = slot.current(0).unwrap();
-        slot.restore(bundle(180));
-        assert_eq!(old.lifetime().not_after, 90);
-        assert_eq!(slot.current(0).unwrap().lifetime().not_after, 180);
-        assert!(slot.current(180).is_none());
+    #[tokio::test]
+    async fn swap_keeps_existing_snapshot_and_expires_current() {
+        use crate::acme::{
+            lab::{Environment, Mode},
+            manager::{Manager, Tick},
+        };
+        let env = Environment::start("manager-certificate-ownership", Mode::Normal).await;
+        let config = env.config();
+        env.install_old(&config);
+        let provider = env.provider("none");
+        env.seed(&config, &*provider);
+        let mut manager = Manager::open(&config, provider, env.http()).unwrap();
+        let old = manager.current(crate::acme::now()).unwrap().clone();
+        assert_eq!(manager.tick().await.unwrap(), Tick::Installed);
+        assert_ne!(
+            old.material().key_pem,
+            manager
+                .current(crate::acme::now())
+                .unwrap()
+                .material()
+                .key_pem
+        );
+        assert!(
+            manager
+                .current(
+                    manager
+                        .current(crate::acme::now())
+                        .unwrap()
+                        .lifetime()
+                        .not_after
+                )
+                .is_none()
+        );
+        assert!(!old.lifetime().valid_at(old.lifetime().not_after));
     }
     #[test]
     fn renewal_window_keeps_two_thirds_of_short_certificate_lifetime() {

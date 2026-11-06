@@ -21,6 +21,25 @@ use tokio::{
     net::TcpStream,
 };
 
+#[derive(Debug)]
+pub(crate) struct ApiFailure {
+    pub status: u16,
+    pub response: serde_json::Value,
+}
+impl std::fmt::Display for ApiFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DNS/control API returned HTTP {}", self.status)
+    }
+}
+impl std::error::Error for ApiFailure {}
+/// Structured authentication/permission rejection, not an ambiguous transport/5xx failure.
+pub(crate) fn mutation_rejected(error: &super::Error) -> bool {
+    error.downcast_ref::<ApiFailure>().is_some_and(|e| {
+        matches!(e.status, 401 | 403)
+            && (e.response["success"] == false || e.response["status"] == "ERROR")
+    })
+}
+
 trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 type BoxIo = Box<dyn Io>;
@@ -29,7 +48,6 @@ type BoxIo = Box<dyn Io>;
 pub struct Http {
     tls: SslConnector,
     pub retry_after: Arc<AtomicU64>,
-    pub last_status: Arc<AtomicU64>,
     timeout: Duration,
     allow_local_http: bool,
     #[cfg(test)]
@@ -50,7 +68,6 @@ impl Http {
         Ok(Self {
             tls: builder.build(),
             retry_after: Arc::new(AtomicU64::new(0)),
-            last_status: Arc::new(AtomicU64::new(0)),
             timeout,
             allow_local_http: false,
             #[cfg(test)]
@@ -108,10 +125,10 @@ impl Http {
             if proxy.scheme_str() != Some("http") {
                 return Err("HTTPS proxy must use an HTTP CONNECT endpoint".into());
             }
-            let stream = TcpStream::connect((
+            let stream = control_socket(
                 proxy.host().ok_or("proxy host missing")?,
                 proxy.port_u16().unwrap_or(80),
-            ))
+            )
             .await?;
             let (mut sender, connection) =
                 hyper::client::conn::http1::handshake::<_, Full<Bytes>>(TokioIo::new(stream))
@@ -141,7 +158,7 @@ impl Http {
             drop(task);
             Box::new(TokioIo::new(upgraded))
         } else {
-            Box::new(TcpStream::connect((host, port)).await?)
+            Box::new(control_socket(host, port).await?)
         };
         let io: BoxIo = if secure {
             Box::new(
@@ -176,25 +193,19 @@ impl Http {
             header::HeaderValue::from_static("close"),
         );
         let response = sender.send_request(request).await?;
-        self.last_status
-            .store(u64::from(response.status().as_u16()), Ordering::Relaxed);
-        if let Some(value) = response
-            .headers()
-            .get(header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
+        // The protocol client still receives Problems (including badNonce).
+        // Never turn unrepresentable remote input into a saturated durable date.
+        if let instant_acme::RetryAfter::At(at) = instant_acme::parse_retry_after(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            std::time::SystemTime::now(),
+        ) && let Ok(duration) = at.duration_since(UNIX_EPOCH)
         {
-            let now = super::now();
-            let until = value
-                .parse::<u64>()
-                .map(|n| now.saturating_add(n))
-                .ok()
-                .or_else(|| {
-                    httpdate::parse_http_date(value)
-                        .ok()?
-                        .duration_since(UNIX_EPOCH)
-                        .ok()
-                        .map(|d| d.as_secs())
-                });
+            let until = duration
+                .as_secs()
+                .checked_add(u64::from(duration.subsec_nanos() != 0));
             if let Some(until) = until {
                 self.retry_after.fetch_max(until, Ordering::Relaxed);
             }
@@ -241,15 +252,27 @@ impl Http {
                     .body(Full::new(Bytes::from(bytes)))?,
             )
             .await?;
-        if !response.status().is_success() {
-            return Err("DNS/control API returned a failure status".into());
-        }
+        let status = response.status();
         let body = response.into_body().collect().await?.to_bytes();
+        if !status.is_success() {
+            return Err(Box::new(ApiFailure {
+                status: status.as_u16(),
+                response: serde_json::from_slice(&body).unwrap_or_default(),
+            }));
+        }
         if body.is_empty() {
             return Ok(serde_json::Value::Null);
         }
         Ok(serde_json::from_slice(&body)?)
     }
+}
+// A cancelled HTTP waiter must not release a running system resolver job.
+async fn control_socket(host: &str, port: u16) -> std::io::Result<TcpStream> {
+    let addresses: Vec<_> = crate::resolve::lookup_control(host, port).await?.collect();
+    if addresses.is_empty() || addresses.len() > 32 {
+        return Err(std::io::Error::other("invalid control DNS candidate count"));
+    }
+    TcpStream::connect(addresses.as_slice()).await
 }
 struct AbortTask(tokio::task::JoinHandle<()>);
 impl Drop for AbortTask {

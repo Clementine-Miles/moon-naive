@@ -3,9 +3,7 @@ mod congestion;
 mod egress;
 mod h2;
 mod h3;
-mod outbound;
 mod redirect;
-pub(crate) mod resolve;
 mod resources;
 mod site;
 #[cfg(test)]
@@ -13,7 +11,7 @@ mod tests;
 pub(crate) mod tls;
 mod tunnel;
 
-use crate::acme::Result;
+use crate::Result;
 use bytes::Bytes;
 use moon_naive_core::{
     auth::Credentials,
@@ -171,7 +169,7 @@ pub(crate) enum Plan {
     Website(Head),
     Forward(Head, Arc<site::Site>),
     Tunnel {
-        target: outbound::Stream,
+        target: egress::Stream,
         framed: Option<moon_naive_core::codec::Mode>,
         response: Reply,
         _permit: resources::TunnelLease,
@@ -224,7 +222,7 @@ impl App {
             users: Vec<moon_naive_core::config::User>,
         }
         let users = if config.proxy.users.is_empty() {
-            crate::acme::state::load_toml::<Users>(&config.credentials_file, 512 * 1024)?
+            crate::acme::persist::load_toml::<Users>(&config.credentials_file, 512 * 1024)?
         } else {
             Users {
                 users: config.proxy.users.clone(),
@@ -249,7 +247,7 @@ impl App {
         )?;
         let stats = Arc::new(Stats::default());
         let resources = resources::Resources::new(config, users.users.len())?;
-        let mut site = site::Site::load(config)?;
+        let mut site = site::Site::load(config, resources.tunnels.clone())?;
         site.buffers = resources.buffers.clone();
         Ok(Self {
             credentials,
@@ -456,7 +454,7 @@ impl Prepared {
         tls.current()?;
         if let Ok(Ok(addresses)) = tokio::time::timeout(
             Duration::from_secs(5),
-            crate::net::resolve::lookup(config.domain.as_str(), config.listener.tcp.port()),
+            crate::resolve::lookup(config.domain.as_str(), config.listener.tcp.port()),
         )
         .await
         {
@@ -533,7 +531,7 @@ impl Network {
         let reload_stop = shutdown.clone();
         tasks.spawn(async move {
             tls::watch(config, reload, reload_stop).await;
-            Ok::<_, crate::acme::Error>(false)
+            Ok::<_, crate::Error>(false)
         });
         let h3_app = app.clone();
         let h3_tls = tls.clone();

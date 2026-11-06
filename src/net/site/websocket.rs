@@ -1,6 +1,6 @@
 //! RFC 8441/9220 website WebSocket to fixed HTTP/1.1 origin Upgrade.
 use super::{Head, Reply, upstream};
-use crate::net::outbound::Stream;
+use crate::net::egress::Stream;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use moon_naive_core::{
     config::Config,
@@ -65,7 +65,12 @@ pub(crate) fn prepare<'a>(
         .position(|p| p.name == route.upstream)
         .ok_or(502u16)?;
     let peers = site.pools.get(index).ok_or(502u16)?;
-    let protocols = super::transform::protocols(head)?;
+    let protocols = super::transform::protocols(
+        head.headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("sec-websocket-protocol"))
+            .map(|(_, value)| value.as_slice()),
+    )?;
     Ok(Prepared {
         peers,
         protocols,
@@ -286,4 +291,39 @@ pub(crate) async fn connect(prepared: Prepared<'_>) -> Result<(Stream, Reply), u
         ));
     }
     Err(502)
+}
+
+/// Validate before admission and before opening an origin. Pingora owns the
+/// resulting Context lease until its entire upgraded duplex operation ends.
+pub(super) fn valid_h1_upgrade(req: &pingora_http::RequestHeader) -> bool {
+    req.method == http::Method::GET
+        && req.version == http::Version::HTTP_11
+        && req.headers.get_all("upgrade").iter().count() == 1
+        && req
+            .headers
+            .get("upgrade")
+            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
+        && req.headers.get_all("connection").iter().any(|v| {
+            v.to_str().is_ok_and(|s| {
+                s.split(',')
+                    .any(|v| v.trim().eq_ignore_ascii_case("upgrade"))
+            })
+        })
+        && req.headers.get_all("sec-websocket-version").iter().count() == 1
+        && req
+            .headers
+            .get("sec-websocket-version")
+            .is_some_and(|v| v == "13")
+        && req.headers.get_all("sec-websocket-key").iter().count() == 1
+        && req
+            .headers
+            .get("sec-websocket-key")
+            .is_some_and(|v| STANDARD.decode(v.as_bytes()).is_ok_and(|v| v.len() == 16))
+        && super::transform::protocols(
+            req.headers
+                .get_all("sec-websocket-protocol")
+                .iter()
+                .map(|v| v.as_bytes()),
+        )
+        .is_ok()
 }

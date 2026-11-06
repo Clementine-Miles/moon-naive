@@ -1,7 +1,8 @@
 //! The single supported operator interface for the daemon and ACME maintenance.
-use crate::acme::store::DiskStore;
+use crate::acme::persist::DiskStore;
 use crate::{
-    acme::{self, Result, certificate::Validator, http::Http},
+    Result,
+    acme::{self, certificate::Validator, http::Http},
     net::{self, Prepared},
     runtime::{self, Control, Mode},
 };
@@ -28,7 +29,7 @@ fn config(path: &str) -> Result<Arc<Config>> {
         || config.acme.eab.is_some()
     {
         // Reload through the private-file reader; parse exactly the checked bytes.
-        let bytes = crate::acme::state::read_private(Path::new(path), 1024 * 1024)?;
+        let bytes = crate::acme::persist::read_private(Path::new(path), 1024 * 1024)?;
         return Ok(Arc::new(Config::parse(
             std::str::from_utf8(&bytes).map_err(|_| "config must be UTF-8")?,
         )?));
@@ -38,7 +39,7 @@ fn config(path: &str) -> Result<Arc<Config>> {
 pub async fn run(args: &[String]) -> Result<()> {
     match args {
         [cmd, action, path] if cmd == "config" && action == "init" => {
-            acme::state::write_private_new(
+            acme::persist::write_private_new(
                 Path::new(path),
                 include_bytes!("../config.example.toml"),
             )?;
@@ -136,7 +137,7 @@ fn transport(config: &Config) -> Result<()> {
 fn certificate_status(config: &Config) -> Result<()> {
     let observation = config.state_dir.join("certificates/TLS-LOADED");
     if observation.exists() {
-        let text = acme::state::read_private(&observation, 4096)?;
+        let text = acme::persist::read_private(&observation, 4096)?;
         println!(
             "runtime_observation_may_be_stale=true\n{}",
             std::str::from_utf8(&text)?
@@ -160,7 +161,7 @@ async fn acme_command(args: &[String]) -> Result<()> {
     if let [cmd, input, output] = args
         && cmd == "import-eab"
     {
-        acme::eab::import_gcloud(Path::new(input), Path::new(output))?;
+        acme::account::import_gcloud(Path::new(input), Path::new(output))?;
         println!("eab_imported=true\nformat=toml\nnetwork_requests=false");
         return Ok(());
     }
@@ -237,7 +238,7 @@ fn migrate(old: &str, new: &str) -> Result<()> {
     if original.len() > 1024 * 1024 {
         return Err("configuration exceeds 1 MiB".into());
     }
-    let mut doc: toml::Value = crate::acme::state::parse_toml(&original)?;
+    let mut doc: toml::Value = crate::acme::persist::parse_toml(&original)?;
     if let Some(listener) = doc.get_mut("listener").and_then(toml::Value::as_table_mut) {
         for field in ["fast_open", "zero_rtt"] {
             if let Some(value) = listener.remove(field)
@@ -254,7 +255,7 @@ fn migrate(old: &str, new: &str) -> Result<()> {
         || source.acme.dns_credentials.is_some()
         || source.acme.eab.is_some()
     {
-        let checked = crate::acme::state::read_private(Path::new(old), 1024 * 1024)?;
+        let checked = crate::acme::persist::read_private(Path::new(old), 1024 * 1024)?;
         if checked != original {
             return Err("configuration changed during migration".into());
         }
@@ -264,7 +265,7 @@ fn migrate(old: &str, new: &str) -> Result<()> {
     table.insert("schema_version".into(), toml::Value::Integer(2));
     if !source.credentials_file.as_os_str().is_empty() {
         let users: toml::Value =
-            crate::acme::state::load_toml(&source.credentials_file, 512 * 1024)?;
+            crate::acme::persist::load_toml(&source.credentials_file, 512 * 1024)?;
         table
             .entry("proxy")
             .or_insert_with(|| toml::Value::Table(Default::default()))
@@ -283,17 +284,17 @@ fn migrate(old: &str, new: &str) -> Result<()> {
     if !source.acme.dns_token_file.as_os_str().is_empty() {
         acme.insert(
             "dns_credentials".into(),
-            crate::acme::state::load_toml(&source.acme.dns_token_file, 16384)?,
+            crate::acme::persist::load_toml(&source.acme.dns_token_file, 16384)?,
         );
         acme.remove("dns_token_file");
     }
     if let Some(path) = &source.acme.eab_credentials_file {
-        acme.insert("eab".into(), crate::acme::state::load_toml(path, 32768)?);
+        acme.insert("eab".into(), crate::acme::persist::load_toml(path, 32768)?);
         acme.remove("eab_credentials_file");
     }
     let text = toml::to_string_pretty(&doc).map_err(|_| "cannot encode configuration")?;
     Config::parse(&text)?;
-    acme::state::write_private_new(Path::new(new), text.as_bytes())?;
+    acme::persist::write_private_new(Path::new(new), text.as_bytes())?;
     println!("configuration migrated; source and ACME state unchanged");
     Ok(())
 }

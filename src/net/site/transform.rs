@@ -43,13 +43,11 @@ pub(super) fn metadata(
     Ok(())
 }
 
-pub(super) fn protocols(head: &super::Head) -> Result<Vec<String>, u16> {
+pub(super) fn protocols<'a>(
+    values: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<Vec<String>, u16> {
     let mut tokens = Vec::new();
-    for (_, value) in head
-        .headers
-        .iter()
-        .filter(|(n, _)| n.eq_ignore_ascii_case("sec-websocket-protocol"))
-    {
+    for value in values {
         for token in std::str::from_utf8(value).map_err(|_| 400u16)?.split(',') {
             let token = token.trim_matches([' ', '\t']);
             if !valid_token(token) || tokens.iter().any(|t| t == token) {

@@ -181,13 +181,6 @@ impl HttpSession {
         }
     }
 
-    fn maybe_force_close_body_reader(&mut self) {
-        if self.upgraded && self.received_upgrade_req_body && !self.body_reader.body_done() {
-            // request is done, reset the response body to close
-            self.body_reader.init_content_length(0, b"");
-        }
-    }
-
     /// Flush local buffer and notify the server by sending the last chunk if chunked encoding is
     /// used.
     pub fn set_request_trailers(&mut self, trailers: http::HeaderMap) -> Result<()> {
@@ -200,7 +193,9 @@ impl HttpSession {
             .await
             .or_err(WriteError, "flushing body")?;
 
-        self.maybe_force_close_body_reader();
+        if self.upgraded && self.received_upgrade_req_body {
+            self.underlying_stream.shutdown().await.or_err(WriteError,"half-closing upgraded request")?;
+        }
         Ok(res)
     }
 

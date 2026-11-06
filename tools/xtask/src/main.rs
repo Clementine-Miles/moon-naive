@@ -156,35 +156,34 @@ fn tested_suite(args: &[&str]) -> Result<()> {
     print!("{report}");
     check(passed > 0, "critical suite ran zero passing tests")
 }
-fn test_suites(isolated: bool) -> Result<()> {
-    if isolated {
-        tested_suite(&[
-            "test",
-            "--locked",
-            "--test",
-            "acme_pebble",
-            "--",
-            "--ignored",
-            "--test-threads=1",
-        ])
-    } else {
-        for args in [
-            vec!["test", "--locked", "-p", "moon-naive-core", "--lib"],
-            vec!["test", "--locked", "-p", "moon-naive", "--lib", "acme::"],
-            vec!["test", "--locked", "-p", "moon-naive", "--lib", "net::"],
-            vec!["test", "--locked", "--test", "cli"],
-        ] {
-            tested_suite(&args)?;
-        }
-        Ok(())
+fn laboratory(args: &[String]) -> Result<()> {
+    let mut command = Command::new("python3");
+    command
+        .arg(root().join("tools/acme-lab/run.py"))
+        .args(args)
+        .current_dir(root());
+    check(
+        command.status()?.success(),
+        "isolated laboratory failed; inspect its authoritative result.json",
+    )
+}
+fn test_suites() -> Result<()> {
+    for args in [
+        vec!["test", "--locked", "-p", "moon-naive-core", "--lib"],
+        vec!["test", "--locked", "-p", "moon-naive", "--lib", "acme::"],
+        vec!["test", "--locked", "-p", "moon-naive", "--lib", "net::"],
+        vec!["test", "--locked", "--test", "cli"],
+    ] {
+        tested_suite(&args)?;
     }
+    Ok(())
 }
 
 fn verify(target: Option<&str>, runner: Option<&[String]>) -> Result<()> {
     let root = root();
     audit::sources()?;
     if target.is_none() {
-        test_suites(false)?;
+        test_suites()?;
     }
     for mut args in [
         vec![
@@ -356,8 +355,9 @@ fn main() -> ExitCode {
     let args: Vec<_> = env::args().skip(1).collect();
     let result = match args.as_slice() {
         [cmd] if cmd == "verify" => verify(None, None),
-        [cmd] if cmd == "test" => test_suites(false),
-        [cmd] if cmd == "test-isolated" => test_suites(true),
+        [cmd] if cmd == "test" => test_suites(),
+        [cmd] if cmd == "test-isolated" => laboratory(&[]),
+        [cmd,args @ ..] if cmd == "lab" => laboratory(args),
         [cmd,target] if cmd=="verify"=>verify(Some(target), None),
         [cmd, target, runner @ ..] if cmd == "verify-run" && !runner.is_empty() => verify(Some(target), Some(runner)),
         [cmd] if cmd == "audit-native" => audit_native(),
@@ -366,7 +366,7 @@ fn main() -> ExitCode {
         [cmd,output] if cmd=="source"=>release::source(Path::new(output)),
         [cmd,binary] if cmd=="platform-smoke"=>release::platform_smoke(Path::new(binary),None),
         [cmd,binary,ca] if cmd=="platform-smoke"=>release::platform_smoke(Path::new(binary),Some(Path::new(ca))),
-        _ => Err("usage: cargo xtask test | test-isolated | verify [target] | verify-run <target> <runner> [runner-args...] | audit-native | check-elf <binary> | dist <binary> <output-dir> | source <output-dir> | platform-smoke <binary> [ca-bundle]".into()),
+        _ => Err("usage: cargo xtask lab [--only SUITE] [--run DIR] [--bootstrap] | test | test-isolated | verify [target] | verify-run <target> <runner> [runner-args...] | audit-native | check-elf <binary> | dist <binary> <output-dir> | source <output-dir> | platform-smoke <binary> [ca-bundle]".into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

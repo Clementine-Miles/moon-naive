@@ -116,7 +116,7 @@ async fn http_upstream_auth_and_coalesced_tunnel_bytes_are_preserved() {
         assert_eq!(&input, b"ping");
         stream.shutdown().await.unwrap();
     });
-    let upstream = outbound::NextHop::new(hop(ProxyKind::Http, addr.to_string())).unwrap();
+    let upstream = egress::NextHop::new(hop(ProxyKind::Http, addr.to_string())).unwrap();
     let mut stream = upstream
         .handshake(
             TcpStream::connect(addr).await.unwrap(),
@@ -159,7 +159,7 @@ async fn socks5_auth_ipv6_and_reply_boundary() {
             .await
             .unwrap();
     });
-    let upstream = outbound::NextHop::new(hop(ProxyKind::Socks5, addr.to_string())).unwrap();
+    let upstream = egress::NextHop::new(hop(ProxyKind::Socks5, addr.to_string())).unwrap();
     let mut stream = upstream
         .handshake(
             TcpStream::connect(addr).await.unwrap(),
@@ -609,7 +609,7 @@ async fn https_upstream_reuses_context_but_verifies_each_peer_and_new_generation
     let roots = f._root.path().join("next-hop-roots.crt");
     std::fs::copy(&f.ca, &roots).unwrap();
     config.ca_file = Some(roots.clone());
-    let upstream = Arc::new(outbound::NextHop::new(config.clone()).unwrap());
+    let upstream = Arc::new(egress::NextHop::new(config.clone()).unwrap());
     for _ in 0..2 {
         let clone = upstream.clone();
         let mut stream = clone
@@ -624,7 +624,7 @@ async fn https_upstream_reuses_context_but_verifies_each_peer_and_new_generation
         assert_eq!(&bytes, b"secure");
         if roots.exists() {
             std::fs::remove_file(&roots).unwrap();
-            assert!(outbound::NextHop::new(config.clone()).is_err());
+            assert!(egress::NextHop::new(config.clone()).is_err());
         }
     }
     // The already-used context must still reject a new peer with an untrusted CA.
@@ -641,7 +641,7 @@ async fn https_upstream_reuses_context_but_verifies_each_peer_and_new_generation
     config.ca_file = Some(f.ca.clone());
     config.tls_server_name = Some("wrong.example.test".into());
     assert!(
-        outbound::NextHop::new(config.clone())
+        egress::NextHop::new(config.clone())
             .unwrap()
             .handshake(
                 TcpStream::connect(address).await.unwrap(),
@@ -654,7 +654,7 @@ async fn https_upstream_reuses_context_but_verifies_each_peer_and_new_generation
     config.ca_file =
         Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/le-staging-roots.crt"));
     assert!(
-        outbound::NextHop::new(config)
+        egress::NextHop::new(config)
             .unwrap()
             .handshake(
                 TcpStream::connect(address).await.unwrap(),
@@ -699,7 +699,7 @@ async fn benchmark_https_next_hop_connect() {
     config.tls_server_name = Some("proxy.example.test".into());
     config.ca_file = Some(roots);
     let setup = std::time::Instant::now();
-    let upstream = outbound::NextHop::new(config).unwrap();
+    let upstream = egress::NextHop::new(config).unwrap();
     let setup_us = setup.elapsed().as_secs_f64() * 1_000_000.;
     let mut samples = Vec::new();
     let mut cold = 0.;
@@ -2067,4 +2067,255 @@ async fn websocket_backup_and_repeated_subprotocol_fields_preserve_raw_target() 
     stop.send(true).unwrap();
     task.await.unwrap().unwrap();
     connection.abort();
+}
+
+#[tokio::test]
+async fn mixed_h1_h2_h3_websocket_admission_holds_through_half_close() {
+    use base64::Engine;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let case = crate::acme::lab_support::Case::new("mixed-websocket-admission");
+    let mut f = fixture();
+    let opened = Arc::new(AtomicUsize::new(0));
+    let reject = Arc::new(AtomicBool::new(false));
+    let finish = Arc::new(tokio::sync::Semaphore::new(0));
+    let (closed, mut half_closed) = tokio::sync::mpsc::channel(8);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_addr = listener.local_addr().unwrap();
+    let origin = tokio::spawn({
+        let opened = opened.clone();
+        let reject = reject.clone();
+        let finish = finish.clone();
+        async move {
+            let mut jobs = tokio::task::JoinSet::new();
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                opened.fetch_add(1, Ordering::SeqCst);
+                let reject = reject.clone();
+                let finish = finish.clone();
+                let closed = closed.clone();
+                jobs.spawn(async move {
+                let mut head=Vec::new();while !head.ends_with(b"\r\n\r\n"){head.push(socket.read_u8().await.unwrap());}
+                if reject.swap(false,Ordering::SeqCst) {socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();return;}
+                let head=String::from_utf8(head).unwrap();let key=head.lines().find_map(|line|line.split_once(':').filter(|(k,_)|k.eq_ignore_ascii_case("sec-websocket-key")).map(|(_,v)|v.trim())).unwrap();
+                let accept=base64::engine::general_purpose::STANDARD.encode(boring::hash::hash(MessageDigest::sha1(),format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes()).unwrap());
+                socket.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n\r\nhello").as_bytes()).await.unwrap();
+                let mut input=Vec::new();let _=socket.read_to_end(&mut input).await;
+                closed.send(()).await.unwrap();
+                finish.acquire().await.unwrap().forget();
+                let _=socket.write_all(b"tail").await;let _=socket.shutdown().await;
+            });
+            }
+        }
+    });
+    let config = Arc::get_mut(&mut f.config).unwrap();
+    config.listener.h1 = true;
+    config.limits.max_streams = 1;
+    config.limits.max_connections = 16;
+    config.limits.max_total_receive_bytes = 256 * 1024 * 1024;
+    config.limits.idle_timeout_secs = 30;
+    config.website.upstreams[0].origins = vec![format!("http://{origin_addr}")];
+    let network = network(&f, None).await;
+    let tcp = network.tcp_addr().unwrap();
+    let udp = network.udp_addr().unwrap();
+    let app = network.app.clone();
+    let _capture = case.capture(&[tcp.port(), udp.port(), origin_addr.port()]);
+    let (stop, rx) = watch::channel(false);
+    let server = tokio::spawn(network.run(rx));
+    async fn h1(
+        f: &Fixture,
+        tcp: std::net::SocketAddr,
+    ) -> (tokio_boring::SslStream<TcpStream>, u16) {
+        let mut tls = SslConnector::builder(SslMethod::tls()).unwrap();
+        tls.set_ca_file(&f.ca).unwrap();
+        tls.set_alpn_protos(b"\x08http/1.1").unwrap();
+        let mut stream = tokio_boring::connect(
+            tls.build().configure().unwrap(),
+            "proxy.example.test",
+            TcpStream::connect(tcp).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        stream.write_all(b"GET /ws HTTP/1.1\r\nHost: proxy.example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(
+                tokio::time::timeout(Duration::from_secs(3), stream.read_u8())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let status = std::str::from_utf8(&head)
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        (stream, status)
+    }
+    fn h2ws() -> http::Request<()> {
+        let mut req = http::Request::builder()
+            .method("CONNECT")
+            .uri("https://proxy.example.test/ws")
+            .header("sec-websocket-version", "13")
+            .body(())
+            .unwrap();
+        req.extensions_mut()
+            .insert(::h2::ext::Protocol::from_static("websocket"));
+        req
+    }
+    async fn h3ws(q: &mut QClient) -> u64 {
+        let until = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            match q.send_headers(
+                &[
+                    quiche::h3::Header::new(b":method", b"CONNECT"),
+                    quiche::h3::Header::new(b":authority", b"proxy.example.test"),
+                    quiche::h3::Header::new(b":scheme", b"https"),
+                    quiche::h3::Header::new(b":path", b"/ws"),
+                    quiche::h3::Header::new(b":protocol", b"websocket"),
+                    quiche::h3::Header::new(b"sec-websocket-version", b"13"),
+                ],
+                false,
+            ) {
+                Ok(id) => return id,
+                Err(quiche::h3::Error::TransportError(quiche::Error::StreamLimit)) => {
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "QUIC stream credit deadline"
+                    );
+                    Box::pin(q.step()).await;
+                }
+                Err(error) => panic!("H3 headers failed: {error:?}"),
+            }
+        }
+    }
+    let (mut h2, driver) = h2_client(tcp, &f.ca).await;
+    let mut q = Box::pin(QClient::new(udp, &f.ca)).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !h2.sender.is_extended_connect_protocol_enabled() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !q.h3.as_ref().unwrap().extended_connect_enabled_by_peer() {
+            Box::pin(q.step()).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (mut one, status) = h1(&f, tcp).await;
+    assert_eq!(status, 101);
+    let mut hello = [0; 5];
+    one.read_exact(&mut hello).await.unwrap();
+    assert_eq!(&hello, b"hello");
+    assert_eq!(app.resources.tunnels.active(), 1);
+    let opened_before = opened.load(Ordering::SeqCst);
+    let (response, _) = h2.send_request(h2ws(), false).unwrap();
+    assert_eq!(response.await.unwrap().status(), 503);
+    let id = h3ws(&mut q).await;
+    assert_eq!(Box::pin(q.response(id)).await.status, 503);
+    let _ = q.conn.stream_shutdown(id, quiche::Shutdown::Write, 0x100);
+    Box::pin(q.step()).await;
+    assert_eq!(
+        opened.load(Ordering::SeqCst),
+        opened_before,
+        "full admission must prevent origin TCP opens"
+    );
+    one.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), half_closed.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        app.resources.tunnels.active(),
+        1,
+        "upload half-close must retain the duplex lease"
+    );
+    finish.add_permits(1);
+    let mut tail = [0; 4];
+    one.read_exact(&mut tail).await.unwrap();
+    assert_eq!(&tail, b"tail");
+    drop(one);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while app.resources.tunnels.active() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // H2 holds the same lease and also retains it after END_STREAM.
+    let (response, mut send) = h2.send_request(h2ws(), false).unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), 200);
+    let mut body = response.into_body();
+    assert_eq!(body.data().await.unwrap().unwrap(), "hello");
+    let opened_before = opened.load(Ordering::SeqCst);
+    assert_eq!(h1(&f, tcp).await.1, 503);
+    let id = h3ws(&mut q).await;
+    assert_eq!(Box::pin(q.response(id)).await.status, 503);
+    let _ = q.conn.stream_shutdown(id, quiche::Shutdown::Write, 0x100);
+    Box::pin(q.step()).await;
+    assert_eq!(opened.load(Ordering::SeqCst), opened_before);
+    send.send_data(Bytes::new(), true).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), half_closed.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(app.resources.tunnels.active(), 1);
+    finish.add_permits(1);
+    assert_eq!(super::body(body).await, b"tail");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while app.resources.tunnels.active() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // A rejected origin handshake must roll back the H1 lease.
+    reject.store(true, Ordering::SeqCst);
+    assert_eq!(h1(&f, tcp).await.1, 403);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while app.resources.tunnels.active() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let id = h3ws(&mut q).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while q.responses.get(&id).is_none_or(|r| r.body.len() < 5) {
+            Box::pin(q.step()).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(q.responses[&id].status, 200);
+    assert_eq!(app.resources.tunnels.active(), 1);
+    let opened_before = opened.load(Ordering::SeqCst);
+    assert_eq!(h1(&f, tcp).await.1, 503);
+    let (response, _) = h2.send_request(h2ws(), false).unwrap();
+    assert_eq!(response.await.unwrap().status(), 503);
+    assert_eq!(opened.load(Ordering::SeqCst), opened_before);
+    q.conn
+        .stream_shutdown(id, quiche::Shutdown::Read, 0x100)
+        .unwrap();
+    q.conn
+        .stream_shutdown(id, quiche::Shutdown::Write, 0x100)
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while app.resources.tunnels.active() != 0 {
+            Box::pin(q.step()).await;
+        }
+    })
+    .await
+    .unwrap();
+    finish.add_permits(8);
+    driver.abort();
+    stop.send(true).unwrap();
+    server.await.unwrap().unwrap();
+    origin.abort();
 }

@@ -80,3 +80,13 @@ This does not retry an HTTP request or change `error_while_proxy`/POST policy.
 A real TLS regression stalls the first connected address and verifies the second.
 The proxy also applies the peer's remaining total connection timeout around pool
 acquisition and HTTP-session initialization, before handing any request to it.
+
+Upgrade half-close correction (correctness consolidation): proxy_h1 no longer marks
+both directions complete when one upgraded direction reaches EOF, and does not
+idle-probe a completed upgraded upload. H1 client/server finish paths half-close
+the write stream without resetting the opposite body reader. The proxy-task API
+has the same rule. Full completion, errors and resets still terminate the session;
+upgraded connections are not reusable. The first-party mixed H1/H2/H3 admission
+regression holds the shared tunnel lease until the duplex operation finishes,
+including a delayed download after upload EOF. Ordinary framed HTTP behavior is
+unchanged. Only the three related Rust files were edited; no vendor reformat.

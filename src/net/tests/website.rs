@@ -115,6 +115,7 @@ async fn single_origin_config_routes_h2_h3_with_origin_host_and_original_path() 
 
 #[tokio::test]
 async fn website_pingora_streaming_proxy_reuses_pool_across_h2_h3_and_sanitizes_headers() {
+    let case = crate::acme::lab_support::Case::new("website-streaming");
     let mut f = fixture();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -180,6 +181,7 @@ async fn website_pingora_streaming_proxy_reuses_pool_across_h2_h3_and_sanitizes_
     let stats = server.app.site.stats().clone();
     let tcp = server.tcp_addr().unwrap();
     let udp = server.udp_addr().unwrap();
+    let _capture = case.capture(&[tcp.port(), udp.port(), address.port()]);
     let naive_stats = server.stats.clone();
     let (stop, rx) = watch::channel(false);
     let task = tokio::spawn(server.run(rx));
@@ -216,7 +218,16 @@ async fn website_pingora_streaming_proxy_reuses_pool_across_h2_h3_and_sanitizes_
     );
     assert_eq!(body(reply.into_body()).await, expected);
     upload.await.unwrap();
-    let mut q = QClient::new(udp, &f.ca).await;
+    let mut q = QClient::initial_with_keylog(udp, &f.ca, Some(&case.path().join("h3.keys"))).await;
+    // Observation must not enlarge the original request/handshake deadlines.
+    q.io_timeout = Duration::from_secs(5);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while q.h3.is_none() {
+            q.step().await;
+        }
+    })
+    .await
+    .unwrap();
     let id = qrequest(&mut q, "POST", "/api//echo", &untrusted, false);
     let bytes = vec![b'q'; 300_000];
     q.send(id, &bytes).await;
@@ -256,7 +267,15 @@ async fn website_pingora_streaming_proxy_reuses_pool_across_h2_h3_and_sanitizes_
             &[("accept-encoding", offer)],
             true,
         );
+        case.event(
+            "h3_compression_request",
+            serde_json::json!({"id":id,"offer":offer,"stats":format!("{:?}",q.conn.stats())}),
+        );
         let reply = q.response(id).await;
+        case.event(
+            "h3_compression_response",
+            serde_json::json!({"id":id,"status":reply.status,"bytes":reply.body.len()}),
+        );
         assert_eq!(reply.status, 200);
         assert_eq!(
             reply.headers.contains_key("content-encoding"),

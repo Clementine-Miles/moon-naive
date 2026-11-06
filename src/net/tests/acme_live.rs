@@ -233,6 +233,18 @@ async fn acme_tls_loaded_diagnostic_failure_does_not_block_activation() {
     std::fs::remove_file(&status).unwrap();
     std::fs::create_dir(&status).unwrap();
     let result = slot.refresh(&fixture.config);
+    assert_eq!(
+        slot.laboratory_report_failures(),
+        1,
+        "the real TLS-LOADED rename failure must be observed"
+    );
+    assert!(
+        std::fs::read_dir(fixture.config.state_dir.join("certificates"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")),
+        "failed status publication must remove temporary files"
+    );
     let after = slot.current().unwrap().id.clone();
     let h2 = observed_h2(tcp, &fixture.ca, &case).await;
     let mut h3 = QClient::new(udp, &fixture.ca).await;
@@ -265,8 +277,18 @@ async fn status_fault(stage: &'static str, after_load: bool) {
         )
         .unwrap();
     }
-    slot.laboratory_fail_record(stage, usize::from(after_load));
+    slot.laboratory_fail_record(stage, 0);
     let result = slot.refresh(&fixture.config);
+    assert_eq!(
+        slot.laboratory_fault_hits(),
+        1,
+        "intended diagnostic IO fault must be reached"
+    );
+    assert_eq!(slot.laboratory_report_failures(), 1);
+    assert!(
+        *result.as_ref().unwrap(),
+        "activation succeeds independently of reporting"
+    );
     let after = slot.current().unwrap().id.clone();
     case.event("status_fault",json!({"stage":stage,"after_load":after_load,"error":result.err().map(|e|e.to_string()),"before":before,"after":after,"CURRENT":pointers_current(&fixture.config),"TLS_LOADED":std::fs::read_to_string(fixture.config.state_dir.join("certificates/TLS-LOADED")).unwrap(),"evidence":"test-only injected io::Error at named syscall boundary"}));
     assert_ne!(
@@ -294,8 +316,23 @@ async fn acme_tls_status_failures_after_load_observe_partial_activation() {
 }
 
 #[tokio::test]
-async fn acme_control_panic_stops_network_with_valid_prior_certificate() {
-    let env = Environment::start("control-panic", Mode::Normal).await;
+async fn acme_control_panic_degrades_renewal_and_keeps_valid_network() {
+    renewal_degradation(true).await;
+}
+#[tokio::test]
+async fn acme_invalid_renewal_material_keeps_valid_network() {
+    renewal_degradation(false).await;
+}
+async fn renewal_degradation(panic: bool) {
+    let env = Environment::start(
+        if panic {
+            "control-panic"
+        } else {
+            "renewal-invalid"
+        },
+        Mode::Normal,
+    )
+    .await;
     env.state.lock().unwrap().domain = "proxy.example.test".into();
     let mut fixture = fixture();
     let config = Arc::get_mut(&mut fixture.config).unwrap();
@@ -313,11 +350,17 @@ async fn acme_control_panic_stops_network_with_valid_prior_certificate() {
         config.listener.tcp.port(),
         config.listener.udp.port(),
     ]);
-    let (_stop, rx) = watch::channel(false);
+    let (stop, rx) = watch::channel(false);
     let http = env.http();
+    let (release_exit, exit) = std::sync::mpsc::channel();
+    let provider = if panic {
+        env.panic_provider(exit)
+    } else {
+        env.provider("none")
+    };
     let task = tokio::spawn(crate::runtime::serve_with_provider(
         config.clone(),
-        env.provider("none"),
+        provider,
         http.clone(),
         rx,
     ));
@@ -332,20 +375,64 @@ async fn acme_control_panic_stops_network_with_valid_prior_certificate() {
     .await
     .unwrap();
     let cert = observed_h2(config.listener.tcp, &env.ca_file, &env.case).await;
-    env.state.lock().unwrap().mode = Mode::Retry("18446744073709551615");
-    let result = tokio::time::timeout(Duration::from_secs(12), task)
-        .await
-        .unwrap()
-        .unwrap();
+    env.state.lock().unwrap().mode = if panic {
+        Mode::Dns("normal")
+    } else {
+        Mode::Certificate(3 * 1024 * 1024)
+    };
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let events = std::fs::read_to_string(env.case.path().join("events.jsonl")).unwrap();
+            if panic && events.contains("control_fault") && events.contains("control_exit_blocked")
+            {
+                break;
+            }
+            if !panic {
+                let state = std::fs::read_dir(config.state_dir.join("acme"))
+                    .unwrap()
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .find(|p| p.extension().is_some_and(|s| s == "json"))
+                    .unwrap();
+                let journal: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(state).unwrap()).unwrap();
+                if journal["blocked_certificate"].is_object() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !task.is_finished(),
+        "valid network must outlive failed renewal control"
+    );
+    assert_eq!(
+        record_handshakes(&config, &env.ca_file, &env.case).await,
+        serial(&cert)
+    );
     let stored = DiskStore::open(&config.state_dir.join("certificates"))
         .unwrap()
         .read_current()
         .unwrap()
         .unwrap();
-    env.case.event("control_panic_outcome",json!({"result":result.as_ref().err().map(ToString::to_string),"certificate_sha256":fingerprint(&cert),"not_after":stored.lifetime.not_after,"now":crate::acme::now(),"active_hyper_drivers":http.laboratory_active_drivers()}));
-    assert!(result.is_err());
+    env.case.event("renewal_degradation_outcome",json!({"renewal":if panic {"stopped; no automatic Manager restart"} else {"blocked on bounded certificate evidence; controller remains healthy"},"certificate_sha256":fingerprint(&cert),"not_after":stored.lifetime.not_after,"now":crate::acme::now(),"active_hyper_drivers":http.laboratory_active_drivers()}));
     assert!(stored.lifetime.not_after > crate::acme::now());
-    assert!(TcpStream::connect(config.listener.tcp).await.is_err());
+    assert!(TcpStream::connect(config.listener.tcp).await.is_ok());
     assert_eq!(http.laboratory_active_drivers(), 0);
     env.case.journal(&config.state_dir, "after-control-panic");
+    stop.send(true).unwrap();
+    if panic {
+        env.case.event(
+            "shutdown_before_control_exit",
+            json!({"fault_reached":true}),
+        );
+        release_exit.send(()).unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(6), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }

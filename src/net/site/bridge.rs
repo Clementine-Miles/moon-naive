@@ -1,4 +1,6 @@
-//! H3 adapts to Pingora's H2 session over bounded memory, never a public listener.
+use std::time::Duration;
+use tokio::time::{Instant, timeout};
+// H3 adapts to Pingora's H2 session over bounded memory, never a public listener.
 use super::{Input, Proxy, Result};
 use bytes::Bytes;
 use pingora_core::{
@@ -26,7 +28,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf},
-    sync::{Notify, mpsc, watch},
+    sync::{Mutex, Notify, Semaphore, mpsc, watch},
     task::JoinHandle,
 };
 
@@ -195,7 +197,7 @@ impl Bridge {
         let (mut response, mut body) = sender.send_request(wire, end)?;
         let upload = async {
             if end {
-                return Ok::<_, crate::acme::Error>(());
+                return Ok::<_, crate::Error>(());
             }
             while let Some(event) = input.recv().await {
                 wake.notify_one();
@@ -222,7 +224,7 @@ impl Bridge {
                             return Err(error);
                         }
                         body.send_trailers(headers)?;
-                        return Ok::<_, crate::acme::Error>(());
+                        return Ok::<_, crate::Error>(());
                     }
                 }
             }
@@ -278,7 +280,7 @@ impl Bridge {
                 }
                 wake.notify_one();
             }
-            Ok::<_, crate::acme::Error>(())
+            Ok::<_, crate::Error>(())
         };
         complete_exchange(upload, download, &response_started).await
     }
@@ -306,12 +308,110 @@ async fn complete_exchange(
     }
 }
 
+#[derive(Debug)]
+struct MemorySocket(DuplexStream);
+impl VirtualSocket for MemorySocket {
+    fn set_socket_option(&self, _opt: VirtualSockOpt) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl AsyncRead for MemorySocket {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+    }
+}
+impl AsyncWrite for MemorySocket {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+    }
+}
+
+pub(super) struct Generations<T> {
+    state: Mutex<State<T>>,
+    waiting: Semaphore,
+    closed: Arc<AtomicBool>,
+}
+struct State<T> {
+    current: Option<Arc<T>>,
+    retry_at: Instant,
+}
+impl<T> Generations<T> {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            state: Mutex::new(State {
+                current: None,
+                retry_at: Instant::now(),
+            }),
+            waiting: Semaphore::new(limit),
+            closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+    pub fn share_shutdown(&mut self, other: &Self) {
+        self.closed = other.closed.clone();
+    }
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.waiting.close();
+    }
+    pub async fn get<F, Fut>(&self, healthy: impl Fn(&T) -> bool, build: F) -> Result<Arc<T>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        // No unbounded queue of waiters behind the construction mutex.
+        let _permit = self
+            .waiting
+            .try_acquire()
+            .map_err(|_| "bridge admission unavailable")?;
+        timeout(Duration::from_secs(3), async {
+            let mut state = self.state.lock().await;
+            if self.closed.load(Ordering::Acquire) {
+                return Err("bridge stopped".into());
+            }
+            if let Some(current) = &state.current
+                && healthy(current)
+            {
+                return Ok(current.clone());
+            }
+            // Dropping our reference does not replay or abort a live request.
+            state.current = None;
+            if Instant::now() < state.retry_at {
+                return Err("bridge reconstruction cooling down".into());
+            }
+            // Set before awaiting: cancellation and construction failures also back off.
+            state.retry_at = Instant::now() + Duration::from_secs(1);
+            let next = Arc::new(build().await?);
+            if self.closed.load(Ordering::Acquire) {
+                return Err("bridge stopped".into());
+            }
+            state.current = Some(next.clone());
+            Ok(next)
+        })
+        .await
+        .map_err(|_| "bridge acquisition deadline")?
+    }
+}
+
 #[cfg(test)]
 mod completion_tests {
     use super::*;
     #[tokio::test(start_paused = true)]
     async fn terminated_driver_is_replaced_without_replaying_post() {
-        use super::super::{Site, generation::Generations};
+        use super::super::{Site, bridge::Generations};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let config = moon_naive_core::config::Config::parse(
@@ -319,7 +419,11 @@ mod completion_tests {
                 .replace("127.0.0.1:8080", &addr.to_string()),
         )
         .unwrap();
-        let site = Site::load(&config).unwrap();
+        let site = Site::load(
+            &config,
+            moon_naive_core::policy::Budget::new(config.limits.max_streams).unwrap(),
+        )
+        .unwrap();
         let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = requests.clone();
         let origin = tokio::spawn(async move {
@@ -502,34 +606,99 @@ mod completion_tests {
     }
 }
 
-#[derive(Debug)]
-struct MemorySocket(DuplexStream);
-impl VirtualSocket for MemorySocket {
-    fn set_socket_option(&self, _opt: VirtualSockOpt) -> std::io::Result<()> {
-        Ok(())
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    fn healthy(value: &AtomicBool) -> bool {
+        value.load(Ordering::Relaxed)
     }
-}
-impl AsyncRead for MemorySocket {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+    #[tokio::test(start_paused = true)]
+    async fn failed_construction_cools_down_then_recovers() {
+        let slot = Generations::new(4);
+        assert!(
+            slot.get(healthy, || async { Err("injected".into()) })
+                .await
+                .is_err()
+        );
+        assert!(
+            slot.get(healthy, || async { panic!("backoff bypassed") })
+                .await
+                .is_err()
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let first = slot
+            .get(healthy, || async { Ok(AtomicBool::new(true)) })
+            .await
+            .unwrap();
+        first.store(false, Ordering::Relaxed);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let next = slot
+            .get(healthy, || async { Ok(AtomicBool::new(true)) })
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &next));
     }
-}
-impl AsyncWrite for MemorySocket {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_failure_has_one_replacement_and_bounded_retention() {
+        let slot = Arc::new(Generations::new(32));
+        let builds = Arc::new(AtomicUsize::new(0));
+        let mut previous: Option<std::sync::Weak<AtomicBool>> = None;
+        for _ in 0..64 {
+            let mut tasks = tokio::task::JoinSet::new();
+            for _ in 0..16 {
+                let slot = slot.clone();
+                let builds = builds.clone();
+                tasks.spawn(async move {
+                    slot.get(healthy, || async {
+                        builds.fetch_add(1, Ordering::Relaxed);
+                        tokio::task::yield_now().await;
+                        Ok(AtomicBool::new(true))
+                    })
+                    .await
+                    .unwrap()
+                });
+            }
+            let first = tasks.join_next().await.unwrap().unwrap();
+            if let Some(old) = previous.take() {
+                assert!(old.upgrade().is_none());
+            }
+            while let Some(next) = tasks.join_next().await {
+                assert!(Arc::ptr_eq(&first, &next.unwrap()));
+            }
+            assert_eq!(Arc::strong_count(&first), 2);
+            first.store(false, Ordering::Relaxed);
+            previous = Some(Arc::downgrade(&first));
+            drop(first);
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert_eq!(builds.load(Ordering::Relaxed), 64);
     }
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().0).poll_flush(cx)
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_constructor_releases_permit_and_shutdown_prevents_rebuild() {
+        let slot = Generations::new(1);
+        let mut pending = Box::pin(slot.get(healthy, std::future::pending));
+        tokio::select! { biased; _ = &mut pending => panic!("unexpected completion"), _ = tokio::task::yield_now() => {} }
+        drop(pending);
+        assert_eq!(slot.waiting.available_permits(), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        slot.get(healthy, || async { Ok(AtomicBool::new(true)) })
+            .await
+            .unwrap();
+        slot.close();
+        assert!(
+            slot.get(healthy, || async { panic!("construction after shutdown") })
+                .await
+                .is_err()
+        );
     }
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+    #[tokio::test(start_paused = true)]
+    async fn construction_deadline_releases_admission() {
+        let slot = Generations::new(1);
+        assert!(slot.get(healthy, std::future::pending).await.is_err());
+        assert_eq!(slot.waiting.available_permits(), 1);
+        slot.get(healthy, || async { Ok(AtomicBool::new(true)) })
+            .await
+            .unwrap();
     }
 }

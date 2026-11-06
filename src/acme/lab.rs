@@ -7,7 +7,7 @@ use super::{
     dns::DnsProvider,
     http::Http,
     manager::Manager,
-    state::{Journal, Order, State},
+    persist::{Journal, Order, State},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use boring::{
@@ -42,8 +42,10 @@ pub(crate) enum Mode {
     Nonce404,
     Order404,
     RecoverProcessing,
+    RecoveryRetry(&'static str),
     Dns(&'static str),
     Retry(&'static str),
+    AriRate(&'static str),
     Certificate(usize),
     CertificatePem(usize),
     CertificateKind(&'static str),
@@ -64,6 +66,7 @@ pub(crate) struct Mock {
     pub mode: Mode,
     pub requests: Vec<String>,
     pub creates: usize,
+    faults: usize,
     records: Vec<Value>,
     count: usize,
     nonce_rejected: usize,
@@ -218,6 +221,7 @@ impl Environment {
             mode,
             requests: vec![],
             creates: 0,
+            faults: 0,
             records: vec![],
             count: 0,
             nonce_rejected: 0,
@@ -280,6 +284,15 @@ impl Environment {
         config.state_dir = self.case.path().join("state");
         config
     }
+    pub(crate) fn panic_provider(
+        &self,
+        exit: std::sync::mpsc::Receiver<()>,
+    ) -> Box<dyn DnsProvider> {
+        Box::new(NoDns {
+            panic: Some(self.case.clone()),
+            exit_barrier: Some(exit),
+        })
+    }
     pub fn provider(&self, kind: &str) -> Box<dyn DnsProvider> {
         match kind {
             "cloudflare" => Box::new(super::dns::Cloudflare::laboratory(
@@ -290,7 +303,10 @@ impl Environment {
                 self.http(),
                 self.base.clone(),
             )),
-            _ => Box::new(NoDns),
+            _ => Box::new(NoDns {
+                panic: None,
+                exit_barrier: None,
+            }),
         }
     }
     pub fn seed(&self, config: &Config, provider: &dyn DnsProvider) {
@@ -345,25 +361,46 @@ impl Environment {
             .unwrap()
             .verify(candidate, super::now())
             .unwrap();
-        super::store::DiskStore::open(&config.state_dir.join("certificates"))
+        super::persist::DiskStore::open(&config.state_dir.join("certificates"))
             .unwrap()
             .install(&verified)
             .unwrap();
     }
 }
-struct NoDns;
+struct NoDns {
+    panic: Option<Case>,
+    exit_barrier: Option<std::sync::mpsc::Receiver<()>>,
+}
+impl Drop for NoDns {
+    fn drop(&mut self) {
+        if let Some(release) = self.exit_barrier.take() {
+            self.panic
+                .as_ref()
+                .unwrap()
+                .event("control_exit_blocked", json!({}));
+            let _ = release.recv();
+        }
+    }
+}
 #[async_trait::async_trait]
 impl DnsProvider for NoDns {
     fn identity(&self) -> String {
         "lab-none".into()
     }
-    async fn present(&mut self, _: &mut super::state::Lease) -> Result<()> {
+    async fn prepare(&mut self, _: &mut super::persist::Lease) -> Result<()> {
+        if let Some(case) = &self.panic {
+            case.event("control_fault", json!({"stage":"dns-prepare"}));
+            panic!("injected control provider panic");
+        }
+        Ok(())
+    }
+    async fn present(&mut self, _: &mut super::persist::Lease) -> Result<()> {
         Err("unexpected DNS creation".into())
     }
-    async fn propagated(&mut self, _: &super::state::Lease) -> Result<bool> {
+    async fn propagated(&mut self, _: &super::persist::Lease) -> Result<bool> {
         Ok(true)
     }
-    async fn cleanup(&mut self, _: &super::state::Lease) -> Result<()> {
+    async fn cleanup(&mut self, _: &super::persist::Lease) -> Result<()> {
         Ok(())
     }
 }
@@ -479,14 +516,19 @@ async fn respond(
             status = 404;
             problem("malformed")
         } else {
-            if let Mode::Retry(value) = &mode {
+            if let Mode::RecoveryRetry(value) = &mode {
+                extra.push(("retry-after".into(), (*value).into()));
+            }
+            if s.finalized
+                && let Mode::Retry(value) = &mode
+            {
                 extra.push(("retry-after".into(), (*value).into()));
             }
             order_state(
                 &s,
                 if matches!(mode, Mode::Dns(_)) {
                     "pending"
-                } else if mode == Mode::RecoverProcessing
+                } else if matches!(mode, Mode::RecoverProcessing | Mode::RecoveryRetry(_))
                     && s.requests
                         .iter()
                         .filter(|r| r.as_str() == "POST /order/1")
@@ -561,13 +603,18 @@ async fn respond(
     } else if path.starts_with("/renewal-info") {
         extra.push((
             "retry-after".into(),
-            if let Mode::Retry(v) = mode {
+            if let Mode::Retry(v) | Mode::AriRate(v) = mode {
                 v.into()
             } else {
                 "3600".into()
             },
         ));
-        json!({"suggestedWindow":{"start":"2030-01-01T00:00:00Z","end":"2020-01-01T00:00:00Z"}})
+        if matches!(mode, Mode::AriRate(_)) {
+            status = 429;
+            problem("rateLimited")
+        } else {
+            json!({"suggestedWindow":{"start":"2030-01-01T00:00:00Z","end":"2020-01-01T00:00:00Z"}})
+        }
     } else if path.starts_with("/zones/")
         || path.starts_with("/domain/")
         || path.starts_with("/dns/")
@@ -628,6 +675,7 @@ fn provider_response(
     let list = (path.contains("dns_records") && method == "GET") || path.contains("retrieve");
     let create = (path.ends_with("dns_records") && method == "POST") || path.contains("/create/");
     if (discovery && mode == &Mode::Dns("discover")) || (list && mode == &Mode::Dns("list")) {
+        s.faults += 1;
         *status = 503;
         return json!({"success":false,"status":"ERROR"});
     }
@@ -636,6 +684,7 @@ fn provider_response(
         if mode == &Mode::Dns("late") {
             return json!({"success":true,"result":{"id":"bbbb"},"status":"SUCCESS","id":"10"});
         }
+        s.faults += 1;
         *status = 403;
         return json!({"success":false,"status":"ERROR"});
     }
@@ -667,6 +716,12 @@ async fn dns_case(kind: &str, phase: &'static str) {
         json!({"result":format!("{result:?}"),"creates":env.state.lock().unwrap().creates}),
     );
     env.case.journal(&config.state_dir, "after-failure");
+    assert_eq!(result.unwrap(), super::manager::Tick::RetryScheduled);
+    assert_eq!(
+        env.state.lock().unwrap().faults,
+        1,
+        "named provider fault must be reached"
+    );
     assert_eq!(
         env.state.lock().unwrap().creates,
         usize::from(phase == "reject"),
@@ -739,13 +794,27 @@ async fn retry_case(value: &'static str, required: Option<Duration>) {
     let result = manager.tick().await;
     env.case.event("tick",json!({"result":format!("{result:?}"),"header":value,"first_poll_ms":env.state.lock().unwrap().poll_delay.map(|d|d.as_millis())}));
     env.case.journal(&config.state_dir, "after");
+    assert!(
+        env.state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|r| r == "POST /finalize/1"),
+        "the intended finalize stage must be exercised"
+    );
+    if value == "18446744073709551615" {
+        assert_eq!(result.unwrap(), super::manager::Tick::RetryScheduled);
+        return;
+    }
+    assert_eq!(result.unwrap(), super::manager::Tick::Installed);
     if let Some(required) = required {
         assert!(
             env.state
                 .lock()
                 .unwrap()
                 .poll_delay
-                .is_none_or(|delay| delay >= required),
+                .is_some_and(|delay| delay >= required),
             "initial certificate poll ignored finalize Retry-After: {value}"
         );
     }
@@ -783,7 +852,7 @@ async fn certificate_case(size: usize, pem: bool) {
     let provider = env.provider("none");
     env.seed(&config, &*provider);
     let mut manager = Manager::open(&config, provider, env.http()).unwrap();
-    let old = manager.slot.current(super::now()).unwrap();
+    let old = manager.current(crate::acme::now()).unwrap().clone();
     let result = manager.tick().await;
     let journal = env.case.journal(&config.state_dir, "after");
     assert!(
@@ -797,19 +866,35 @@ async fn certificate_case(size: usize, pem: bool) {
     );
     let rss = fs::read_to_string("/proc/self/status").unwrap();
     env.case.event("diagnostic",json!({"response_bytes":size,"pem":pem,"result":format!("{result:?}"),"old_certificate_valid":old.lifetime().valid_at(super::now()),"controller_ready":manager.ready(),"process_memory":rss.lines().filter(|s|s.starts_with("VmRSS:")||s.starts_with("VmHWM:")).collect::<Vec<_>>()}));
-    assert!(
-        result.is_ok(),
-        "diagnostic evidence must not suspend the controller via journal overflow"
-    );
-    if let Some(bytes) = journal
-        .pointer("/blocked_certificate/chain_pem")
-        .and_then(Value::as_array)
-    {
-        assert!(
-            bytes.len() <= 16384,
-            "diagnostic certificate evidence must be bounded before serialization: {}",
-            bytes.len()
+    let expected = if pem && size == 1024 * 1024 {
+        super::manager::Tick::Installed
+    } else {
+        super::manager::Tick::RetryScheduled
+    };
+    assert_eq!(result.unwrap(), expected);
+    assert!(manager.ready(), "prior valid service must remain available");
+    assert!(serde_json::to_vec(&journal).unwrap().len() < 128 * 1024);
+    if size <= 4 * 1024 * 1024 && !(pem && size == 1024 * 1024) {
+        let blocked = &journal["blocked_certificate"];
+        assert_eq!(blocked["original_bytes"], size);
+        assert_eq!(
+            blocked["chain_pem"].as_array().unwrap().len(),
+            size.min(16384)
         );
+        assert_eq!(blocked["sha256"].as_str().unwrap().len(), 64);
+        if !pem {
+            let digest: String = boring::sha::sha256(&vec![b'X'; size])
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            assert_eq!(
+                blocked["sha256"], digest,
+                "digest covers the whole response"
+            );
+        }
+        assert!(journal["order"].is_object());
+    } else {
+        assert!(journal["blocked_certificate"].is_null());
     }
 }
 macro_rules! cert_tests {($($name:ident,$size:expr,$pem:literal;)*)=>{$(#[tokio::test]async fn $name(){certificate_case($size,$pem).await;})*};}
@@ -840,6 +925,7 @@ async fn control_http_header_stall_releases_connection() {
     let result = http.request(request).await;
     env.case.event("timeout",json!({"elapsed_ms":started.elapsed().as_millis(),"error":result.as_ref().err().map(ToString::to_string)}));
     assert!(result.is_err());
+    assert_eq!(env.state.lock().unwrap().requests, ["GET /dir"]);
     assert!(started.elapsed() < Duration::from_secs(3));
 }
 
@@ -858,6 +944,11 @@ async fn nonce_case(rejects: usize, with_nonce: bool, success: bool) {
     let requests = env.state.lock().unwrap().requests.clone();
     env.case.event("nonce_result",json!({"rejects":rejects,"with_new_nonce":with_nonce,"result":format!("{result:?}"),"requests":requests}));
     env.case.journal(&config.state_dir, "after");
+    assert_eq!(
+        env.state.lock().unwrap().nonce_rejected,
+        rejects.min(5),
+        "badNonce injection must be exercised"
+    );
     if success {
         assert!(matches!(result, Ok(super::manager::Tick::Installed)));
     } else {
@@ -900,7 +991,7 @@ async fn ari_maximum_retry_after_does_not_panic() {
         )
         .await
         .unwrap();
-    let stored = super::store::DiskStore::open(&config.state_dir.join("certificates"))
+    let stored = super::persist::DiskStore::open(&config.state_dir.join("certificates"))
         .unwrap()
         .read_current()
         .unwrap()
@@ -922,6 +1013,8 @@ async fn transport_stall(kind: &str) {
     let env = Environment::start(&format!("transport-{kind}"), Mode::Normal).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    env.case
+        .event("server", json!({"port":port,"kind":"stalled-transport"}));
     let _capture = env.case.capture(&[env.port, port]);
     let kind = kind.to_owned();
     let tls = env.tls.clone();
@@ -1194,8 +1287,8 @@ async fn two_managers_contend_for_same_directory_without_corrupting_key() {
     let config = env.config();
     let provider = env.provider("none");
     env.seed(&config, &*provider);
-    let before = env.case.journal(&config.state_dir, "before");
     let manager = Manager::open(&config, provider, env.http()).unwrap();
+    let before = env.case.journal(&config.state_dir, "before");
     let second = Manager::open(&config, env.provider("none"), env.http());
     assert!(
         second.is_err(),
@@ -1250,17 +1343,20 @@ impl DnsProvider for BeforeCreate {
     fn identity(&self) -> String {
         self.provider.identity()
     }
-    async fn present(&mut self, _: &mut super::state::Lease) -> Result<()> {
+    async fn prepare(&mut self, _: &mut super::persist::Lease) -> Result<()> {
         self.entered.notify_one();
         std::future::pending().await
     }
-    async fn recover(&mut self, lease: &mut super::state::Lease) -> Result<()> {
+    async fn present(&mut self, lease: &mut super::persist::Lease) -> Result<()> {
+        self.provider.present(lease).await
+    }
+    async fn recover(&mut self, lease: &mut super::persist::Lease) -> Result<()> {
         self.provider.recover(lease).await
     }
-    async fn propagated(&mut self, lease: &super::state::Lease) -> Result<bool> {
+    async fn propagated(&mut self, lease: &super::persist::Lease) -> Result<bool> {
         self.provider.propagated(lease).await
     }
-    async fn cleanup(&mut self, lease: &super::state::Lease) -> Result<()> {
+    async fn cleanup(&mut self, lease: &super::persist::Lease) -> Result<()> {
         self.provider.cleanup(lease).await
     }
 }
@@ -1285,14 +1381,14 @@ async fn intent_cancel(kind: &str) {
         .await
         .unwrap();
     env.case
-        .journal(&config.state_dir, "durable-intent-before-present");
+        .journal(&config.state_dir, "preparation-before-mutation-intent");
     task.abort();
     let _ = task.await;
     assert_eq!(env.state.lock().unwrap().creates, 0);
     let mut manager = Manager::open(&config, env.provider(kind), env.http()).unwrap();
     let result = manager.cleanup().await;
     let after = env.case.journal(&config.state_dir, "after-cancel-restart");
-    env.case.event("intent_cancel",json!({"creates":0,"cleanup":format!("{result:?}"),"evidence":"request future canceled before provider present; Manager dropped and reopened"}));
+    env.case.event("intent_cancel",json!({"creates":0,"cleanup":format!("{result:?}"),"evidence":"read-only preparation canceled; Manager dropped and reopened"}));
     assert!(
         result.is_ok() && after["leases"].as_array().unwrap().is_empty(),
         "known pre-POST cancellation needs a recoverable preparation state"
@@ -1313,6 +1409,8 @@ async fn external_cancellation_closes_socket_and_owned_driver() {
     let env = Environment::start("http-external-cancel", Mode::Normal).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    env.case
+        .event("server", json!({"port":port,"kind":"cancelled-transport"}));
     let _capture = env.case.capture(&[port]);
     let tls = env.tls.clone();
     let (started, waiting) = tokio::sync::oneshot::channel();
@@ -1423,4 +1521,214 @@ async fn retry_after_beyond_operation_deadline_defers_without_early_poll() {
     assert_eq!(before["order"], after["order"]);
     assert!(after["next_attempt"].as_u64().unwrap() >= start + 119);
     assert!(env.state.lock().unwrap().poll_delay.is_none());
+}
+
+async fn uncertain_send_gap(kind: &str) {
+    let env = Environment::start(&format!("durable-send-gap-{kind}"), Mode::Dns("normal")).await;
+    let _capture = env.capture();
+    let config = env.config();
+    let provider = env.provider(kind);
+    env.seed(&config, &*provider);
+    let mut journal = env.case.journal(&config.state_dir, "before-gap");
+    journal["leases"] = json!([{"phase":"CreateUncertain","name":"_acme-challenge.acme.example.test","value":"pending-value","marker":"retained-gap-marker","record_id":null,"borrowed":false}]);
+    let path = fs::read_dir(config.state_dir.join("acme"))
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|s| s == "json"))
+        .unwrap();
+    fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+    let mut manager = Manager::open(&config, provider, env.http()).unwrap();
+    assert!(manager.cleanup().await.is_err());
+    let after = env.case.journal(&config.state_dir, "retained-gap");
+    assert_eq!(after["leases"], journal["leases"]);
+    assert_eq!(env.state.lock().unwrap().creates, 0);
+    env.case
+        .event("send_gap", json!({"empty_list_does_not_prove_unsent":true}));
+}
+#[tokio::test]
+async fn cloudflare_durable_send_gap_retains_uncertainty() {
+    uncertain_send_gap("cloudflare").await;
+}
+#[tokio::test]
+async fn porkbun_durable_send_gap_retains_uncertainty() {
+    uncertain_send_gap("porkbun").await;
+}
+
+async fn recovered_wait(header: &'static str, defer: bool) {
+    let env = Environment::start(
+        if defer {
+            "recovery-deferred"
+        } else {
+            "recovery-first-wait"
+        },
+        Mode::RecoveryRetry(header),
+    )
+    .await;
+    let _capture = env.capture();
+    let config = env.config();
+    let provider = env.provider("none");
+    env.seed(&config, &*provider);
+    let before = env.case.journal(&config.state_dir, "before");
+    {
+        let mut shared = env.state.lock().unwrap();
+        shared.finalized = true;
+        shared.csr = serde_json::from_value(before["order"]["csr"].clone()).unwrap();
+    }
+    let mut manager = Manager::open(&config, provider, env.http()).unwrap();
+    let result = manager.tick().await.unwrap();
+    let after = env.case.journal(&config.state_dir, "after");
+    let calls = env.state.lock().unwrap().requests.clone();
+    assert!(
+        !calls
+            .iter()
+            .any(|r| r == "POST /finalize/1" || r == "POST /new-order")
+    );
+    if defer {
+        assert_eq!(result, super::manager::Tick::RetryScheduled);
+        assert_eq!(before["order"], after["order"]);
+        assert_eq!(after["last_failure_phase"], "order-deferred");
+        assert!(after["next_attempt"].as_u64().unwrap() > super::now() + 100);
+        let n = calls.len();
+        drop(manager);
+        let mut reopened = Manager::open(&config, env.provider("none"), env.http()).unwrap();
+        assert_eq!(reopened.tick().await.unwrap(), super::manager::Tick::Idle);
+        assert_eq!(env.state.lock().unwrap().requests.len(), n);
+    } else {
+        assert_eq!(result, super::manager::Tick::Installed);
+        let events = fs::read_to_string(env.case.path().join("events.jsonl")).unwrap();
+        let times: Vec<_> = events
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .filter(|v| v["kind"] == "request" && v["data"]["path"] == "/order/1")
+            .map(|v| v["elapsed_us"].as_u64().unwrap())
+            .collect();
+        assert_eq!(times.len(), 2);
+        assert!(
+            times[1] - times[0] >= 1_900_000,
+            "recovered Processing order must inherit its first Retry-After"
+        );
+    }
+}
+#[tokio::test]
+async fn recovered_processing_preserves_first_retry_after() {
+    recovered_wait("2", false).await;
+}
+#[tokio::test]
+async fn deferred_order_wait_survives_restart() {
+    recovered_wait("120", true).await;
+}
+
+#[tokio::test]
+async fn cancellation_during_order_wait_preserves_restart_deadline() {
+    let env = Environment::start("cancel-poll-wait", Mode::RecoveryRetry("120")).await;
+    let _capture = env.capture();
+    let mut config = env.config();
+    config.acme.operation_timeout_secs = 300;
+    let provider = env.provider("none");
+    env.seed(&config, &*provider);
+    let before = env.case.journal(&config.state_dir, "before");
+    {
+        let mut shared = env.state.lock().unwrap();
+        shared.finalized = true;
+        shared.csr = serde_json::from_value(before["order"]["csr"].clone()).unwrap();
+    }
+    let mut manager = Manager::open(&config, provider, env.http()).unwrap();
+    let mut tick = Box::pin(manager.tick());
+    tokio::select! {
+        result = &mut tick => panic!("operation must still be waiting: {result:?}"),
+        _ = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let journal = env.case.journal(&config.state_dir, "waiting");
+                    if journal["next_attempt"].as_u64().unwrap() > super::now() + 100 { break; }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+        } => {}
+    }
+    drop(tick);
+    drop(manager);
+    let after = env.case.journal(&config.state_dir, "cancelled");
+    assert_eq!(before["order"], after["order"]);
+    let requests = env.state.lock().unwrap().requests.len();
+    let mut reopened = Manager::open(&config, env.provider("none"), env.http()).unwrap();
+    assert_eq!(reopened.tick().await.unwrap(), super::manager::Tick::Idle);
+    assert_eq!(env.state.lock().unwrap().requests.len(), requests);
+    env.case.event(
+        "cancelled_wait",
+        json!({"persisted_until":after["next_attempt"],"operation_budget":300}),
+    );
+}
+
+#[tokio::test]
+async fn outer_retry_after_overflow_does_not_persist_saturated_date() {
+    let env = Environment::start("outer-retry-overflow", Mode::Retry("18446744073709551615")).await;
+    let _capture = env.capture();
+    let config = env.config();
+    let provider = env.provider("none");
+    env.seed(&config, &*provider);
+    let mut manager = Manager::open(&config, provider, env.http()).unwrap();
+    assert_eq!(
+        manager.tick().await.unwrap(),
+        super::manager::Tick::RetryScheduled
+    );
+    let after = env.case.journal(&config.state_dir, "after");
+    assert!(after["next_attempt"].as_u64().unwrap() <= super::now() + 3);
+    assert!(
+        env.state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|r| r == "POST /finalize/1")
+    );
+}
+
+#[tokio::test]
+async fn ari_rate_limit_wait_is_not_capped_by_local_recheck_policy() {
+    let env = Environment::start("ari-rate-limit", Mode::Normal).await;
+    let _capture = env.capture();
+    let config = env.config();
+    let provider = env.provider("none");
+    env.seed(&config, &*provider);
+    let mut manager = Manager::open(&config, provider, env.http()).unwrap();
+    assert_eq!(
+        manager.tick().await.unwrap(),
+        super::manager::Tick::Installed
+    );
+    drop(manager);
+    env.state.lock().unwrap().mode = Mode::AriRate("100000");
+    let path = fs::read_dir(config.state_dir.join("acme"))
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|s| s == "json"))
+        .unwrap();
+    let mut journal: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    journal["ari_check_at"] = json!(0);
+    fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+    let mut manager = Manager::open(&config, env.provider("none"), env.http()).unwrap();
+    assert_eq!(manager.tick().await.unwrap(), super::manager::Tick::Idle);
+    let after = env.case.journal(&config.state_dir, "rate-limited");
+    assert!(after["ari_check_at"].as_u64().unwrap() >= super::now() + 99999);
+}
+
+#[test]
+fn retry_after_parser_distinguishes_missing_malformed_and_unrepresentable() {
+    use instant_acme::{RetryAfter, parse_retry_after};
+    let now = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    assert_eq!(parse_retry_after(None, now), RetryAfter::Absent);
+    assert_eq!(
+        parse_retry_after(Some("invalid"), now),
+        RetryAfter::Malformed
+    );
+    assert_eq!(
+        parse_retry_after(Some("2"), now),
+        RetryAfter::At(now + Duration::from_secs(2))
+    );
+    for header in ["18446744073709551615", "18446744073709551616"] {
+        assert_eq!(
+            parse_retry_after(Some(header), now),
+            RetryAfter::Unrepresentable
+        );
+    }
 }

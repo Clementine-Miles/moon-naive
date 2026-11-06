@@ -67,6 +67,7 @@ impl Account {
             .await?;
 
         let nonce = nonce_from_response(&rsp);
+        let retry_after = retry_after(&rsp);
         let order_url = rsp
             .parts
             .headers
@@ -96,7 +97,7 @@ impl Account {
         Ok(Order {
             account: self.inner.clone(),
             nonce,
-            retry_after: None,
+            retry_after,
             state,
             url: order_url.ok_or("no order URL found")?,
         })
@@ -109,14 +110,25 @@ impl Account {
     /// Returns an [`Order`] instance. Use the [`Order::state`] method to inspect its state.
     pub async fn order(&self, url: String) -> Result<Order, Error> {
         let rsp = self.inner.post(None::<&Empty>, None, &url).await?;
+        let status = rsp.parts.status.as_u16();
+        let nonce = nonce_from_response(&rsp);
+        let wait = retry_after(&rsp);
+        let state = Problem::check::<OrderState>(rsp)
+            .await
+            .map_err(|source| Error::Response {
+                method: Method::POST,
+                url: url.clone(),
+                status,
+                source: Box::new(source),
+            })?;
         Ok(Order {
             account: self.inner.clone(),
-            nonce: nonce_from_response(&rsp),
-            retry_after: None,
+            nonce,
+            retry_after: wait,
             // Order of fields matters! We return errors from Problem::check
             // before emitting an error if there is no order url. Or the
             // simple no url error hides the causing error in `Problem::check`.
-            state: Problem::check::<OrderState>(rsp).await?,
+            state,
             url,
         })
     }
@@ -168,16 +180,24 @@ impl Account {
             .header(USER_AGENT, CRATE_USER_AGENT)
             .body(BodyWrapper::default())?;
 
+        let url = format!("{renewal_info_url}/{certificate_id}");
         let rsp = self.inner.client.http.request(request).await?;
-        let Some(retry_after) = retry_after(&rsp) else {
-            return Err(Error::Str("missing Retry-After header"));
-        };
-
-        let delay = retry_after
-            .duration_since(SystemTime::now())
-            .unwrap_or(Duration::ZERO);
-
-        Ok((Problem::check::<RenewalInfo>(rsp).await?, delay))
+        let status = rsp.parts.status.as_u16();
+        let wait = retry_after(&rsp).deadline();
+        let outcome = Problem::check::<RenewalInfo>(rsp).await;
+        let parsed = (|| {
+            let info = outcome?;
+            let Some(at) = wait? else {
+                return Err(Error::Str("missing Retry-After header"));
+            };
+            Ok((info, at.duration_since(SystemTime::now()).unwrap_or(Duration::ZERO)))
+        })();
+        parsed.map_err(|source| Error::Response {
+            method: Method::GET,
+            url,
+            status,
+            source: Box::new(source),
+        })
     }
 
     /// Update the account's authentication key, reusing the existing [`CryptoProvider`]

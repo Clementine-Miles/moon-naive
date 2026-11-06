@@ -1,7 +1,8 @@
 //! One process, with ACME fsync and DNS control work on its own OS/runtime thread.
 use crate::{
+    Result,
     acme::{
-        self, Result,
+        self,
         dns::DnsProvider,
         http::Http,
         manager::{Manager, Tick},
@@ -55,26 +56,35 @@ impl Control {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()?;
-                    let result = runtime.block_on(async move {
-                        eprintln!("event=control_start phase=setup");
-                        let mut manager = factory()?;
-                        ready_send.send_replace(manager.ready());
-                        if mode == Mode::Check {
-                            return Ok(());
-                        }
-                        let result = control_loop(&mut manager, stop, &ready_send, mode).await;
-                        // Dropped operations leave their durable intent for restart recovery.
-                        let cleanup =
-                            tokio::time::timeout(Duration::from_secs(30), manager.cleanup())
-                                .await
-                                .map_err(|_| -> acme::Error {
-                                    "DNS cleanup deadline; journal retained".into()
-                                })
-                                .and_then(|result| result);
-                        result.and(cleanup)
-                    });
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        runtime.block_on(async move {
+                            eprintln!("event=control_start phase=setup");
+                            let mut manager = factory()?;
+                            eprintln!(
+                                "event=control_restored certificate_ready={} next_attempt={}",
+                                manager.ready(),
+                                manager.next_attempt()
+                            );
+                            ready_send.send_replace(manager.ready());
+                            if mode == Mode::Check {
+                                return Ok(());
+                            }
+                            let result = control_loop(&mut manager, stop, &ready_send, mode).await;
+                            // Dropped operations leave their durable intent for restart recovery.
+                            let cleanup =
+                                tokio::time::timeout(Duration::from_secs(30), manager.cleanup())
+                                    .await
+                                    .map_err(|_| -> crate::Error {
+                                        "DNS cleanup deadline; journal retained".into()
+                                    })
+                                    .and_then(|result| result);
+                            result.and(cleanup)
+                        })
+                    }));
                     runtime.shutdown_timeout(Duration::from_secs(1));
-                    result
+                    result.unwrap_or_else(|_| {
+                        Err("ACME control panicked; explicit state reconciliation required".into())
+                    })
                 })();
                 let _ = done_send.send(result);
             })?;
@@ -180,6 +190,7 @@ where
     let (stop, receive) = watch::channel(false);
     let mut control = factory(config, receive.clone())?;
     let mut ready = control.ready.clone();
+    let mut serving = false;
     let result=async {
         if !*ready.borrow() {notify("STATUS=Waiting for the initial certificate")?;eprintln!("event=certificate_wait listeners_opened=false");}
         while !*ready.borrow() {
@@ -194,13 +205,25 @@ where
             result=control.wait()=>{result?;return Err("ACME control stopped during startup".into());},
             result=prepared.bind()=>result?,
         };
+        serving = true;
         eprintln!("event=server_ready h2={} h3={} tls=boringssl quic=quiche",network.tcp_addr()?,network.udp_addr()?);
         notify("READY=1\nSTATUS=Serving H2/H3; automatic certificate renewal active")?;
         let network=network.run(receive);
         tokio::pin!(network);
         tokio::select! {biased;
             _=wait_stop(&mut shutdown)=>{notify("STOPPING=1\nSTATUS=Draining connections")?;let _=stop.send(true);network.await},
-            result=control.wait()=>{let _=stop.send(true);let _=network.await;result?;Err("ACME control stopped unexpectedly".into())},
+            result=control.wait()=>{
+                eprintln!("event=renewal_stopped reconcile_required=true detail={result:?}");
+                if let Err(error) = notify("STATUS=Network continues with TLS/ECH admission checks; renewal stopped, explicit reconciliation required") {
+                    eprintln!("event=renewal_status_report_failed detail={error}");
+                }
+                // Never resume the failed Manager or replay unknown side effects.
+                // Network admission continues to check inner and ECH expiry.
+                tokio::select! {
+                    _=wait_stop(&mut shutdown)=>{let _=stop.send(true);network.await},
+                    result=&mut network=>result,
+                }
+            },
             result=&mut network=>{result?;Err("network drivers stopped unexpectedly".into())},
         }
     }.await;
@@ -210,14 +233,23 @@ where
     } else {
         tokio::time::timeout(Duration::from_secs(35), control.wait())
             .await
-            .map_err(|_| -> acme::Error { "ACME shutdown deadline; journal retained".into() })
+            .map_err(|_| -> crate::Error { "ACME shutdown deadline; journal retained".into() })
             .and_then(|result| result)
     };
     eprintln!(
         "event=server_stopped clean={}",
         result.is_ok() && cleanup.is_ok()
     );
-    result.and(cleanup)
+    if serving {
+        if let Err(error) = cleanup {
+            eprintln!("event=renewal_cleanup_failed reconcile_required=true detail={error}");
+        }
+        // The same post-startup renewal failure must have the same consequence
+        // whether control.wait or the explicit network shutdown won the select.
+        result
+    } else {
+        result.and(cleanup)
+    }
 }
 fn notify(message: &str) -> Result<()> {
     let Some(path) = std::env::var_os("NOTIFY_SOCKET") else {

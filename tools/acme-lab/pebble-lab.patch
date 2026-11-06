@@ -114,3 +114,16 @@ index 23b9df4..a8b4a3a 100644
 +	info, err := os.Stat(path)
 +	return err == nil && info.IsDir()
 +}
+diff --git a/wfe/wfe.go b/wfe/wfe.go
+index 3d52ac3..e502711 100644
+--- a/wfe/wfe.go
++++ b/wfe/wfe.go
+@@ -1555,7 +1555,7 @@ func (wfe *WebFrontEndImpl) makeAuthorizations(order *core.Order, request *http.
+ 		// If there is an existing valid authz for this identifier, we can reuse it
+ 		authz := wfe.db.FindValidAuthorization(order.AccountID, ident)
+ 		// Otherwise create a new pending authz (and randomly not)
+-		if authz == nil || rand.Intn(100) > wfe.authzReusePercent {
++		if authz == nil || rand.Intn(100) >= wfe.authzReusePercent {
+ 			authz = &core.Authorization{
+ 				ID:          newToken(),
+ 				ExpiresDate: expires,

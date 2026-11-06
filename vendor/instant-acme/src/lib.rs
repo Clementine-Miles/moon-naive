@@ -197,18 +197,47 @@ fn nonce_from_response(rsp: &BytesResponse) -> Option<String> {
 ///
 /// Retry-After = HTTP-date / delay-seconds
 /// delay-seconds  = 1*DIGIT
-fn retry_after(rsp: &BytesResponse) -> Option<SystemTime> {
-    let value = rsp.parts.headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+/// Parsed Retry-After; malformed and unrepresentable input are distinct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetryAfter {
+    /// Header absent.
+    Absent,
+    /// Invalid syntax.
+    Malformed,
+    /// Absolute UTC not-before time.
+    At(SystemTime),
+    /// Valid delay syntax outside the clock range.
+    Unrepresentable,
+}
+/// Parse without saturating remote time input or panicking on overflow.
+pub fn parse_retry_after(value: Option<&str>, now: SystemTime) -> RetryAfter {
+    let Some(value) = value else { return RetryAfter::Absent; };
+    let value = value.trim();
     if value.is_empty() {
-        return None;
+        return RetryAfter::Malformed;
     }
-
-    Some(match u64::from_str(value) {
-        // `delay-seconds` is a number of seconds to wait
-        Ok(secs) => SystemTime::now() + Duration::from_secs(secs),
-        // `HTTP-date` looks like `Fri, 31 Dec 1999 23:59:59 GMT`
-        Err(_) => SystemTime::from(HttpDate::from_str(value).ok()?),
-    })
+    if value.bytes().all(|b| b.is_ascii_digit()) {
+        return value.parse::<u64>().ok()
+            .and_then(|secs| now.checked_add(Duration::from_secs(secs)))
+            .map(RetryAfter::At).unwrap_or(RetryAfter::Unrepresentable);
+    }
+    HttpDate::from_str(value).ok().map(|date| RetryAfter::At(date.into()))
+        .unwrap_or(RetryAfter::Malformed)
+}
+impl RetryAfter {
+    pub(crate) fn deadline(self) -> Result<Option<SystemTime>, Error> {
+        match self {
+            Self::At(at) => Ok(Some(at)),
+            Self::Absent | Self::Malformed => Ok(None),
+            Self::Unrepresentable => Err(Error::Str("unrepresentable Retry-After")),
+        }
+    }
+}
+fn retry_after(rsp: &BytesResponse) -> RetryAfter {
+    parse_retry_after(
+        rsp.parts.headers.get(RETRY_AFTER).and_then(|v| v.to_str().ok()),
+        SystemTime::now(),
+    )
 }
 
 /// Default HTTP client implementation using hyper and rustls

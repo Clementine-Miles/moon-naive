@@ -320,7 +320,7 @@ struct BridgeLimits {
     buffers: Option<Arc<super::resources::BufferPool>>,
 }
 async fn bridge_charged(
-    target: super::outbound::Stream,
+    target: super::egress::Stream,
     framed: Option<moon_naive_core::codec::Mode>,
     mut incoming: mpsc::Receiver<Bytes>,
     outgoing: mpsc::Sender<Bytes>,
@@ -341,7 +341,7 @@ async fn bridge_charged(
         decoder.finish()?;
         write.shutdown().await?;
         activity.touch();
-        Ok::<_, crate::acme::Error>(())
+        Ok::<_, crate::Error>(())
     };
     let download = async {
         let mut download = TunnelDownload::new(framed)?;
@@ -357,7 +357,7 @@ async fn bridge_charged(
         }
         drop(outgoing);
         wake.notify_one();
-        Ok::<_, crate::acme::Error>(())
+        Ok::<_, crate::Error>(())
     };
     activity
         .run(idle, async {
@@ -439,7 +439,7 @@ pub(super) async fn serve(
                 let ids: Vec<_> = client.streams.keys().copied().collect();
                 for id in ids {
                     let stream = client.streams.get_mut(&id).unwrap();
-                    if drive_stream(
+                    match drive_stream(
                         &mut client.conn,
                         h3,
                         id,
@@ -447,16 +447,18 @@ pub(super) async fn serve(
                         &app,
                         wake.clone(),
                         &mut body_buffer,
-                    )
-                    .is_err()
-                    {
-                        let _ = client
-                            .conn
-                            .stream_shutdown(id, quiche::Shutdown::Read, CANCEL);
-                        let _ = client
-                            .conn
-                            .stream_shutdown(id, quiche::Shutdown::Write, CANCEL);
-                        client.streams.remove(&id);
+                    ) {
+                        Ok(more) => send_again |= more,
+                        Err(_) => {
+                            let _ = client
+                                .conn
+                                .stream_shutdown(id, quiche::Shutdown::Read, CANCEL);
+                            let _ =
+                                client
+                                    .conn
+                                    .stream_shutdown(id, quiche::Shutdown::Write, CANCEL);
+                            client.streams.remove(&id);
+                        }
                     }
                 }
                 let mut poll_budget_exhausted = true;
@@ -544,8 +546,8 @@ pub(super) async fn serve(
                             }
                         }
                         Ok((id, quiche::h3::Event::Data)) => {
-                            if let Some(stream) = client.streams.get_mut(&id)
-                                && drive_stream(
+                            if let Some(stream) = client.streams.get_mut(&id) {
+                                match drive_stream(
                                     &mut client.conn,
                                     h3,
                                     id,
@@ -553,19 +555,22 @@ pub(super) async fn serve(
                                     &app,
                                     wake.clone(),
                                     &mut body_buffer,
-                                )
-                                .is_err()
-                            {
-                                client.streams.remove(&id);
-                                let _ =
-                                    client
-                                        .conn
-                                        .stream_shutdown(id, quiche::Shutdown::Read, CANCEL);
-                                let _ = client.conn.stream_shutdown(
-                                    id,
-                                    quiche::Shutdown::Write,
-                                    CANCEL,
-                                );
+                                ) {
+                                    Ok(more) => send_again |= more,
+                                    Err(_) => {
+                                        client.streams.remove(&id);
+                                        let _ = client.conn.stream_shutdown(
+                                            id,
+                                            quiche::Shutdown::Read,
+                                            CANCEL,
+                                        );
+                                        let _ = client.conn.stream_shutdown(
+                                            id,
+                                            quiche::Shutdown::Write,
+                                            CANCEL,
+                                        );
+                                    }
+                                }
                             }
                             // poll can report the same unread DATA repeatedly.
                             // The bounded stream scan retries when queue space opens.
@@ -715,6 +720,8 @@ fn recv_body(
     }
 }
 
+// True only when a bounded local drain made progress through its whole budget.
+// Flow control, empty queues and closed directions wait for external readiness.
 fn drive_stream(
     conn: &mut quiche::Connection,
     h3: &mut quiche::h3::Connection,
@@ -723,7 +730,7 @@ fn drive_stream(
     app: &App,
     wake: Arc<Notify>,
     body_buffer: &mut BytesMut,
-) -> Result<()> {
+) -> Result<bool> {
     // An unread DATA frame can leave quiche H3 in its Data state, where poll()
     // alone won't consume/report a later reset. Check terminal transport state
     // even while admission/queues are blocked, without reading any DATA bytes.
@@ -792,7 +799,7 @@ fn drive_stream(
                 stream.activity.touch();
             }
             Err(quiche::h3::Error::StreamBlocked) | Err(quiche::h3::Error::Done) => {
-                return Ok(());
+                return Ok(false);
             }
             Err(e) => return Err(e.into()),
         }
@@ -800,13 +807,17 @@ fn drive_stream(
             let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, NO_ERROR);
         }
     }
+    let mut more = false;
     if stream.sent_headers && !stream.site && !stream.input_done {
         if let Some(input) = &stream.input {
+            let mut input_budget = true;
             for _ in 0..4 {
                 if input.capacity() == 0 {
+                    input_budget = false;
                     break;
                 }
                 let Some(bytes) = recv_body(conn, h3, id, body_buffer, app)? else {
+                    input_budget = false;
                     break;
                 };
                 input
@@ -814,6 +825,7 @@ fn drive_stream(
                     .map_err(|_| "H3 upload queue closed")?;
                 stream.activity.touch();
             }
+            more |= input_budget;
         }
         if conn.stream_finished(id) {
             stream.input_done = true;
@@ -821,8 +833,9 @@ fn drive_stream(
         }
     }
     if !stream.sent_headers {
-        return Ok(());
+        return Ok(more);
     }
+    let mut output_budget = true;
     for _ in 0..4 {
         if stream.pending.is_empty()
             && !stream.output_done
@@ -831,18 +844,27 @@ fn drive_stream(
             match output.try_recv() {
                 Ok(data) => stream.pending = data,
                 Err(mpsc::error::TryRecvError::Disconnected) => stream.output_done = true,
-                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    output_budget = false;
+                    break;
+                }
             }
         }
         if stream.sent_fin {
+            output_budget = false;
             break;
         }
         if stream.pending.is_empty() && !stream.output_done {
+            output_budget = false;
             break;
         }
         let fin = stream.output_done;
         match h3.send_body(conn, id, &stream.pending, fin) {
             Ok(n) => {
+                if n == 0 && !fin {
+                    output_budget = false;
+                    break;
+                }
                 let _ = stream.pending.split_to(n);
                 if n > 0 || (fin && stream.pending.is_empty()) {
                     stream.activity.touch();
@@ -851,14 +873,17 @@ fn drive_stream(
                     stream.sent_fin = true;
                 }
             }
-            Err(quiche::h3::Error::Done) | Err(quiche::h3::Error::StreamBlocked) => break,
+            Err(quiche::h3::Error::Done) | Err(quiche::h3::Error::StreamBlocked) => {
+                output_budget = false;
+                break;
+            }
             Err(e) => return Err(e.into()),
         }
     }
     if stream.activity.is_idle(app.idle) {
         return Err("H3 stream idle deadline".into());
     }
-    Ok(())
+    Ok(more || (output_budget && !stream.sent_fin))
 }
 fn drive_website(
     conn: &mut quiche::Connection,
@@ -867,22 +892,27 @@ fn drive_website(
     stream: &mut Stream,
     body_buffer: &mut BytesMut,
     app: &App,
-) -> Result<()> {
+) -> Result<bool> {
     let web = stream.website.as_mut().expect("website stream");
+    let mut more = false;
     if let Some(input) = &web.input {
         if input.is_closed() {
             web.input = None;
         } else if !stream.input_done {
+            let mut input_budget = true;
             for _ in 0..4 {
                 if input.capacity() == 0 {
+                    input_budget = false;
                     break;
                 }
                 let Some(bytes) = recv_body(conn, h3, id, body_buffer, app)? else {
+                    input_budget = false;
                     break;
                 };
                 input.try_send(super::site::Input::Data(bytes))?;
                 stream.activity.touch();
             }
+            more |= input_budget;
         }
     }
     if stream.input_done
@@ -900,6 +930,7 @@ fn drive_website(
             web.input = None;
         }
     }
+    let mut output_budget = true;
     for _ in 0..4 {
         if stream.pending.is_empty()
             && web.header.is_none()
@@ -922,7 +953,10 @@ fn drive_website(
                 Ok(HttpTask::Done) => stream.output_done = true,
                 Ok(HttpTask::Failed(e)) => return Err(e.into()),
                 Ok(HttpTask::UpgradedBody(..)) => return Err("website upgrade unsupported".into()),
-                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    output_budget = false;
+                    break;
+                }
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     return Err("website response truncated".into());
                 }
@@ -956,11 +990,15 @@ fn drive_website(
                     }
                     stream.activity.touch();
                 }
-                Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => break,
+                Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => {
+                    output_budget = false;
+                    break;
+                }
                 Err(e) => return Err(e.into()),
             }
         }
         if stream.sent_fin {
+            output_budget = false;
             break;
         }
         if !stream.sent_headers {
@@ -980,9 +1018,13 @@ fn drive_website(
                     stream.sent_fin = true;
                     stream.activity.touch();
                 }
-                Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => break,
+                Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => {
+                    output_budget = false;
+                    break;
+                }
                 Err(e) => return Err(e.into()),
             }
+            output_budget = false;
             break;
         }
         if stream.pending.is_empty() && !stream.output_done {
@@ -990,6 +1032,10 @@ fn drive_website(
         }
         match h3.send_body(conn, id, &stream.pending, stream.output_done) {
             Ok(n) => {
+                if n == 0 && !stream.output_done {
+                    output_budget = false;
+                    break;
+                }
                 let _ = stream.pending.split_to(n);
                 if n > 0 {
                     stream.activity.touch();
@@ -999,7 +1045,10 @@ fn drive_website(
                     stream.activity.touch();
                 }
             }
-            Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => break,
+            Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => {
+                output_budget = false;
+                break;
+            }
             Err(e) => return Err(e.into()),
         }
     }
@@ -1009,7 +1058,7 @@ fn drive_website(
         web.input = None;
         stream.input_done = true;
     }
-    Ok(())
+    Ok(more || (output_budget && !stream.sent_fin))
 }
 fn parse_trailers(headers: &[quiche::h3::Header]) -> Result<http::HeaderMap> {
     if headers.len() > 128
@@ -1151,6 +1200,103 @@ mod tests {
             .unwrap()
             .unwrap();
     }
+    #[tokio::test]
+    async fn coalesced_output_wake_keeps_bounded_website_drain_running() {
+        let case = crate::acme::lab_support::Case::new("coalesced-queue");
+        use super::super::tests::{QClient, fixture, network};
+        let f = fixture();
+        let network = network(&f, None).await;
+        let app = network.app.clone();
+        let addr = network.udp_addr().unwrap();
+        let (stop, rx) = watch::channel(false);
+        let server = tokio::spawn(network.run(rx));
+        let mut peer = QClient::new(addr, &f.ca).await;
+        let (tx, output) = mpsc::channel(16);
+        // Valid API messages that do not emit QUIC packets. One coalesced wake
+        // must drain them without relying on ACKs, timers, or further producers.
+        for _ in 0..9 {
+            tx.send(HttpTask::Body(None, false)).await.unwrap();
+        }
+        let mut stream = Stream {
+            website: Some(Website {
+                input: None,
+                output,
+                header: None,
+                headers_started: true,
+                trailers: None,
+            }),
+            request_trailers: None,
+            plan: None,
+            _prepare: None,
+            reply: None,
+            sent_headers: true,
+            site: false,
+            input: None,
+            output: None,
+            pending: Bytes::new(),
+            input_done: true,
+            output_done: false,
+            sent_fin: false,
+            task: None,
+            completion: None,
+            bridge_done: false,
+            _active: Active::new(app.stats.clone()),
+            _admission: app.resources.requests.acquire().unwrap(),
+            activity: Activity::new(),
+        };
+        let mut scratch = BytesMut::new();
+        let h3 = peer.h3.as_mut().unwrap();
+        let more = drive_stream(
+            &mut peer.conn,
+            h3,
+            0,
+            &mut stream,
+            &app,
+            Arc::new(Notify::new()),
+            &mut scratch,
+        )
+        .unwrap();
+        assert_eq!(
+            stream.website.as_ref().unwrap().output.len(),
+            5,
+            "one turn retains its four-item work bound"
+        );
+        case.event(
+            "local_work_continuation",
+            serde_json::json!({"remaining":5,"reschedule":more}),
+        );
+        assert!(
+            more,
+            "coalesced notifications cannot strand already queued work"
+        );
+        let mut turns = 1;
+        while drive_stream(
+            &mut peer.conn,
+            h3,
+            0,
+            &mut stream,
+            &app,
+            Arc::new(Notify::new()),
+            &mut scratch,
+        )
+        .unwrap()
+        {
+            turns += 1;
+            assert!(turns < 4, "an open empty queue must not busy-poll");
+        }
+        assert_eq!(stream.website.as_ref().unwrap().output.len(), 0);
+        drop(tx);
+        drop(stream);
+        assert_eq!(app.resources.requests.active(), 0);
+        assert_eq!(
+            app.stats.streams.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        drop(peer);
+        stop.send(true).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
     #[test]
     fn paced_datagram_survives_backpressure_without_regeneration() {
         let now = Instant::now();

@@ -29,6 +29,18 @@ pub enum Error {
     /// RFC 8555 uses problem documents as described in RFC 7807.
     #[error(transparent)]
     Api(#[from] Problem),
+    /// The response at an operation boundary, after nonce/JWS handling.
+    #[error("{method} {url} returned HTTP {status}: {source}")]
+    Response {
+        /// HTTP method actually sent.
+        method: http::Method,
+        /// Actual response URL.
+        url: String,
+        /// Response HTTP status.
+        status: u16,
+        /// Original ACME Problem or decoding failure.
+        source: Box<Error>,
+    },
     /// Failed from cryptographic operations
     #[error("cryptographic operation failed")]
     Crypto,

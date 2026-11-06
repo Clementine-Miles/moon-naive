@@ -1,6 +1,6 @@
 # 验证范围
 
-最新 ACME 专项实测、抓包帧号、当前默认失败回归和最小生产修复设计见 [ACME-LAB.md](ACME-LAB.md)。本页下方历史实施记录不代表该专项已修复或本次执行成功。
+当前正确性修复、模块合并、测试判据和隔离实验结果见 [ACME-LAB.md](ACME-LAB.md)。本页下方旧提交的执行记录只作历史证据，不代表本轮检查结果。
 
 已恢复 `857ec949` 中仍适用的第一方测试，并增加桥接恢复、地址回退、订单退役和文件读取回归测试。历史执行结果和未完成项见下方[安全实施记录](#安全实施记录)。测试通过不等于生产部署验收。
 
@@ -21,7 +21,7 @@ cargo xtask verify
 ## 测试类别
 
 - 纯单元：认证绑定、头部清理、帧解析、地址策略、配置和证书验证。
-- 确定性状态/故障：`site::generation` 使用暂停时钟验证重建、取消、冷却和截止时间；ACME 测试验证持久化、DNS 所有权及退役。
+- 确定性状态/故障：`site::bridge::generation_tests` 使用暂停时钟验证重建、取消、冷却和截止时间；ACME 测试验证持久化、DNS 所有权及退役。
 - 本地传输：`net::tests` 使用临时 CA 和回环源站覆盖 H1/H2/H3、WebSocket、CONNECT、转发、取消及连接池隔离。生产代码无回环白名单开关。
 - 隔离 ACME/DNS：`tests/acme_pebble.rs` 启动本地 Pebble 和 challtestsrv，覆盖签发、EAB、重启、更新和 DNS 故障。
 - 可选：外部浏览器/客户端、抓包和微基准默认忽略。未提供的新模糊测试及长期 soak 不算已验证。
@@ -30,10 +30,10 @@ cargo xtask verify
 export PEBBLE_SOURCE=/path/to/pebble-source
 export PEBBLE_BIN=/path/to/pebble
 export CHALLTESTSRV_BIN=/path/to/pebble-challtestsrv
-cargo xtask test-isolated
+cargo xtask lab --run /absolute/path/outside-checkout/run-id
 ```
 
-本次使用 Pebble v2.8.0。隔离套件不访问公网 DNS 或真实 CA。测试工具属于开发环境，不进入运行时依赖。抓包测试需要另行提供其工具和输出目录；恢复测试源码不表示已恢复全部实验工具。
+本次使用 Pebble v2.8.0。隔离套件不访问公网 DNS 或真实 CA。测试工具属于开发环境，不进入运行时依赖。显式 lab 入口要求抓包和独立协议验证，工具发现、可选 bootstrap 及工件说明统一见 ACME-LAB；普通测试不强制抓包。
 
 ## 验证边界
 
@@ -86,7 +86,7 @@ reproduced or claimed**.
 
 ### Implementation details and semantics
 
-- [`Generations::get`](../src/net/site/generation.rs): semaphore bounds waiting
+- [`Generations::get`](../src/net/site/bridge.rs): semaphore bounds waiting
   requests by configured max streams; mutex serializes construction; acquisition
   and construction share a three-second deadline. A cancelled/failed constructor
   still enforces a one-second cooldown. Only the current generation is cached.
@@ -98,7 +98,7 @@ reproduced or claimed**.
   Existing H2 protocol protections remain enabled. New requests may fail during
   cooldown and must be retried by the client according to its own semantics.
 - [`Egress::dial_candidates`](../src/net/egress.rs),
-  [`Origin::peer`](../src/net/site/forward.rs),
+  [`ForwardOrigin::peer`](../src/net/site/upstream.rs),
   [`Pool::peer`/`ResolvedConnector`](../src/net/site/upstream.rs): connection
   attempts use concrete validated addresses, keeping logical SNI separate.
   At most two TCP dials run concurrently, with at most 32 candidates. DNS limits
@@ -111,14 +111,14 @@ reproduced or claimed**.
   installable expired bundle**. If historical chain validation fails, the order
   remains for investigation. `verify` for activation still requires current time.
 - [`Manager::reconcile`](../src/acme/manager.rs) and
-  [`Journal::retire_completed`](../src/acme/state.rs) retire a verified obsolete
+  [`Journal::retire_completed`](../src/acme/persist.rs) retire a verified obsolete
   completed order before any new order. Persisted cooldown is at least one hour,
   also respecting configured max retry and observed Retry-After. One bounded
   diagnostic contains order-URL hash, timestamp, expiry and reason; obsolete
   private key is discarded. Account and DNS lease state survive. Persistence
   failure suspends the manager; temporary installation failures keep the order.
 - `state::open_private`, `validate_private`, and
-  [`store::read_bounded`](../src/acme/store.rs) validate opened descriptors,
+  [`persist::read_bounded`](../src/acme/persist.rs) validate opened descriptors,
   reject final-component symlinks/FIFOs, bound reads and preserve owner-only
   permissions. Parent directory ancestry is still a trusted boundary; this is
   **not** a full directory-FD-based publication design.
@@ -227,7 +227,7 @@ hardware/configuration and separate any test fixture setup from measurements.
 
 ## 依赖维护
 
-No upstream baseline or vendored source was changed in this work. Keep notices
+The following maintenance record belongs to the historical implementation above. Current small vendor patches and their validation are in ACME-LAB.md. Keep notices
 and inventories intact. Root dependencies remain pinned to:
 
 | Component | Baseline | Retained patch purpose / regression evidence |

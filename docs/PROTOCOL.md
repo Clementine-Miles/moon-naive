@@ -144,7 +144,7 @@ TLS 共用 BoringSSL；quiche 使用 boring crate 后端。gzip 由 Rust miniz_o
 
 H3 内存桥使用可替换代际。任一驱动退出会通知当前交换失败；后续请求经有界、单次构建及冷却后获得新桥。不会重放应用请求。DATA 长度在进入共享 H2 连接前检查，长度不符只重置该流。
 
-CONNECT、HTTP 转发及固定网站源站复用有界 TCP 候选拨号，最多同时尝试两个地址。固定源站允许显式配置的私网地址，任意转发目标仍应用公共目标策略。源站选择与其地址回退分开；TLS 握手后的候选回退、整个 DNS/TCP/TLS 链的一次总截止时间仍待完善。
+CONNECT、HTTP 转发及固定网站源站复用有界 TCP 候选拨号，最多同时尝试两个地址。固定源站允许显式配置的私网地址，任意转发目标仍应用公共目标策略。源站选择与其地址回退分开；固定源站在 HTTP 发送前可推进 TCP/TLS 候选，并把 DNS、建连和会话初始化纳入连接期限；已发送的应用请求不隐式重放。
 
 上述改动没有完成控制面进程隔离、双身份自动证书管理、原子多路径激活或认证容量预留。当前真实实现及验收差距见[实施报告](VERIFICATION.md#安全实施记录)。
 
@@ -156,10 +156,9 @@ CONNECT、HTTP 转发及固定网站源站复用有界 TCP 候选拨号，最多
 | 路径 | 职责 |
 | --- | --- |
 | [src](../src/) | 服务端 CLI、运行时、证书控制面及网络入口 |
-| [src/acme/account.rs](../src/acme/account.rs) | instant-acme 账户创建、恢复及 EAB 协调 |
+| [src/acme/account.rs](../src/acme/account.rs) | instant-acme 账户创建、恢复及 EAB 导入/注册 |
 | [src/acme/manager.rs](../src/acme/manager.rs) | DNS-01 订单、续期、退避及恢复 |
-| [src/acme/eab.rs](../src/acme/eab.rs) | EAB 导入和 instant-acme 注册适配 |
-| [src/acme/state.rs](../src/acme/state.rs) / [store.rs](../src/acme/store.rs) | 日志、私有权限、证书 generation 和 CURRENT |
+| [src/acme/persist.rs](../src/acme/persist.rs) | 日志、私有权限、证书 generation 和 CURRENT |
 | [src/net](../src/net/) | TLS、H2/H3、隧道、ACL 拨号及固定下一跳 |
 | [src/net/site](../src/net/site/) | 共用 Pingora 网站/正向代理、上游池和 WebSocket |
 | [core/src](../core/src/) | 配置、认证、记录 codec、准入及额度策略 |

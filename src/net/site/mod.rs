@@ -1,7 +1,5 @@
 //! Shared Pingora website engine. H2 enters directly; H3 uses a bounded memory bridge.
 mod bridge;
-mod forward;
-mod generation;
 mod transform;
 mod upstream;
 pub(super) mod websocket;
@@ -183,7 +181,7 @@ pub(crate) struct Site {
     proxy: Arc<Proxy>,
     pools: Vec<Arc<upstream::Pool>>,
     pub(super) buffers: Arc<super::resources::BufferPool>,
-    bridge: generation::Generations<bridge::Bridge>,
+    bridge: bridge::Generations<bridge::Bridge>,
     max_streams: u32,
     #[cfg(test)]
     stats: Arc<WebStats>,
@@ -205,7 +203,8 @@ struct Router {
     pools: Vec<Arc<upstream::Pool>>,
     routes: Vec<(moon_naive_core::website::Route, usize)>,
     alt_svc: String,
-    forward: Option<forward::Origin>,
+    forward: Option<upstream::ForwardOrigin>,
+    tunnels: Option<moon_naive_core::policy::Budget>,
     stats: Arc<WebStats>,
 }
 #[derive(Default)]
@@ -223,9 +222,10 @@ struct Context {
     path: Option<String>,
     uploaded: usize,
     deadline: Option<tokio::time::Instant>,
+    _tunnel: Option<super::resources::TunnelLease>,
 }
 impl Site {
-    pub fn load(config: &Config) -> Result<Self> {
+    pub fn load(config: &Config, tunnels: moon_naive_core::policy::Budget) -> Result<Self> {
         config.website.validate()?;
         if config.website.routes.is_empty() {
             return Err("website requires a configured reverse-proxy route".into());
@@ -262,6 +262,7 @@ impl Site {
             routes,
             stats: Arc::clone(&stats),
             forward: None,
+            tunnels: Some(tunnels),
             alt_svc: format!("h3=\":{}\"; ma=86400", config.listener.udp.port()),
         };
         let conf = Arc::new(ServerConf {
@@ -280,7 +281,7 @@ impl Site {
             proxy: Arc::new(proxy),
             pools,
             buffers: super::resources::BufferPool::new(config.limits.max_total_buffer_bytes),
-            bridge: generation::Generations::new(config.limits.max_streams),
+            bridge: bridge::Generations::new(config.limits.max_streams),
             max_streams: config.limits.max_streams as u32,
             #[cfg(test)]
             stats,
@@ -301,14 +302,15 @@ impl Site {
             routes: vec![],
             stats: Arc::default(),
             alt_svc: String::new(),
-            forward: Some(forward::Origin::new(origin, user, egress)?),
+            forward: Some(upstream::ForwardOrigin::new(origin, user, egress)?),
+            tunnels: None,
         };
         let conf = Arc::new(ServerConf {
             max_retries: 1,
             upstream_keepalive_pool_size: 16,
             ..ServerConf::default()
         });
-        let mut bridge = generation::Generations::new(config.limits.max_streams);
+        let mut bridge = bridge::Generations::new(config.limits.max_streams);
         bridge.share_shutdown(&website.bridge);
         Ok(Self {
             proxy: Arc::new(pingora_proxy::http_proxy(&conf, router)),
@@ -553,6 +555,22 @@ impl ProxyHttp for Router {
                 ctx.pool = Some(*pool);
                 let target = transform::target(&req.uri, &route.path_prefix, route.strip_prefix);
                 ctx.path = Some(target);
+                if matches!(req.version, http::Version::HTTP_10 | http::Version::HTTP_11)
+                    && req.headers.contains_key("upgrade")
+                {
+                    if !websocket::valid_h1_upgrade(req) {
+                        self.send_local(s, Reply::error(400)).await?;
+                        return Ok(true);
+                    }
+                    ctx._tunnel = Some(
+                        super::resources::TunnelLease::anonymous(
+                            self.tunnels.as_ref().expect("website ledger"),
+                        )
+                        .ok_or_else(|| {
+                            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(503))
+                        })?,
+                    );
+                }
                 return Ok(false);
             }
         }

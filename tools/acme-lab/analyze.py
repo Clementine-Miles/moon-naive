@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Decode laboratory pcaps. Raw keys and full journals never enter the Git index."""
-import argparse
 import base64
 import hashlib
 import hmac
@@ -18,20 +17,15 @@ FIELDS = ["frame.number", "frame.time_epoch", "tcp.stream", "tcp.srcport", "tcp.
 def un64(value):
     return base64.urlsafe_b64decode(value + '=' * (-len(value) % 4))
 
-def digest(path):
-    sha = hashlib.sha256()
-    with path.open('rb') as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b''):
-            sha.update(block)
-    return sha.hexdigest()
-
 def analyze(case, exe):
+    if not (case/'wire.pcap').exists() or (case/'wire.pcap').stat().st_size<=24:
+        return {'case':case.name,'errors':['empty or missing capture'],'tshark_exit':None}
     events = [json.loads(line) for line in (case / 'events.jsonl').read_text().splitlines()]
     tls_ports, dns_ports, quic_ports = set(), set(), set()
     ports=json.loads((case / "ports.json").read_text())["ports"]
-    if case.name.startswith(("live-renew", "control-panic")):
+    if case.name.startswith(("live-renew", "control-panic", "renewal-invalid")):
         tls_ports.add(ports[1]);quic_ports.add(ports[2])
-    elif case.name.startswith("tls-loaded-failure"):
+    elif case.name.startswith(("tls-loaded-failure", "website-streaming", "codec-windows")):
         tls_ports.add(ports[0]);quic_ports.add(ports[1])
     for event in events:
         data = event['data']
@@ -56,8 +50,11 @@ def analyze(case, exe):
         result = subprocess.run(args, stdout=subprocess.PIPE, stderr=error, check=False)
     (case / 'tshark.result.json').write_text(json.dumps({'command': args, 'exit_code': result.returncode}, indent=2))
     if result.returncode:
-        return {'case': case.name, 'tshark_exit': result.returncode, 'evidence': 'decode_failed'}
+        return {'case': case.name, 'tshark_exit': result.returncode, 'errors': ['decoder failed']}
     packets = json.loads(result.stdout)
+    errors=[]
+    if not any(e['kind']=='capture_stopped' and e['data'].get('exit_code')==0 for e in events):
+        errors.append('capture did not finish successfully')
     timeline = []
     # Derive only a public verifier from the synthetic persisted account key.
     verifier = None
@@ -135,6 +132,7 @@ def analyze(case, exe):
                         if isinstance(payload, dict) and 'externalAccountBinding' in payload:
                             eab = payload['externalAccountBinding']
                             item['eab_protected'] = json.loads(un64(eab['protected']))
+                            item['eab_bound'] = json.loads(un64(eab['payload'])) == protected.get('jwk') and item['eab_protected'].get('url') == protected.get('url') and item['eab_protected'].get('alg') == 'HS256'
                             item['eab_hs256_valid'] = hmac.compare_digest(hmac.digest(b'B' * 32, f"{eab['protected']}.{eab['payload']}".encode(), 'sha256'), un64(eab['signature']))
                         if isinstance(payload, dict) and 'csr' in payload:
                             try:
@@ -151,7 +149,8 @@ def analyze(case, exe):
         timeline.append({'source': 'test_log', 'epoch': event['utc_epoch_us'] / 1e6, 'kind': event['kind'], 'data': event['data']})
     timeline.sort(key=lambda row: row['epoch'])
     (case / 'timeline.json').write_text(json.dumps(timeline, indent=2))
-    summary = {'case': case.name, 'tshark_exit': 0, 'pcap_rows': len(packets),
+    errors += protocol_errors(timeline)
+    summary = {'case': case.name, 'errors':errors, 'tshark_exit': 0, 'pcap_rows': len(packets),
                'http_requests': sum(bool(p.get('method')) for p in timeline),
                'dns_frames': sum('dns' in p for p in timeline),
                'valid_jose': sum(p.get('jose_signature_valid') is True for p in timeline),
@@ -182,23 +181,45 @@ def analyze(case, exe):
                     certificates.append(entry)
         (case/'handshake-analysis.json').write_text(json.dumps({'command':handshake_args,'exit_code':decoded.returncode,'certificates':certificates},indent=2))
         summary['wire_certificates']=len(certificates)
+        if decoded.returncode:summary['errors'].append('handshake decoder failed')
     (case / 'analysis.json').write_text(json.dumps(summary, indent=2))
     return summary
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('root', type=Path)
-    parser.add_argument('--index', type=Path)
-    args = parser.parse_args()
-    summaries = []
-    for pcap in sorted(args.root.rglob('wire.pcap')):
-        summaries.append(analyze(pcap.parent, os.environ.get('ACME_LAB_TSHARK', 'tshark')))
-    target = args.index or args.root / 'evidence-index.json'
-    files = [{'path': str(p.relative_to(args.root)), 'bytes': p.stat().st_size, 'sha256': digest(p)}
-             for p in sorted(args.root.rglob('*')) if p.is_file() and p.resolve() != target.resolve() and p.suffix in ('.pcap', '.json', '.jsonl', '.log', '.keys')]
-    index = {'artifact_root': str(args.root), 'cases': summaries, 'files': files}
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(index, indent=2) + '\n')
-    print(json.dumps({'cases': len(summaries), 'pcap_rows': sum(v.get('pcap_rows', 0) for v in summaries), 'index': str(target)}))
-if __name__ == '__main__':
-    main()
+def protocol_errors(rows):
+    errors=[]
+    for row in rows:
+        if row.get('signature_length') is not None:
+            if row.get('signature_length')!=64 or row.get('jose_signature_valid') is not True:
+                errors.append(f"frame {row.get('frame')}: JOSE verification failed or was not executed")
+            if row.get('protected_url_matches') is not True:
+                errors.append(f"frame {row.get('frame')}: protected.url mismatch")
+        keys=row.get('payload_keys') or []
+        if 'csr' in keys and (row.get('csr_signature_valid') is not True or not row.get('csr_san')):
+            errors.append('CSR verification failed or was not executed')
+        if 'externalAccountBinding' in keys and (row.get('eab_hs256_valid') is not True or row.get('eab_bound') is not True):
+            errors.append('EAB verification failed or was not executed')
+    return errors
+
+def self_test():
+    """Counterexamples for the evidence gate, including a real failed decoder."""
+    import tempfile
+    import unittest
+    class Evidence(unittest.TestCase):
+        def test_empty_capture(self):
+            with tempfile.TemporaryDirectory() as temp:
+                case=Path(temp);(case/'wire.pcap').write_bytes(bytes(24))
+                self.assertIn('empty or missing capture',analyze(case,'/bin/false')['errors'])
+        def test_decoder_failure(self):
+            with tempfile.TemporaryDirectory() as temp:
+                case=Path(temp);(case/'wire.pcap').write_bytes(bytes(25))
+                (case/'events.jsonl').write_text('');(case/'ports.json').write_text('{"ports":[]}')
+                result=analyze(case,'/bin/false')
+                self.assertEqual(result['tshark_exit'],1);self.assertTrue(result['errors'])
+        def test_failed_or_unexecuted_protocol_verification(self):
+            good={'signature_length':64,'jose_signature_valid':True,'protected_url_matches':True}
+            self.assertFalse(protocol_errors([good]))
+            for field,value in [('jose_signature_valid',False),('jose_signature_valid',None),('protected_url_matches',False)]:
+                self.assertTrue(protocol_errors([dict(good,**{field:value})]))
+            self.assertTrue(protocol_errors([{'payload_keys':['csr']}]))
+            self.assertTrue(protocol_errors([{'payload_keys':['externalAccountBinding'],'eab_hs256_valid':True,'eab_bound':False}]))
+    return unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Evidence)).wasSuccessful()

@@ -1,4 +1,4 @@
-use super::{Result, http::Http, state::Lease};
+use super::{Result, http::Http, persist::Lease};
 use async_trait::async_trait;
 use hickory_proto::{
     op::{Message, MessageType, OpCode, Query, ResponseCode},
@@ -14,12 +14,22 @@ use tokio::{
 #[async_trait]
 pub trait DnsProvider: Send {
     fn identity(&self) -> String;
+    /// Read-only discovery and ownership lookup. Never mutate remote DNS here.
+    async fn prepare(&mut self, _lease: &mut Lease) -> Result<()> {
+        Ok(())
+    }
     /// Intent is durable before this call. Recover ownership by marker after an
     /// uncertain API response; never adopt another record as owned.
     async fn present(&mut self, lease: &mut Lease) -> Result<()>;
     async fn propagated(&mut self, lease: &Lease) -> Result<bool>;
     /// Recover a confirmed creation before the manager durably enters deletion.
-    async fn recover(&mut self, _lease: &mut Lease) -> Result<()> {
+    async fn recover(&mut self, lease: &mut Lease) -> Result<()> {
+        if lease.phase == super::persist::LeasePhase::CreateUncertain
+            && lease.record_id.is_none()
+            && !lease.borrowed
+        {
+            return Err("provider must establish uncertain DNS ownership".into());
+        }
         Ok(())
     }
     async fn cleanup(&mut self, lease: &Lease) -> Result<()>;
@@ -29,6 +39,9 @@ pub trait DnsProvider: Send {
 impl<T: DnsProvider + ?Sized> DnsProvider for Box<T> {
     fn identity(&self) -> String {
         (**self).identity()
+    }
+    async fn prepare(&mut self, lease: &mut Lease) -> Result<()> {
+        (**self).prepare(lease).await
     }
     async fn present(&mut self, lease: &mut Lease) -> Result<()> {
         (**self).present(lease).await
@@ -48,7 +61,7 @@ pub fn provider_from_config(
     config: &moon_naive_core::config::Config,
     http: Http,
 ) -> Result<Box<dyn DnsProvider>> {
-    use super::{porkbun, state::read_private};
+    use super::{persist::read_private, porkbun};
     match config.acme.dns_provider.as_str() {
         "cloudflare" => {
             #[derive(serde::Deserialize)]
@@ -61,7 +74,7 @@ pub fn provider_from_config(
                     api_token: c.api_token.clone().ok_or("Cloudflare api_token missing")?,
                 }
             } else {
-                crate::acme::state::load_toml(&config.acme.dns_token_file, 16384)?
+                crate::acme::persist::load_toml(&config.acme.dns_token_file, 16384)?
             };
             Ok(Box::new(Cloudflare::new(
                 http,
@@ -192,7 +205,7 @@ impl Cloudflare {
                 let host = server.as_str().ok_or("invalid authoritative server")?;
                 let resolved = tokio::time::timeout(
                     Duration::from_secs(5),
-                    crate::net::resolve::lookup_control(host, 53),
+                    crate::resolve::lookup_control(host, 53),
                 )
                 .await??;
                 let mut candidates = resolved.take(33).collect::<Vec<_>>();
@@ -210,34 +223,95 @@ impl Cloudflare {
         Ok(&self.authorities.as_ref().unwrap().1)
     }
 }
-fn matches_record(record: &Value, lease: &Lease) -> bool {
+pub(super) fn matches_record(record: &Value, lease: &Lease) -> bool {
     record["type"] == "TXT"
+        && record["content"] == lease.value
         && record["name"]
             .as_str()
-            .is_some_and(|v| v.trim_end_matches('.').eq_ignore_ascii_case(&lease.name))
-        && record["content"] == lease.value
+            .is_some_and(|name| name.trim_end_matches('.').eq_ignore_ascii_case(&lease.name))
+}
+/// Common ownership policy; only field names and ID formats differ by provider.
+pub(super) fn adopt(
+    records: &[Value],
+    lease: &mut Lease,
+    marker: &str,
+    id: fn(&Value) -> Result<String>,
+    borrow: bool,
+) -> Result<bool> {
+    let owned = records
+        .iter()
+        .find(|r| matches_record(r, lease) && r[marker] == lease.marker);
+    let found = owned.or_else(|| {
+        if borrow {
+            records.iter().find(|r| matches_record(r, lease))
+        } else {
+            None
+        }
+    });
+    if let Some(record) = found {
+        lease.record_id = Some(id(&record["id"])?);
+        lease.borrowed = record[marker] != lease.marker;
+        return Ok(true);
+    }
+    Ok(false)
+}
+/// Shared ownership transition; an empty read cannot resolve a durable send gap.
+pub(super) fn recover_owned(
+    records: &[Value],
+    lease: &mut Lease,
+    marker: &str,
+    id: fn(&Value) -> Result<String>,
+) -> Result<()> {
+    if adopt(records, lease, marker, id, false)? {
+        lease.phase = super::persist::LeasePhase::Created;
+        return Ok(());
+    }
+    Err("DNS create outcome uncertain; retain marker and reconcile again".into())
+}
+pub(super) fn cleanup_known(records: &[Value], lease: &Lease, marker: &str) -> Result<()> {
+    if lease.phase == super::persist::LeasePhase::CreateUncertain
+        && lease.record_id.is_none()
+        && !records
+            .iter()
+            .any(|r| matches_record(r, lease) && r[marker] == lease.marker)
+    {
+        return Err("DNS create outcome uncertain; retain lease and reconcile again".into());
+    }
+    Ok(())
+}
+fn record_id(value: &Value) -> Result<String> {
+    let id = value.as_str().ok_or("Cloudflare record ID missing")?;
+    if id.is_empty() || id.len() > 128 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("invalid Cloudflare record ID".into());
+    }
+    Ok(id.to_owned())
 }
 #[async_trait]
 impl DnsProvider for Cloudflare {
     fn identity(&self) -> String {
         format!("cloudflare:{}", self.zone)
     }
+    async fn prepare(&mut self, lease: &mut Lease) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            self.authorities(lease).await?;
+            adopt(
+                &self.records(lease).await?,
+                lease,
+                "comment",
+                record_id,
+                true,
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| "DNS preparation deadline")?
+    }
     async fn present(&mut self, lease: &mut Lease) -> Result<()> {
-        // Validate zone ownership before any write, also primes NS discovery.
-        self.authorities(lease).await?;
-        let records = self.records(lease).await?;
-        if let Some(record) = records
-            .iter()
-            .find(|r| matches_record(r, lease) && r["comment"] == lease.marker)
-        {
-            lease.record_id = Some(record["id"].as_str().ok_or("record ID missing")?.into());
-            lease.borrowed = false;
+        if lease.record_id.is_some() {
             return Ok(());
         }
-        if let Some(record) = records.iter().find(|r| matches_record(r, lease)) {
-            lease.record_id = Some(record["id"].as_str().ok_or("record ID missing")?.into());
-            lease.borrowed = true;
-            return Ok(());
+        if self.authorities.is_none() {
+            return Err("DNS read-only preparation required".into());
         }
         let value = self
             .api(
@@ -246,19 +320,23 @@ impl DnsProvider for Cloudflare {
                 Some(json!({"type":"TXT", "name":lease.name,
             "content":lease.value, "ttl":120, "comment":lease.marker})),
             )
-            .await?;
-        lease.record_id = Some(
-            value["result"]["id"]
-                .as_str()
-                .ok_or("record ID missing after creation")?
-                .into(),
-        );
+            .await;
+        if let Err(error) = &value
+            && super::http::mutation_rejected(error)
+        {
+            lease.phase = super::persist::LeasePhase::Preparing;
+        }
+        let value = value?;
+        lease.record_id = Some(record_id(&value["result"]["id"])?);
         lease.borrowed = false;
         Ok(())
     }
     async fn propagated(&mut self, lease: &Lease) -> Result<bool> {
-        let addresses = self.authorities(lease).await?.to_vec();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let addresses = tokio::time::timeout_at(deadline, self.authorities(lease))
+            .await
+            .map_err(|_| "DNS discovery deadline")??
+            .to_vec();
         for candidates in addresses {
             let mut visible = false;
             for address in candidates {
@@ -288,44 +366,23 @@ impl DnsProvider for Cloudflare {
     async fn recover(&mut self, lease: &mut Lease) -> Result<()> {
         if lease.borrowed
             || lease.record_id.is_some()
-            || lease.phase != super::state::LeasePhase::CreateUncertain
+            || lease.phase != super::persist::LeasePhase::CreateUncertain
         {
             return Ok(());
         }
-        let records = self.records(lease).await?;
-        if let Some(record) = records
-            .iter()
-            .find(|record| matches_record(record, lease) && record["comment"] == lease.marker)
-        {
-            lease.record_id = Some(record["id"].as_str().ok_or("record ID missing")?.to_owned());
-            lease.phase = super::state::LeasePhase::Created;
-            return Ok(());
-        }
-        Err("DNS create outcome uncertain; retain marker and reconcile again".into())
+        recover_owned(&self.records(lease).await?, lease, "comment", record_id)
     }
     async fn cleanup(&mut self, lease: &Lease) -> Result<()> {
         if lease.borrowed {
             return Ok(());
         }
         let records = self.records(lease).await?;
-        if lease.phase == super::state::LeasePhase::CreateUncertain
-            && lease.record_id.is_none()
-            && !records
-                .iter()
-                .any(|record| matches_record(record, lease) && record["comment"] == lease.marker)
-        {
-            // A single empty list can precede a delayed remote commit. Keep the
-            // durable marker, including across shutdown; never create a new order.
-            return Err("DNS create outcome uncertain; retain lease and reconcile again".into());
-        }
+        cleanup_known(&records, lease, "comment")?;
         for record in records {
             if !matches_record(&record, lease) || record["comment"] != lease.marker {
                 continue;
             }
-            let id = record["id"].as_str().ok_or("record ID missing")?;
-            if !id.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err("invalid DNS record ID".into());
-            }
+            let id = record_id(&record["id"])?;
             self.api("DELETE", &format!("/dns_records/{id}"), None)
                 .await?;
         }
@@ -525,9 +582,11 @@ mod tests {
             ..Lease::default()
         };
         let mut provider = make_provider();
+        provider.prepare(&mut lease).await.unwrap();
         assert!(provider.present(&mut lease).await.is_err()); // DNS write happened; response failed.
         assert!(lease.record_id.is_none());
         let mut recovered = make_provider();
+        recovered.prepare(&mut lease).await.unwrap();
         recovered.present(&mut lease).await.unwrap();
         assert_eq!(posts.load(Ordering::Relaxed), 1); // No duplicate POST after restart.
         recovered.cleanup(&lease).await.unwrap();
@@ -535,6 +594,7 @@ mod tests {
         assert_eq!(*records.lock().unwrap(), [foreign]);
         lease.value = "foreign-value".into();
         lease.record_id = None;
+        recovered.prepare(&mut lease).await.unwrap();
         recovered.present(&mut lease).await.unwrap();
         assert!(lease.borrowed);
         recovered.cleanup(&lease).await.unwrap();
@@ -605,7 +665,7 @@ mod delayed_create_tests {
         provider.cleanup(&recovered).await.unwrap();
         assert!(records.lock().unwrap().is_empty());
         let mut confirmed = recovered;
-        confirmed.phase = super::super::state::LeasePhase::DeleteUncertain;
+        confirmed.phase = super::super::persist::LeasePhase::DeleteUncertain;
         provider.cleanup(&confirmed).await.unwrap();
     }
 }

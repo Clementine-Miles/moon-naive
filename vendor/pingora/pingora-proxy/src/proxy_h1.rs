@@ -335,10 +335,7 @@ where
                     match send_body_to1(client_session, body).await {
                         Ok(send_done) => {
                             request_done = send_done;
-                            // An upgraded request is terminated when either side is done
-                            if request_done && client_session.was_upgraded() {
-                                response_done = true;
-                            }
+                            // Upgrade is duplex: request EOF only closes the upload half.
                         },
                         Err(e) => {
                            warn!("send error, draining read buf: {e}");
@@ -563,7 +560,7 @@ where
                 // Otherwise deadlock could happen if both upstream and downstream are blocked
                 // on sending to their corresponding pipes which are both full.
                 body = session.downstream_session.read_body_or_idle(downstream_state.is_done()),
-                    if downstream_state.can_poll() && send_permit.is_ok() => {
+                    if downstream_state.can_poll() && (!upgraded || downstream_state.is_reading()) && send_permit.is_ok() => {
 
                     debug!("downstream event");
                     let body = match body {
@@ -595,11 +592,7 @@ where
                            }
                         }
                     };
-                    // If the request is websocket, `None` body means the request is closed.
-                    // Set the response to be done as well so that the request completes normally.
-                    if body.is_none() && session.was_upgraded() {
-                        response_state.maybe_set_upstream_done(true);
-                    }
+                    // An upgraded upload EOF must not discard a still-active response.
                     // TODO: consider just drain this if serve_from_cache is set
                     let is_body_done = session.is_body_done();
                     let request_done = self.send_body_to_pipe(

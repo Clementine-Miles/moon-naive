@@ -1071,17 +1071,10 @@ impl HttpSession {
         }
     }
 
-    fn maybe_force_close_body_reader(&mut self) {
-        if self.upgraded && !self.body_reader.body_done() {
-            // response is done, reset the request body to close
-            self.body_reader.init_content_length(0, b"");
-        }
-    }
-
     /// Signal that there is no more body to write.
     /// This call will try to flush the buffer if there is any un-flushed data.
     /// For chunked encoding response, this call will also send the last chunk.
-    /// For upgraded sessions, this call will also close the reading of the client body.
+    /// For upgraded sessions, this half-closes the response, retaining the request reader.
     pub async fn finish_body(&mut self) -> Result<Option<usize>> {
         let res = self.body_writer.finish(&mut self.underlying_stream).await?;
         self.underlying_stream
@@ -1093,7 +1086,7 @@ impl HttpSession {
             "finish body (response body writer), upgraded: {}",
             self.upgraded
         );
-        self.maybe_force_close_body_reader();
+        if self.upgraded {self.underlying_stream.shutdown().await.or_err(WriteError,"half-closing upgraded response")?;}
         Ok(res)
     }
 
@@ -1675,7 +1668,7 @@ impl HttpSession {
                     }
                     ProxyTaskWriter::FinishingBody => {
                         end_stream = true;
-                        self.maybe_force_close_body_reader();
+                        if self.upgraded {self.underlying_stream.shutdown().await.or_err(WriteError,"half-closing upgraded response")?;}
                         break; // fine to break after finish, no tasks should be queued after
                     }
                 }

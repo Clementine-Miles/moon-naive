@@ -67,6 +67,11 @@ impl Case {
         serde_json::from_slice(&bytes).unwrap()
     }
     pub fn capture(&self, ports: &[u16]) -> Option<Capture> {
+        let mode = std::env::var("ACME_LAB_CAPTURE").unwrap_or_default();
+        let required = mode == "required";
+        if !required && mode != "optional" {
+            return None;
+        }
         self.write("ports.json", &json!({"ports":ports}));
         let filter = ports
             .iter()
@@ -101,6 +106,10 @@ impl Case {
                         "pcap_unavailable",
                         json!({"exit":status.code(),"filter":filter}),
                     );
+                    assert!(
+                        !required,
+                        "required capture exited before the case: {status}"
+                    );
                     None
                 } else {
                     self.event("capture_started", json!({"pid":child.id(),"filter":filter}));
@@ -115,6 +124,7 @@ impl Case {
                     "pcap_unavailable",
                     json!({"error":error.to_string(),"filter":filter}),
                 );
+                assert!(!required, "required capture could not start: {error}");
                 None
             }
         }
@@ -143,6 +153,6 @@ impl Drop for Capture {
             .status();
         let status = self.child.wait();
         self.case
-            .event("capture_stopped", json!({"status":format!("{status:?}")}));
+            .event("capture_stopped", json!({"exit_code":status.as_ref().ok().and_then(|s|s.code()),"status":format!("{status:?}")}));
     }
 }

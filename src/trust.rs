@@ -19,7 +19,7 @@ impl Roots {
             loaded: tokio::sync::OnceCell::new(),
         }))
     }
-    pub(crate) async fn get(&self) -> crate::acme::Result<Option<Certificates>> {
+    pub(crate) async fn get(&self) -> crate::Result<Option<Certificates>> {
         let roots = self
             .0
             .loaded
@@ -28,7 +28,7 @@ impl Roots {
                     return Ok(None);
                 };
                 // Both filesystem IO and X509 parsing stay off the data-plane workers.
-                tokio::task::spawn_blocking(move || -> crate::acme::Result<_> {
+                tokio::task::spawn_blocking(move || -> crate::Result<_> {
                     let bytes = std::fs::read(path)?;
                     let certs = boring::x509::X509::stack_from_pem(&bytes)?;
                     if certs.is_empty() {

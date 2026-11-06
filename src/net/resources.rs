@@ -18,6 +18,14 @@ pub(crate) struct TunnelLease {
     _global: Permit,
     _user: Option<Permit>,
 }
+impl TunnelLease {
+    pub(super) fn anonymous(budget: &Budget) -> Option<Self> {
+        Some(Self {
+            _global: budget.acquire()?,
+            _user: None,
+        })
+    }
+}
 impl Resources {
     pub fn new(config: &Config, users: usize) -> super::Result<Self> {
         Ok(Self {

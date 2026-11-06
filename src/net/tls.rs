@@ -1,5 +1,5 @@
 use super::{Config, Result, TransportProfile};
-use crate::acme::store::DiskStore;
+use crate::acme::persist::DiskStore;
 use boring::{
     pkey::PKey,
     ssl::{AlpnError, SslAcceptor, SslContextBuilder, SslMethod, SslVersion, select_next_proto},
@@ -20,6 +20,8 @@ pub(super) struct Generation {
 pub(super) struct Slot(
     Arc<RwLock<Arc<Generation>>>,
     #[cfg(test)] Arc<Mutex<Option<RecordFault>>>,
+    #[cfg(test)] Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)] Arc<std::sync::atomic::AtomicUsize>,
 );
 #[cfg(test)]
 struct RecordFault {
@@ -33,8 +35,12 @@ impl Slot {
             Arc::new(RwLock::new(Arc::new(load(config)?))),
             #[cfg(test)]
             Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         );
-        slot.record(config)?;
+        slot.report(config);
         Ok(slot)
     }
     pub fn current(&self) -> Result<Arc<Generation>> {
@@ -47,7 +53,6 @@ impl Slot {
         Ok(generation)
     }
     pub(super) fn refresh(&self, config: &Config) -> Result<bool> {
-        self.record(config)?;
         let current = self
             .0
             .read()
@@ -55,12 +60,20 @@ impl Slot {
             .clone();
         let id = DiskStore::open(&config.state_dir.join("certificates"))?.current_generation()?;
         if id.as_deref() == Some(current.id.as_str()) && ech_stamp(config)? == current.ech_stamp {
+            self.report(config);
             current.valid_at(crate::acme::now())?;
             return Ok(false);
         }
         self.replace(load(config)?)?;
-        self.record(config)?;
+        self.report(config);
         Ok(true)
+    }
+    fn report(&self, config: &Config) {
+        if let Err(error) = self.record(config) {
+            #[cfg(test)]
+            self.3.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            eprintln!("event=tls_status_write_failed detail={error}");
+        }
     }
     fn record(&self, config: &Config) -> Result<()> {
         let generation = self
@@ -101,22 +114,36 @@ impl Slot {
             generation.not_after,
             generation.outer.map(|life| life.not_after)
         );
-        if crate::acme::state::read_private(&path, 4096).is_ok_and(|old| old == text.as_bytes()) {
+        if crate::acme::persist::read_private(&path, 4096).is_ok_and(|old| old == text.as_bytes()) {
             return Ok(());
         }
         let mut nonce = [0; 8];
         boring::rand::rand_bytes(&mut nonce)?;
         let temp = path.with_file_name(format!("TLS-LOADED-{}.tmp", u64::from_be_bytes(nonce)));
-        #[cfg(test)]
-        record_fault(fault, "create")?;
-        crate::acme::state::write_private_new(&temp, text.as_bytes())?;
-        #[cfg(test)]
-        record_fault(fault, "rename")?;
-        std::fs::rename(&temp, &path)?;
-        #[cfg(test)]
-        record_fault(fault, "fsync")?;
-        std::fs::File::open(path.parent().unwrap())?.sync_all()?;
-        Ok(())
+        let result = (|| -> Result<()> {
+            #[cfg(test)]
+            record_fault(fault, "create", &self.2)?;
+            crate::acme::persist::write_private_new(&temp, text.as_bytes())?;
+            #[cfg(test)]
+            record_fault(fault, "rename", &self.2)?;
+            std::fs::rename(&temp, &path)?;
+            #[cfg(test)]
+            record_fault(fault, "fsync", &self.2)?;
+            std::fs::File::open(path.parent().unwrap())?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        result
+    }
+    #[cfg(test)]
+    pub(super) fn laboratory_report_failures(&self) -> usize {
+        self.3.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    #[cfg(test)]
+    pub(super) fn laboratory_fault_hits(&self) -> usize {
+        self.2.load(std::sync::atomic::Ordering::SeqCst)
     }
     #[cfg(test)]
     pub(super) fn laboratory_fail_record(&self, stage: &'static str, skip_records: usize) {
@@ -131,8 +158,13 @@ impl Slot {
     }
 }
 #[cfg(test)]
-fn record_fault(fault: Option<&str>, stage: &str) -> Result<()> {
+fn record_fault(
+    fault: Option<&str>,
+    stage: &str,
+    hits: &std::sync::atomic::AtomicUsize,
+) -> Result<()> {
     if fault == Some(stage) {
+        hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         return Err(std::io::Error::other(format!("injected TLS-LOADED {stage} failure")).into());
     }
     Ok(())
@@ -283,7 +315,7 @@ impl EchMaterial {
         let Some(settings) = &config.ech else {
             return Ok(None);
         };
-        let file: EchKeyFile = crate::acme::state::load_toml(&settings.keys_file, 65536)?;
+        let file: EchKeyFile = crate::acme::persist::load_toml(&settings.keys_file, 65536)?;
         if file.keys.is_empty() || file.keys.len() > 8 || !file.keys.iter().any(|k| k.retry) {
             return Err("ECH requires 1..8 keys and at least one retry config".into());
         }
@@ -323,7 +355,7 @@ impl EchMaterial {
         if require_valid_time && !lifetime.valid_at(crate::acme::now()) {
             return Err("ECH public certificate is not currently valid".into());
         }
-        let private_key = PKey::private_key_from_pem(&crate::acme::state::read_private(
+        let private_key = PKey::private_key_from_pem(&crate::acme::persist::read_private(
             &settings.private_key_file,
             65536,
         )?)?;
@@ -487,7 +519,7 @@ pub(crate) fn ech_command(action: &str, config: &Config) -> Result<()> {
         }
         "dns" => {
             let _ = EchMaterial::load(config)?;
-            let file: EchKeyFile = crate::acme::state::load_toml(&settings.keys_file, 65536)?;
+            let file: EchKeyFile = crate::acme::persist::load_toml(&settings.keys_file, 65536)?;
             let mut configs = Vec::new();
             for key in file.keys.into_iter().filter(|key| key.retry) {
                 configs.extend(
@@ -523,7 +555,7 @@ fn ech_stamp(config: &Config) -> Result<Option<[u8; 32]>> {
         (&ech.private_key_file, true),
     ] {
         let bytes = if private {
-            crate::acme::state::read_private(path, 65536)?
+            crate::acme::persist::read_private(path, 65536)?
         } else {
             let mut bytes = Vec::new();
             std::fs::File::open(path)?

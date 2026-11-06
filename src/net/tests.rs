@@ -6,7 +6,7 @@ mod capture;
 mod evolution;
 mod official;
 mod website;
-use crate::acme::store::DiskStore;
+use crate::acme::persist::DiskStore;
 use boring::{
     asn1::Asn1Time,
     bn::BigNum,
@@ -21,10 +21,10 @@ use boring::{
 use std::{os::unix::fs::PermissionsExt, path::PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-struct Fixture {
+pub(super) struct Fixture {
     _root: tempfile::TempDir,
     config: Arc<Config>,
-    ca: PathBuf,
+    pub(super) ca: PathBuf,
     ca_key: PKey<Private>,
     ca_cert: X509,
     site_root: PathBuf,
@@ -38,7 +38,7 @@ impl Drop for Fixture {
 fn key() -> PKey<Private> {
     crate::acme::crypto::p256().unwrap()
 }
-fn fixture() -> Fixture {
+pub(super) fn fixture() -> Fixture {
     let root = tempfile::tempdir().unwrap();
     let ca_key = key();
     let leaf_key = key();
@@ -211,7 +211,7 @@ fn fixture() -> Fixture {
         origin,
     }
 }
-async fn network(f: &Fixture, target: Option<std::net::SocketAddr>) -> Network {
+pub(super) async fn network(f: &Fixture, target: Option<std::net::SocketAddr>) -> Network {
     // Port zero is deliberately test-only. Production Config rejects it.
     let mut app = App::load(&f.config).unwrap();
     app.egress.test_target = target;
@@ -643,11 +643,11 @@ async fn real_h2_rejects_h1_absent_alpn_private_targets_and_site_traversal() {
     task.await.unwrap().unwrap();
 }
 
-struct QClient {
+pub(super) struct QClient {
     socket: UdpSocket,
     server: std::net::SocketAddr,
-    conn: quiche::Connection,
-    h3: Option<quiche::h3::Connection>,
+    pub(super) conn: quiche::Connection,
+    pub(super) h3: Option<quiche::h3::Connection>,
     next_id: u64,
     responses: std::collections::HashMap<u64, QResponse>,
     read_limit: usize,
@@ -686,14 +686,9 @@ impl QClient {
         config.set_max_idle_timeout(30000);
         config.set_max_recv_udp_payload_size(1350);
         config.set_max_send_udp_payload_size(1350);
-        // Capture workloads use larger windows to keep stress-test receive
-        // limits from dominating their packet sizes and scheduling.
-        let stream_window = if keylog.is_some() { 1024 * 1024 } else { 65536 };
-        config.set_initial_max_data(if keylog.is_some() {
-            8 * 1024 * 1024
-        } else {
-            1024 * 1024
-        });
+        // Key logging is observation only: retain the same small receive windows.
+        let stream_window = 65536;
+        config.set_initial_max_data(1024 * 1024);
         config.set_initial_max_stream_data_bidi_local(stream_window);
         config.set_initial_max_stream_data_bidi_remote(stream_window);
         config.set_initial_max_stream_data_uni(65536);
@@ -735,7 +730,7 @@ impl QClient {
             },
         }
     }
-    async fn new(server: std::net::SocketAddr, ca: &std::path::Path) -> Self {
+    pub(super) async fn new(server: std::net::SocketAddr, ca: &std::path::Path) -> Self {
         let mut client = Self::initial(server, ca).await;
         let end = std::time::Instant::now() + Duration::from_secs(5);
         while client.h3.is_none() {
@@ -970,11 +965,12 @@ impl QClient {
             }
             assert!(
                 std::time::Instant::now() < end,
-                "H3 response deadline, connection={:?}, received={:?}",
+                "H3 response deadline, connection={:?}, received={:?}, stats={:?}",
                 self.conn.local_error(),
                 self.responses
                     .get(&id)
-                    .map(|r| (r.status, r.body.len(), r.finished, r.reset))
+                    .map(|r| (r.status, r.body.len(), r.finished, r.reset)),
+                self.conn.stats()
             );
             self.step().await;
         }
@@ -2232,9 +2228,11 @@ async fn negotiated_windows_share_h2_h3_connections_without_content_changes() {
         auth::{Binding, Context},
         codec::{Decoder, Encoder, Offer},
     };
+    let case = crate::acme::lab_support::Case::new("codec-windows");
     let f = fixture();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let server = network(&f, Some(listener.local_addr().unwrap())).await;
+    let origin_addr = listener.local_addr().unwrap();
+    let server = network(&f, Some(origin_addr)).await;
     let origin = tokio::spawn(async move {
         let mut tasks = tokio::task::JoinSet::new();
         for _ in 0..8 {
@@ -2252,6 +2250,7 @@ async fn negotiated_windows_share_h2_h3_connections_without_content_changes() {
     });
     let tcp = server.tcp_addr().unwrap();
     let udp = server.udp_addr().unwrap();
+    let _capture = case.capture(&[tcp.port(), udp.port(), origin_addr.port()]);
     let (stop, rx) = watch::channel(false);
     let task = tokio::spawn(server.run(rx));
     let credentials = Credentials::new(&[("alice", "long-loopback-test-password")]).unwrap();
@@ -2322,7 +2321,15 @@ async fn negotiated_windows_share_h2_h3_connections_without_content_changes() {
         assert_eq!(decoder.feed(&wire).unwrap(), payload);
         decoder.finish().unwrap();
     }
-    let mut q = QClient::new(udp, &f.ca).await;
+    let mut q = QClient::initial_with_keylog(udp, &f.ca, Some(&case.path().join("h3.keys"))).await;
+    q.io_timeout = Duration::from_secs(5);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while q.h3.is_none() {
+            q.step().await;
+        }
+    })
+    .await
+    .unwrap();
     let mut requests = Vec::new();
     for bits in [1, 2, 5, 7] {
         let binding = Binding {
@@ -2358,8 +2365,13 @@ async fn negotiated_windows_share_h2_h3_connections_without_content_changes() {
             .verify_selection(0, &context(&binding), offer, proof)
             .unwrap();
         assert_eq!(mode, f.config.traffic.select(offer));
+        case.event(
+            "codec_upload",
+            serde_json::json!({"id":id,"bytes":payload.len(),"offer":offer.bits()}),
+        );
         q.send(id, &encode(mode)).await;
         let response = q.response(id).await;
+        case.event("codec_download", serde_json::json!({"id":id,"wire_bytes":response.body.len(),"stats":format!("{:?}",q.conn.stats())}));
         let mut decoder = Decoder::new(mode);
         assert_eq!(decoder.feed(&response.body).unwrap(), payload);
         decoder.finish().unwrap();

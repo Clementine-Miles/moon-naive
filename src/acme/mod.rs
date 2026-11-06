@@ -1,19 +1,16 @@
 //! Live DNS-01 certificate management. All network crypto uses boring 5.
-mod account;
+pub mod account;
 pub mod certificate;
 pub mod crypto;
 pub mod dns;
-pub mod eab;
 pub mod http;
 pub mod manager;
+pub mod persist;
 pub mod porkbun;
-pub mod state;
-pub mod store;
 #[cfg(test)]
 mod tests;
 
-pub type Error = Box<dyn std::error::Error + Send + Sync>;
-pub type Result<T> = std::result::Result<T, Error>;
+use crate::{Error, Result};
 
 pub fn now() -> u64 {
     std::time::SystemTime::now()

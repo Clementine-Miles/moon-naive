@@ -28,7 +28,7 @@ use crate::{ChallengeStatus, Error, Key, nonce_from_response, retry_after};
 pub struct Order {
     pub(crate) account: Arc<AccountInner>,
     pub(crate) nonce: Option<String>,
-    pub(crate) retry_after: Option<SystemTime>,
+    pub(crate) retry_after: crate::RetryAfter,
     pub(crate) url: String,
     pub(crate) state: OrderState,
 }
@@ -98,6 +98,7 @@ impl Order {
             .await?;
 
         self.nonce = nonce_from_response(&rsp);
+        self.retry_after = retry_after(&rsp);
         self.state = Problem::check::<OrderState>(rsp).await?;
         Ok(())
     }
@@ -116,6 +117,7 @@ impl Order {
                 .post(None::<&Empty>, self.nonce.take(), &self.url)
                 .await?;
             self.nonce = nonce_from_response(&rsp);
+            self.retry_after = retry_after(&rsp);
             self.state = Problem::check::<OrderState>(rsp).await?;
         }
 
@@ -164,10 +166,10 @@ impl Order {
     /// Yields the [`OrderStatus`] immediately if `Ready` or `Invalid`, or yields an
     /// [`Error::Timeout`] if the [`RetryPolicy::timeout`] has been reached.
     pub async fn poll_ready(&mut self, retries: &RetryPolicy) -> Result<OrderStatus, Error> {
-        let mut retrying = retries.state();
-        self.retry_after = None;
+        let mut retrying = retries.state()?;
         loop {
-            if let ControlFlow::Break(err) = retrying.wait(self.retry_after.take()).await {
+            let after = std::mem::replace(&mut self.retry_after, crate::RetryAfter::Absent);
+            if let ControlFlow::Break(err) = retrying.wait(after.deadline()?).await {
                 return Err(err);
             }
 
@@ -187,10 +189,14 @@ impl Order {
     /// An error is returned immediately: if the order state is `Invalid`, if polling runs
     /// into a timeout, or if the ACME CA suggest to retry at a later time.
     pub async fn poll_certificate(&mut self, retries: &RetryPolicy) -> Result<String, Error> {
-        let mut retrying = retries.state();
-        self.retry_after = None;
+        if matches!(self.state.status, OrderStatus::Valid | OrderStatus::Invalid) {
+            return self.certificate().await?
+                .ok_or(Error::Str("no certificates received from ACME CA"));
+        }
+        let mut retrying = retries.state()?;
         loop {
-            if let ControlFlow::Break(err) = retrying.wait(self.retry_after.take()).await {
+            let after = std::mem::replace(&mut self.retry_after, crate::RetryAfter::Absent);
+            if let ControlFlow::Break(err) = retrying.wait(after.deadline()?).await {
                 return Err(err);
             }
 
@@ -222,6 +228,11 @@ impl Order {
     /// Extract the URL and last known state from the `Order`
     pub fn into_parts(self) -> (String, OrderState) {
         (self.url, self.state)
+    }
+
+    /// Last response scheduling hint, for applications that persist polling deadlines.
+    pub fn retry_after(&self) -> crate::RetryAfter {
+        self.retry_after
     }
 
     /// Get the last known state of the order
@@ -623,12 +634,13 @@ impl RetryPolicy {
         self
     }
 
-    fn state(&self) -> RetryState {
-        RetryState {
+    fn state(&self) -> Result<RetryState, Error> {
+        Ok(RetryState {
             delay: self.delay,
             backoff: self.backoff,
-            deadline: Instant::now() + self.timeout,
-        }
+            deadline: Instant::now().checked_add(self.timeout)
+                .ok_or(Error::Str("unrepresentable retry deadline"))?,
+        })
     }
 }
 
@@ -649,21 +661,58 @@ impl RetryState {
         if let Some(after) = after {
             let now = SystemTime::now();
             if let Ok(delay) = after.duration_since(now) {
-                let next = Instant::now() + delay;
+                let Some(next) = Instant::now().checked_add(delay) else {
+                    return ControlFlow::Break(Error::Str("unrepresentable Retry-After"));
+                };
                 if next > self.deadline {
                     return ControlFlow::Break(Error::Timeout(Some(next)));
                 } else {
                     sleep(delay).await;
+                    if Instant::now() > self.deadline {
+                        return ControlFlow::Break(Error::Timeout(None));
+                    }
                     return ControlFlow::Continue(());
                 }
             }
         }
 
-        sleep(self.delay).await;
-        self.delay = self.delay.mul_f32(self.backoff);
-        match Instant::now() + self.delay > self.deadline {
-            true => ControlFlow::Break(Error::Timeout(None)),
-            false => ControlFlow::Continue(()),
+        let Some(next) = Instant::now().checked_add(self.delay) else {
+            return ControlFlow::Break(Error::Str("unrepresentable retry delay"));
+        };
+        if next > self.deadline {
+            return ControlFlow::Break(Error::Timeout(None));
         }
+        sleep(self.delay).await;
+        let Ok(delay) = Duration::try_from_secs_f64(self.delay.as_secs_f64() * f64::from(self.backoff)) else {
+            return ControlFlow::Break(Error::Str("unrepresentable retry backoff"));
+        };
+        self.delay = delay;
+        if Instant::now() > self.deadline {
+            return ControlFlow::Break(Error::Timeout(None));
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn retry_wait_checks_deadline_before_sleep() {
+        let mut state = RetryPolicy::new().initial_delay(Duration::from_secs(1))
+            .timeout(Duration::ZERO).state().unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(100), state.wait(None)).await.unwrap();
+        assert!(matches!(result, ControlFlow::Break(Error::Timeout(None))));
+    }
+
+    #[tokio::test]
+    async fn retry_wait_does_not_discard_last_permitted_attempt() {
+        let mut state = RetryPolicy::new().initial_delay(Duration::from_millis(1))
+            .backoff(1000.0).timeout(Duration::from_millis(500)).state().unwrap();
+        assert!(matches!(state.wait(None).await, ControlFlow::Continue(())));
+        let result = tokio::time::timeout(Duration::from_millis(100), state.wait(None)).await.unwrap();
+        assert!(matches!(result, ControlFlow::Break(Error::Timeout(None))));
     }
 }

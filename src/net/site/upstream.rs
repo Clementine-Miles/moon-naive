@@ -1,6 +1,12 @@
 //! Fixed configuration origins; async bounded DNS, Pingora peers/pools and passive failover.
 use super::{Result, Website};
+use crate::net::egress::Egress;
+use moon_naive_core::policy::{Authority, allows_ip};
 use moon_naive_core::{config::Config, website::Upstream};
+use pingora_core::{
+    connectors::L4Connect,
+    protocols::l4::{stream::Stream as L4, virt::VirtualSocketStream},
+};
 use pingora_core::{
     protocols::ALPN,
     upstreams::peer::{HttpPeer, HttpUpstreamRequestPolicy},
@@ -155,7 +161,7 @@ impl Pool {
         {
             let addresses = tokio::time::timeout(
                 Duration::from_secs(config.connect_timeout_secs).min(Duration::from_secs(2)),
-                crate::net::resolve::lookup(origin.host.as_str(), origin.port),
+                crate::resolve::lookup(origin.host.as_str(), origin.port),
             )
             .await
             .map_err(|_| pingora_core::Error::new_up(pingora_core::ErrorType::ConnectTimedout))?
@@ -223,13 +229,7 @@ impl Pool {
                 )
             })
         }));
-        peer.options.connection_timeout = Some(Duration::from_secs(config.connect_timeout_secs));
-        peer.options.total_connection_timeout = peer.options.connection_timeout;
-        peer.options.read_timeout = Some(Duration::from_secs(config.read_timeout_secs));
-        peer.options.write_timeout = Some(Duration::from_secs(config.write_timeout_secs));
-        peer.options.idle_timeout = Some(Duration::from_secs(config.upstream_idle_secs));
-        peer.options.verify_cert = true;
-        peer.options.verify_hostname = true;
+        configure_peer(&mut peer, config);
         peer.options.ca = origin.ca.clone();
         peer.options.alpn = if origin.tls && self.config.http2 {
             ALPN::H2H1
@@ -316,6 +316,117 @@ impl pingora_core::connectors::L4Connect for ResolvedConnector {
         .map_err(|_| pingora_core::Error::new_up(pingora_core::ErrorType::ConnectError))?;
         Ok(socket.into())
     }
+}
+
+pub(super) struct ForwardOrigin {
+    authority: Authority,
+    tls: bool,
+    user: usize,
+    egress: Egress,
+}
+impl ForwardOrigin {
+    pub fn new(origin: &str, user: usize, egress: Egress) -> Result<Self> {
+        let uri: http::Uri = origin.parse()?;
+        let host = uri.host().ok_or("forward host missing")?;
+        let tls = match uri.scheme_str() {
+            Some("https") => true,
+            Some("http") => false,
+            _ => return Err("unsupported forward scheme".into()),
+        };
+        let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
+        let authority = Authority::parse(&format!("{host}:{port}"))?;
+        Ok(Self {
+            authority,
+            tls,
+            user,
+            egress,
+        })
+    }
+    pub async fn peer(&self, config: &Website) -> pingora_core::Result<Box<HttpPeer>> {
+        let fail = || pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(502));
+        if self.egress.is_self(&self.authority.host) {
+            return Err(fail());
+        }
+        let addresses = tokio::time::timeout(
+            Duration::from_secs(config.connect_timeout_secs),
+            crate::resolve::lookup(self.authority.host.as_str(), self.authority.port),
+        )
+        .await
+        .map_err(|_| fail())?
+        .map_err(|_| fail())?
+        .take(33)
+        .collect::<Vec<_>>();
+        if addresses.len() > 32 {
+            return Err(fail());
+        }
+        let addresses: Vec<_> = addresses
+            .into_iter()
+            .filter(|a| {
+                allows_ip(a.ip(), &self.egress.own) && !super::super::egress::is_local(a.ip())
+            })
+            .collect();
+        let addr = *addresses.first().ok_or_else(fail)?;
+        let mut peer = HttpPeer::new(addr, self.tls, self.authority.host.clone());
+        peer.group_key = self.user as u64 + 1;
+        peer.options.custom_l4 = Some(Arc::new(ForwardConnector {
+            egress: self.egress.clone(),
+            addresses,
+            next: std::sync::atomic::AtomicUsize::new(0),
+        }));
+        if self.tls {
+            peer.options.ca = self.egress.roots.get().await.map_err(|_| fail())?;
+        }
+        peer.options.alpn = if self.tls {
+            pingora_core::protocols::ALPN::H2H1
+        } else {
+            pingora_core::protocols::ALPN::H1
+        };
+        configure_peer(&mut peer, config);
+        Ok(Box::new(peer))
+    }
+}
+struct ForwardConnector {
+    egress: Egress,
+    addresses: Vec<std::net::SocketAddr>,
+    next: std::sync::atomic::AtomicUsize,
+}
+impl std::fmt::Debug for ForwardConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CheckedEgress")
+    }
+}
+#[async_trait::async_trait]
+impl L4Connect for ForwardConnector {
+    fn connection_attempts(&self) -> usize {
+        self.addresses.len()
+    }
+    fn attempt_timeout(&self) -> Option<Duration> {
+        Some(Duration::from_secs(3))
+    }
+    async fn connect(
+        &self,
+        _addr: &pingora_core::protocols::l4::socket::SocketAddr,
+    ) -> pingora_core::Result<L4> {
+        let mut addresses = self.addresses.clone();
+        let len = addresses.len();
+        addresses.rotate_left(self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % len);
+        let stream: crate::net::egress::Stream = self
+            .egress
+            .dial_candidates(addresses)
+            .await
+            .map_err(|_| pingora_core::Error::new(pingora_core::ErrorType::ConnectError))?;
+        Ok(L4::from(VirtualSocketStream::new(Box::new(stream))))
+    }
+}
+
+fn configure_peer(peer: &mut HttpPeer, config: &Website) {
+    peer.options.connection_timeout = Some(Duration::from_secs(config.connect_timeout_secs));
+    peer.options.total_connection_timeout = peer.options.connection_timeout;
+    peer.options.read_timeout = Some(Duration::from_secs(config.read_timeout_secs));
+    peer.options.write_timeout = Some(Duration::from_secs(config.write_timeout_secs));
+    peer.options.idle_timeout = Some(Duration::from_secs(config.upstream_idle_secs));
+    peer.options.verify_cert = true;
+    peer.options.verify_hostname = true;
 }
 
 #[cfg(test)]

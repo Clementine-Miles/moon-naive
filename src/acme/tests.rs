@@ -1,6 +1,6 @@
 use super::{
     http::Http,
-    state::{Journal, State, read_private},
+    persist::{Journal, State, read_private},
 };
 use bytes::Bytes;
 use http::{Request, Response};
@@ -114,7 +114,7 @@ async fn http_rejects_cleartext_limits_body_and_cancels_deadline() {
 
 #[test]
 fn completed_order_retirement_persists_cooldown_account_and_dns_ownership() {
-    use super::state::{Lease, Order};
+    use super::persist::{Lease, Order};
     let root = tempfile::tempdir().unwrap();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let state = State::open(root.path(), &"b".repeat(64)).unwrap();
@@ -152,9 +152,9 @@ fn secret_reader_checks_opened_file_and_rejects_fifo_without_blocking() {
     let path = root.path().join("secret");
     std::fs::write(&path, b"fixture").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let file = super::state::open_private(&path, 64).unwrap();
+    let file = super::persist::open_private(&path, 64).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(super::state::validate_private(&file, 64).is_err());
+    assert!(super::persist::validate_private(&file, 64).is_err());
     let fifo = root.path().join("fifo");
     rustix::fs::mknodat(
         rustix::fs::CWD,

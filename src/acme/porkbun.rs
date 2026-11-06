@@ -3,7 +3,7 @@ use super::{
     Result,
     dns::{DnsProvider, authoritative_txt},
     http::Http,
-    state::Lease,
+    persist::Lease,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -18,7 +18,7 @@ pub struct Credentials {
 }
 impl Credentials {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        let value: Self = crate::acme::state::parse_toml(bytes)?;
+        let value: Self = crate::acme::persist::parse_toml(bytes)?;
         value.validate()
     }
     pub fn new(apikey: String, secretapikey: String) -> Result<Self> {
@@ -138,13 +138,6 @@ impl Porkbun {
         Ok(records.clone())
     }
 }
-fn matches(record: &Value, lease: &Lease) -> bool {
-    record["type"] == "TXT"
-        && record["content"] == lease.value
-        && record["name"]
-            .as_str()
-            .is_some_and(|name| name.trim_end_matches('.').eq_ignore_ascii_case(&lease.name))
-}
 fn record_id(value: &Value) -> Result<String> {
     let id = value
         .as_str()
@@ -161,22 +154,23 @@ impl DnsProvider for Porkbun {
     fn identity(&self) -> String {
         format!("porkbun:{}", self.zone)
     }
+    async fn prepare(&mut self, lease: &mut Lease) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            self.relative(lease)?;
+            self.discover().await?;
+            super::dns::adopt(&self.records(lease).await?, lease, "notes", record_id, true)?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| "DNS preparation deadline")?
+    }
     async fn present(&mut self, lease: &mut Lease) -> Result<()> {
-        let relative = self.relative(lease)?;
-        self.discover().await?;
-        let records = self.records(lease).await?;
-        if let Some(record) = records
-            .iter()
-            .find(|r| matches(r, lease) && r["notes"] == lease.marker)
-        {
-            lease.record_id = Some(record_id(&record["id"])?);
-            lease.borrowed = false;
+        if lease.record_id.is_some() {
             return Ok(());
         }
-        if let Some(record) = records.iter().find(|r| matches(r, lease)) {
-            lease.record_id = Some(record_id(&record["id"])?);
-            lease.borrowed = true;
-            return Ok(());
+        let relative = self.relative(lease)?;
+        if self.nameservers.is_none() {
+            return Err("DNS read-only preparation required".into());
         }
         let value = self
             .api(
@@ -185,7 +179,13 @@ impl DnsProvider for Porkbun {
             "content":lease.value,"ttl":600,"notes":lease.marker}),
                 Some(&lease.marker),
             )
-            .await?;
+            .await;
+        if let Err(error) = &value
+            && super::http::mutation_rejected(error)
+        {
+            lease.phase = super::persist::LeasePhase::Preparing;
+        }
+        let value = value?;
         lease.record_id = Some(record_id(&value["id"])?);
         lease.borrowed = false;
         if value
@@ -198,26 +198,37 @@ impl DnsProvider for Porkbun {
     }
     async fn propagated(&mut self, lease: &Lease) -> Result<bool> {
         self.relative(lease)?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         if self.nameservers.is_none() {
-            self.discover().await?;
+            tokio::time::timeout_at(deadline, self.discover())
+                .await
+                .map_err(|_| "DNS discovery deadline")??;
         }
         for host in self.nameservers.as_ref().unwrap() {
-            let mut addresses: Vec<_> = tokio::time::timeout(
-                Duration::from_secs(5),
-                crate::net::resolve::lookup_control(host.as_str(), 53),
+            let mut addresses: Vec<_> = tokio::time::timeout_at(
+                deadline.min(tokio::time::Instant::now() + Duration::from_secs(5)),
+                crate::resolve::lookup_control(host.as_str(), 53),
             )
             .await??
+            .take(33)
             .collect();
+            if addresses.len() > 32 {
+                return Err("too many authoritative DNS candidates".into());
+            }
             addresses.sort_by_key(|addr| !addr.is_ipv4());
             if addresses.is_empty() {
                 return Err("Porkbun authoritative nameserver has no address".into());
             }
             let mut visible = false;
             for address in addresses {
-                if authoritative_txt(address, &lease.name, &lease.value)
-                    .await
-                    .unwrap_or(false)
-                {
+                if matches!(
+                    tokio::time::timeout_at(
+                        deadline.min(tokio::time::Instant::now() + Duration::from_secs(1)),
+                        authoritative_txt(address, &lease.name, &lease.value)
+                    )
+                    .await,
+                    Ok(Ok(true))
+                ) {
                     visible = true;
                     break;
                 }
@@ -231,38 +242,20 @@ impl DnsProvider for Porkbun {
     async fn recover(&mut self, lease: &mut Lease) -> Result<()> {
         if lease.borrowed
             || lease.record_id.is_some()
-            || lease.phase != super::state::LeasePhase::CreateUncertain
+            || lease.phase != super::persist::LeasePhase::CreateUncertain
         {
             return Ok(());
         }
-        let records = self.records(lease).await?;
-        if let Some(record) = records
-            .iter()
-            .find(|record| matches(record, lease) && record["notes"] == lease.marker)
-        {
-            lease.record_id = Some(record_id(&record["id"])?);
-            lease.phase = super::state::LeasePhase::Created;
-            return Ok(());
-        }
-        Err("DNS create outcome uncertain; retain marker and reconcile again".into())
+        super::dns::recover_owned(&self.records(lease).await?, lease, "notes", record_id)
     }
     async fn cleanup(&mut self, lease: &Lease) -> Result<()> {
         if lease.borrowed {
             return Ok(());
         }
         let records = self.records(lease).await?;
-        if lease.phase == super::state::LeasePhase::CreateUncertain
-            && lease.record_id.is_none()
-            && !records
-                .iter()
-                .any(|record| matches(record, lease) && record["notes"] == lease.marker)
-        {
-            // A single empty list can precede a delayed remote commit. Keep the
-            // durable marker, including across shutdown; never create a new order.
-            return Err("DNS create outcome uncertain; retain lease and reconcile again".into());
-        }
+        super::dns::cleanup_known(&records, lease, "notes")?;
         for record in records {
-            if matches(&record, lease) && record["notes"] == lease.marker {
+            if super::dns::matches_record(&record, lease) && record["notes"] == lease.marker {
                 let id = record_id(&record["id"])?;
                 self.api(&format!("/dns/delete/{}/{id}", self.zone), json!({}), None)
                     .await?;
@@ -346,11 +339,14 @@ mod tests {
         let mut provider = Porkbun::new(http.clone(), "example.dev", credentials()).unwrap();
         provider.api_base = server.url.clone();
         let intent = lease();
-        assert!(provider.present(&mut intent.clone()).await.is_err());
+        let mut submitted = intent.clone();
+        provider.prepare(&mut submitted).await.unwrap();
+        assert!(provider.present(&mut submitted).await.is_err());
         // New process, original durable intent: discover the owned record by notes.
         let mut provider = Porkbun::new(http, "example.dev", credentials()).unwrap();
         provider.api_base = server.url.clone();
         let mut recovered = intent.clone();
+        provider.prepare(&mut recovered).await.unwrap();
         provider.present(&mut recovered).await.unwrap();
         assert_eq!(recovered.record_id.as_deref(), Some("10"));
         assert!(!recovered.borrowed);
@@ -361,6 +357,7 @@ mod tests {
         assert_eq!(*records.lock().unwrap(), vec![foreign]);
         records.lock().unwrap().push(json!({"id":"11","type":"TXT","name":intent.name,"content":intent.value,"notes":"another-owner"}));
         let mut borrowed = intent;
+        provider.prepare(&mut borrowed).await.unwrap();
         provider.present(&mut borrowed).await.unwrap();
         assert!(borrowed.borrowed);
         provider.cleanup(&borrowed).await.unwrap();
@@ -390,7 +387,7 @@ mod tests {
         let mut outside = lease();
         outside.name = "_acme-challenge.badexample.dev".into();
         assert!(provider.relative(&outside).is_err());
-        assert!(provider.present(&mut lease()).await.is_err());
+        assert!(provider.prepare(&mut lease()).await.is_err());
         assert!(Credentials::parse(b"apikey = 'a'\nsecretapikey = ''").is_err());
         assert!(record_id(&json!("../1")).is_err());
     }
