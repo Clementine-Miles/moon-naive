@@ -2,7 +2,7 @@
 
 基于 **Rust、Pingora、BoringSSL 和 quiche** 的 H2/H3 代理服务端，当前版本 **0.7.0**，面向 Linux x86_64。支持固定源站反向代理，以及经过认证的 CONNECT 和 HTTP(S) 正向代理。
 
-仅支持 **moon-naive 修订4协议**，与官方 Naïve 客户端不兼容；配套 Chromium 客户端尚未实现。
+仅支持 **moon-naive 修订4协议**，与官方 Naïve 客户端不兼容；Android/Linux 实验客户端源码已导入并初步适配；完整构建和互通尚未验收，见[项目手册](docs/PROJECT.md#androidlinux-实验客户端)。
 
 ## 证书管理
 

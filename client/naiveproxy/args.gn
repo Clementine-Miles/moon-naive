@@ -1,0 +1,32 @@
+# Copyright 2026 moon-naive contributors. SPDX-License-Identifier: Apache-2.0
+# Linux/Android only. Derived from the pinned official src/build.sh profile.
+is_debug = false
+is_component_build = false
+is_official_build = false
+chrome_pgo_phase = 0
+symbol_level = 1
+is_clang = true
+use_sysroot = false
+is_cronet_build = true
+use_udev = false
+use_aura = false
+use_ozone = false
+use_gio = false
+use_glib = false
+use_platform_icu_alternatives = true
+is_perfetto_embedder = true
+disable_file_support = true
+enable_websockets = false
+use_kerberos = false
+disable_zstd_filter = false
+enable_mdns = false
+enable_reporting = false
+include_transport_security_state_preload_list = false
+enable_device_bound_sessions = false
+enable_bracketed_proxy_uris = true
+enable_quic_proxy_support = true
+enable_disk_cache_sql_backend = false
+use_nss_certs = false
+enable_backup_ref_ptr_support = false
+enable_dangling_raw_ptr_checks = false
+use_clang_modules = false

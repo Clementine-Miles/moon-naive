@@ -2,7 +2,7 @@
 
 适用版本 0.7.0。本文统一原配置、协议、部署、ACME 生命周期、构建工具与信任根说明；仓库原有目录是 `docs`，没有 `docx`。主配置模板仍以 [config.example.toml](../config.example.toml) 为准。
 
-本项目基于 Rust、Pingora、BoringSSL 和 quiche，面向 Linux x86_64。仅实现 moon-naive revision 4；官方 Naïve 客户端不兼容，配套 Chromium 客户端尚未实现。
+本项目基于 Rust、Pingora、BoringSSL 和 quiche，面向 Linux x86_64。仅实现 moon-naive revision 4；官方 Naïve 客户端不兼容，已引入 Android/Linux Chromium 实验客户端源码，完整构建与互通尚未验收。
 
 测试、基准、实验工具、测试夹具、仅供验证的 vendor 示例及容器构建/运行入口已从当前源码树移除。生产 ACME staging、信任根和配置诊断保留；名称包含 test 的 CA 域名/公开根不等于测试源码。
 
@@ -11,6 +11,7 @@
 - [ACME 状态与 TLS 激活](#acme-状态与-tls-激活)
 - [原生构建与部署](#原生构建与部署)
 - [构建检查与维护边界](#构建检查与维护边界)
+- [Android/Linux 实验客户端](#androidlinux-实验客户端)
 - [历史审阅与实验记录](#历史审阅与实验记录清理前)
 - [Staging 信任根来源](#staging-信任根来源)
 
@@ -385,7 +386,7 @@ ACME journal 写入版本 3，保留版本 1/2 的保守读取迁移。创建结
 
 ## 协议与架构
 
-当前版本 **0.7.0**，认证域与 exporter 使用修订4。**不产生空闲假流量，不为真实反代添加Padding首部或改写正文**。采用认证协商的8/16条初期窗口，可选低比例后段填充。旧moon-naive和官方Naïve客户端不兼容；新的Chromium客户端尚待实现。
+当前版本 **0.7.0**，认证域与 exporter 使用修订4。**不产生空闲假流量，不为真实反代添加Padding首部或改写正文**。采用认证协商的8/16条初期窗口，可选低比例后段填充。旧moon-naive和官方Naïve客户端不兼容；实验客户端初步适配见下文；尚未通过完整构建与互通验收。
 
 ### 路由与连接
 
@@ -741,9 +742,58 @@ ACME 已完成订单的证书若已过期或进入更新窗口，先验证身份
 
 构建依赖 C/C++、make、CMake、libclang、Linux headers、Perl、pkg-config、Git 与系统 CA；同平台 BoringSSL 复用方法见原生构建章节。构建、摘要、tar.gz、ELF 检查由 tools/xtask 的 Rust 工具完成，不依赖实验 Python/Go 程序。
 
-当前检查结果仅说明本次清理后的构建与静态检查情况，不能代替已删除的 codec、半关闭、恢复、权限和真实网络回归覆盖。真实 Chromium revision 4 客户端、其他目标/MSRV、长期运行、公网 CA/DNS、性能与 DPI 可识别性不能由编译成功推导。
+当前检查结果仅说明本次清理后的构建与静态检查情况，不能代替已删除的 codec、半关闭、恢复、权限和真实网络回归覆盖。实验客户端的真实互通、其他目标/MSRV、长期运行、公网 CA/DNS、性能与 DPI 可识别性不能由编译成功推导。
 
 合并前的审阅与实验记录保留于 Git 提交 [bcf418e](https://github.com/Clementine-Miles/moon-naive/tree/bcf418ea1f99900da64ed2abbee292d2484dbbc7/docs)，对应当时源码；不得作为当前提交的测试执行成功。仓库外既有抓包、密钥和 journal 工件未纳入源代码归档。
+
+## Android/Linux 实验客户端
+
+### 来源与裁剪
+
+官方来源为 [klzgrad/naiveproxy](https://github.com/klzgrad/naiveproxy)，固定发布标签 `v154.0.8037.49-5`、commit `d04efe1ea4477c2db24a7d0e2f068b3bee931e45`、Chromium `154.0.8037.49`。不跟随会重写历史的 master；来源以 [UPSTREAM_REVISION](../client/naiveproxy/UPSTREAM_REVISION) 为准。
+
+[client/naiveproxy](../client/naiveproxy/) 保留 Linux/Android 共用的 Naïve CLI、SOCKS/HTTP 本地入口、连接搬运、记录适配及 Android 原生插件源码。没有引入 Windows、macOS、iOS、OpenWrt 的发布脚本、CI、测试、Docker、预编译客户端、上游签名 keystore 或整棵 Chromium 通用依赖。旧 preamble getter 及连接级 padding 缓存已删除。
+
+这是**源码 overlay 与精确 Chromium 补丁**，不是脱离 Chromium 的独立 C++ 程序。通用 Chromium/BoringSSL/GN 依赖在仓库外按固定 commit 获取；它们为两平台共用的构建依赖，不能按文件名随意裁剪再声称可构建。保留的上游源码有 BSD 许可和版权；Android 插件 Kotlin 文件为 GPL-3.0-or-later，随附 apk/COPYING；新增 moon-naive 文件使用项目 Apache-2.0。Android 包名改为 `org.moonnaive.plugin`，插件 ID 为 `moon-naive-plugin`，与官方插件分开；宿主应用需要支持这个新 ID。本仓库不提供完整 Android VPN GUI。
+
+### 本次适配边界
+
+- 仅一个有凭据的 HTTPS 下一跳、TLS 1.3、H2 普通 CONNECT；缺少 proxy、直接连接、QUIC、多跳、extra-headers、密钥日志和旧 tunnel-timeout 配置均拒绝。不会退回官方 Naïve Basic 认证协议。
+- [chromium.patch](../client/naiveproxy/chromium.patch) 在 ActivateCreatedStream 分配实际流 ID 后、序列化 HEADERS 前生成请求证明。exporter 显式空 context、label、转录字段和响应域均保持服务端 revision 4 原样；每个 socket/流独立保存绑定，不把 TLS 连接标记为已登录。
+- Basic 凭据只用于读取 Chromium 原有本地凭据缓存、派生共享 key，随后清除临时明文和认证字段；线上只有 `moon-naive 02.<proof>`。CONNECT 只生成 method、authority 与证明，不发送 preamble、旧 Padding/FastOpen 或额外浏览器首部。两条 HPACK 编码路径在查找动态表前强制 Proxy-Authorization 使用 never-index。
+- 200 和唯一的 Proxy-Authentication-Info 验证通过后才报告外层 CONNECT 成功；认证、字段、连接、流 ID 或目标不匹配都失败。H1 fallback 在生成认证前拒绝；QUIC 与 early data 显式关闭。证书、主机名和原有信任验证继续由 Chromium 执行。
+- 初步只提议 02：双向有限 16 条记录，各自独立计数；发送 N≤16309、P=0，接收校验 N/P/零填充和任意分片，第 16 条 padding 消费完成后精确切换 raw。发送保留原有有限缓冲及短写 drain。未实现 8 条或稀疏模式提议，未添加兼容协议。
+- 使用 Chromium 默认接收窗口，删除上游 CLI 的超大窗口覆盖；没有据此宣称吞吐或指纹改善。服务端 Rust 源码、预算、ACL、CONNECT 时序与协议均未修改。
+
+### 准备、构建与 Android 打包
+
+唯一准备入口为 [prepare.py](../client/naiveproxy/prepare.py)。Python 3.10+ 和 Git 为准备阶段依赖；完整 native 构建另需匹配上游 DEPS 的 Chromium Clang、GN、Ninja、系统构建依赖，Android 还需对应 NDK。构建目录必须位于本仓库外且为空；入口拒绝覆盖已有工作区。默认只准备源码，不安装依赖、不编译、不执行目标程序。
+
+```sh
+python3 client/naiveproxy/prepare.py --work-dir /absolute/build/moon-linux \
+  --target-os linux --target-cpu x64
+# 已有固定上游 checkout 时，只检查 pin 和补丁适用性：
+python3 client/naiveproxy/prepare.py --check-source /absolute/pinned-naiveproxy
+# 已提供匹配工具链时显式编译；也可提供 --gn /path/gn --ninja /path/ninja。
+python3 client/naiveproxy/prepare.py --work-dir /absolute/build/moon-android \
+  --target-os android --target-cpu arm64 --build
+```
+
+准备入口取固定 commit、检查并应用补丁，再覆盖保留的客户端源码；构建使用 args.gn 和显式目标参数，关闭组件/PGO 构建。输出为外部目录 `src/out/moon-<os>-<cpu>/naive`。官方工具下载方式见固定 commit 的 src/get-clang.sh/src/DEPS；若下载域名或工具链不可用，入口以非零退出，保留准备目录供调查，不换 TLS 后端或修改服务端来绕过。
+
+成功构建后的配置示例（仅实验，使用高熵凭据及正常可信证书）：
+
+```json
+{"listen":"socks://127.0.0.1:1080","proxy":"https://user:replace-with-high-entropy-secret@proxy.example:443"}
+```
+
+Android 使用相同 patched native 程序。将对应 ABI 的 Android 产物放到 `client/naiveproxy/apk/app/libs/<ABI>/libnaive.so`；arm64→arm64-v8a、arm→armeabi-v7a、x64→x86_64、x86→x86。使用 JDK 21、Gradle 8.14.2、Android SDK/build-tools 36，并在 apk 目录运行 `APK_ABI=arm64-v8a gradle assembleDebug`。缺少 native 文件时打包拒绝；release 默认不签名，发行者使用自己的签名配置。未保存 Gradle wrapper 二进制和上游签名密钥。不能拿 Linux ELF 作为 Android native 产物，也不能把交叉编译当作设备执行。
+
+### 已执行检查与未完成事项
+
+本次在仓库外 `/workspace/client-adaptation-evidence/` 编译了协议模块，实际链接现有 BoringSSL libcrypto；与**当前** Rust core 的 authorization/confirmation 对照 stream ID 1、3、255、2147483647，检查不同 exporter/目标/流、反射和重复响应证明拒绝。decoder 检查 1/2/3/4/7/17/127/16384/大块分片、16 条后同输入 raw、越界长度、空记录、padding 超限/非零、截断边界和输出容量不足，均通过。校验程序和构建输出在仓库外，没有重新添加测试源码或 Docker。prepare.py pin/patch 检查、Python 语法及 Android manifest XML 解析通过；这些不是网络互通证据。另实际执行 Linux --build 准备入口：固定源码下载、补丁和 overlay 安装完成，随后因缺少 GN/Ninja/匹配 Clang 按预期以 1 退出，编译阶段没有执行；原始退出码和日志保留于 prepare-linux.exit / prepare-linux.log。
+
+**完整客户端仍属未验收的源级初步适配。**本环境访问官方 GN 下载域名 chrome-infra-packages.appspot.com 时收到代理 CONNECT 403，尚无对应 GN/Chromium Clang/Android SDK 的完整构建、APK 安装、新 H2/QUIC 握手或真实 Chromium 客户端续期/ECH/复用结果。H3 未适配，不能使用 quic://。上游连接搬运仍把 EOF 转为整条连接关闭，尚未满足 moon-naive 的双向半关闭验收；不能据本次纯模块检查将其作为可靠客户端发布。后续必须完成两个平台编译、半关闭接口/生命周期、真实服务端握手与认证失败路径、复用、取消/背压/额度回收、证书/ECH 和 POST 不重放验收，再解除实验状态。
 
 ## 历史审阅与实验记录（清理前）
 

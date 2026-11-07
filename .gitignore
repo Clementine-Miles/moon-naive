@@ -19,3 +19,10 @@
 *.pcap
 *.pcapng
 *.keys
+
+# Client build products stay out of source archives.
+/client/naiveproxy/apk/.gradle/
+/client/naiveproxy/apk/**/build/
+/client/naiveproxy/apk/app/libs/
+/client/naiveproxy/apk/local.properties
+__pycache__/
