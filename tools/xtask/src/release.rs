@@ -345,40 +345,137 @@ fn notices(stage: &Path) -> Result<()> {
     )?;
     Ok(())
 }
-pub fn source(directory: &Path) -> Result<()> {
+/// Resolve the revision once and read Git objects, never mutable working files.
+fn source_snapshot(repo: &Path, stage: &Path, revision: &str) -> Result<String> {
+    check(
+        capture(
+            repo,
+            "git",
+            &["status", "--porcelain", "--untracked-files=no"],
+        )?
+        .is_empty(),
+        "source release requires a clean tracked worktree and index",
+    )?;
+    check(!revision.starts_with('-'), "invalid source revision")?;
+    let revision = capture(
+        repo,
+        "git",
+        &["rev-parse", "--verify", &format!("{revision}^{{commit}}")],
+    )?;
+    let revision = revision.trim();
+    let tree = capture(repo, "git", &["ls-tree", "-r", "-z", revision])?;
+    for record in tree.split('\0').filter(|s| !s.is_empty()) {
+        check(
+            record.starts_with("100644 blob ") || record.starts_with("100755 blob "),
+            "source release rejects symlinks, submodules and nonregular Git entries",
+        )?;
+    }
+    let temporary = stage.join(".git-source.tar");
+    let output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let status = std::process::Command::new("git")
+        .current_dir(repo)
+        .args(["archive", "--format=tar", revision])
+        .stdout(output)
+        .status()?;
+    check(status.success(), "git archive failed")?;
+    let result = (|| -> Result<()> {
+        let mut archive = tar::Archive::new(fs::File::open(&temporary)?);
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            // git archive emits a global PAX commit-id header, not a file.
+            if entry.header().entry_type().is_pax_global_extensions() {
+                continue;
+            }
+            let path = entry.path()?.into_owned();
+            check(
+                !path.is_absolute()
+                    && path
+                        .components()
+                        .all(|p| matches!(p, std::path::Component::Normal(_))),
+                "invalid archive path",
+            )?;
+            check(
+                path != Path::new(".git-source.tar"),
+                "reserved release path",
+            )?;
+            check(
+                entry.header().entry_type().is_file() || entry.header().entry_type().is_dir(),
+                "nonregular archive entry",
+            )?;
+            check(entry.unpack_in(stage)?, "archive path escaped stage")?;
+        }
+        Ok(())
+    })();
+    fs::remove_file(temporary)?;
+    result?;
+    fs::write(stage.join("SOURCE_REVISION"), format!("{revision}\n"))?;
+    Ok(revision.into())
+}
+pub fn source(directory: &Path, revision: &str) -> Result<()> {
     audit::sources()?;
     let output = output(directory)?;
     let stage = output.join(format!("moon-naive-{}-source", env!("CARGO_PKG_VERSION")));
     fs::create_dir(&stage)?;
-    let files = capture(
-        &root(),
-        "git",
-        &[
-            "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "-z",
-        ],
-    )?;
-    for name in files.split('\0').filter(|name| !name.is_empty()) {
-        let path = root().join(name);
-        if name.starts_with("vendor/") || !path.is_file() {
-            continue;
-        }
-        check(
-            !Path::new(name).is_absolute()
-                && !Path::new(name)
-                    .components()
-                    .any(|part| part == std::path::Component::ParentDir),
-            "invalid source path",
-        )?;
-        copy(&path, &stage.join(name), name.ends_with(".openrc"))?;
-    }
-    let mut vendor_files = Vec::new();
-    paths(&root().join("vendor"), &mut vendor_files)?;
-    for path in vendor_files {
-        copy(&path, &stage.join(path.strip_prefix(root())?), false)?;
-    }
+    source_snapshot(&root(), &stage, revision)?;
     archive(&stage, &output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn source_uses_committed_bytes_rejects_dirty_and_links_and_preserves_modes() {
+        let base = root()
+            .join("work")
+            .join(format!("source-test-{}", std::process::id()));
+        if base.exists() {
+            fs::remove_dir_all(&base).unwrap();
+        }
+        fs::create_dir_all(&base).unwrap();
+        let repo = base.join("repo");
+        fs::create_dir(&repo).unwrap();
+        capture(&repo, "git", &["init", "-q"]).unwrap();
+        capture(
+            &repo,
+            "git",
+            &["config", "user.email", "fixture@example.invalid"],
+        )
+        .unwrap();
+        capture(&repo, "git", &["config", "user.name", "Fixture"]).unwrap();
+        fs::write(repo.join("run"), b"original").unwrap();
+        fs::set_permissions(repo.join("run"), fs::Permissions::from_mode(0o755)).unwrap();
+        capture(&repo, "git", &["add", "run"]).unwrap();
+        capture(&repo, "git", &["commit", "-qm", "fixture"]).unwrap();
+        fs::write(repo.join("untracked-secret"), b"must not ship").unwrap();
+        fs::create_dir(repo.join("vendor")).unwrap();
+        fs::write(repo.join("vendor/untracked-secret"), b"must not ship").unwrap();
+        let stage = base.join("stage");
+        fs::create_dir(&stage).unwrap();
+        source_snapshot(&repo, &stage, "HEAD").unwrap();
+        assert_eq!(fs::read(stage.join("run")).unwrap(), b"original");
+        assert_ne!(
+            fs::metadata(stage.join("run"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        assert!(!stage.join("untracked-secret").exists());
+        assert!(!stage.join("vendor").exists());
+        archive(&stage, &base).unwrap();
+        let sums = fs::read_to_string(stage.join("SHA256SUMS")).unwrap();
+        assert!(sums.contains(&format!("{}  run", checksum(&stage.join("run")).unwrap())));
+        fs::write(repo.join("run"), b"dirty").unwrap();
+        assert!(source_snapshot(&repo, &stage, "HEAD").is_err());
+        capture(&repo, "git", &["checkout", "--", "run"]).unwrap();
+        std::os::unix::fs::symlink("untracked-secret", repo.join("link")).unwrap();
+        capture(&repo, "git", &["add", "link"]).unwrap();
+        capture(&repo, "git", &["commit", "-qm", "link"]).unwrap();
+        assert!(source_snapshot(&repo, &stage, "HEAD").is_err());
+        fs::remove_dir_all(base).unwrap();
+    }
 }

@@ -135,6 +135,10 @@ fn transport(config: &Config) -> Result<()> {
     Ok(())
 }
 fn certificate_status(config: &Config) -> Result<()> {
+    print!(
+        "{}",
+        acme::health::report(&config.state_dir.join("acme/WORKER"))?
+    );
     let observation = config.state_dir.join("certificates/TLS-LOADED");
     if observation.exists() {
         let text = acme::persist::read_private(&observation, 4096)?;
@@ -148,6 +152,10 @@ fn certificate_status(config: &Config) -> Result<()> {
         let ready = Validator::for_config(config)?
             .verify(stored.candidate, acme::now())
             .is_ok();
+        println!(
+            "certificate_seconds_until_expiry={}",
+            stored.lifetime.not_after.saturating_sub(acme::now())
+        );
         println!(
             "certificate_ready={ready}\ngeneration={}\nnot_after={}\nlisteners=not_checked",
             stored.generation, stored.lifetime.not_after

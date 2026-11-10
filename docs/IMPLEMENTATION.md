@@ -119,3 +119,33 @@ work/clippy.log and work/release.log (running at this checkpoint).
 Initial Clippy found two test-only style issues (redundant pending closure and
 identical timeout branches); corrected without changing behavior. Rerun output:
 work/clippy-final.log. Release build is still running; do not record it as passed.
+
+## Continued work after 1379712
+
+Confirmed previous final Clippy passed (16.42s) and locked Linux x86_64 release
+build passed (1m08s). New changes:
+- Private renewal WORKER observation with process start/boot binding, monotonic
+  heartbeat, stop/panic state, next attempt and per-run last installation success.
+  Existing CLI status separates these observations from certificate readiness.
+- Confirmed externally missing/modified TXT records require reconciliation;
+  uncertain-creation semantics remain conservative, no automatic recreation.
+- Source snapshots now use resolved Git commit objects, reject dirty tracked
+  files, symlinks/submodules; exclude untracked files, preserve executable bits,
+  record revision and generate archive/content checksums.
+
+Validation: xtask packaging fixture passes (including untracked vendor secret,
+executable bit, dirty input, committed symlink and checksum checks); native graph
+and vendor checksum audit passed. Health identity/stale-state/symlink test passed.
+Confirmed-record unit test passed. ACME suite and worker activation regression
+results: work/acme-next.log and work/health-live-tests.log. Clippy after changes:
+work/clippy-health.log. These logs must be checked before marking final success.
+
+Remaining: detailed sanitized transport/ACME failure classes (currently phase),
+additional fairness/retry acceptance tests and resource measurements, H3 performance
+harness/comparisons and justified window policy, final MSRV/release/full-suite run,
+source-archive smoke validation at committed revision, final acceptance report and
+GitHub push. None of these are implied complete by the restored regression count.
+
+Verified continued-work results: ACME suite 88 passed/0 failed (127.11s), actual
+worker/activation suite 9 passed/0 failed (23.29s), health and confirmed-record
+tests passed, Clippy -D warnings passed (15.84s), fmt and diff --check passed.

@@ -234,6 +234,12 @@ impl DnsProvider for Porkbun {
                 }
             }
             if !visible {
+                super::dns::check_confirmed(
+                    &self.records(lease).await?,
+                    lease,
+                    "notes",
+                    record_id,
+                )?;
                 return Ok(false);
             }
         }

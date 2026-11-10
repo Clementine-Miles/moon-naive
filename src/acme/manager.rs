@@ -28,6 +28,7 @@ pub enum Tick {
 /// Run on a dedicated control runtime/process: journal fsync never runs on a
 /// future data-plane worker. No listener is opened by this manager.
 pub struct Manager<P> {
+    pub(crate) health_path: std::path::PathBuf,
     bundle: Option<VerifiedBundle>,
     provider: P,
     http: Http,
@@ -102,6 +103,7 @@ impl<P: DnsProvider> Manager<P> {
         let validator = Validator::for_config(config)?;
         let store = DiskStore::open(&config.state_dir.join("certificates"))?;
         let mut manager = Self {
+            health_path: config.state_dir.join("acme/WORKER"),
             bundle: None,
             provider,
             http: http.clone(),

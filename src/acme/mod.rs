@@ -40,3 +40,5 @@ pub(crate) mod lab_support;
 
 #[cfg(test)]
 pub(crate) mod lab;
+
+pub(crate) mod health;

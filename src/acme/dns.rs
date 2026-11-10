@@ -268,6 +268,25 @@ pub(super) fn recover_owned(
     }
     Err("DNS create outcome uncertain; retain marker and reconcile again".into())
 }
+/// A confirmed creation disappearing is different from an unresolved POST.
+/// Never recreate it automatically or adopt a replacement owned by another actor.
+pub(super) fn check_confirmed(
+    records: &[Value],
+    lease: &Lease,
+    marker: &str,
+    id: fn(&Value) -> Result<String>,
+) -> Result<()> {
+    if let Some(expected) = &lease.record_id
+        && !records.iter().any(|r| {
+            matches_record(r, lease)
+                && (lease.borrowed || r[marker] == lease.marker)
+                && id(&r["id"]).is_ok_and(|actual| actual == *expected)
+        })
+    {
+        return Err("confirmed DNS record missing or modified; operator reconciliation required; ownership retained".into());
+    }
+    Ok(())
+}
 pub(super) fn cleanup_known(records: &[Value], lease: &Lease, marker: &str) -> Result<()> {
     if lease.phase == super::persist::LeasePhase::CreateUncertain
         && lease.record_id.is_none()
@@ -357,6 +376,7 @@ impl DnsProvider for Cloudflare {
                 }
             }
             if !visible {
+                check_confirmed(&self.records(lease).await?, lease, "comment", record_id)?;
                 self.authorities = None;
                 return Ok(false);
             }
@@ -728,5 +748,42 @@ impl Cloudflare {
             Self::new(http, &"a".repeat(32), "synthetic-cloudflare-token".into()).unwrap();
         provider.api_base = api_base;
         provider
+    }
+}
+
+#[cfg(test)]
+mod confirmed_tests {
+    use super::*;
+    #[test]
+    fn confirmed_missing_modified_and_foreign_records_never_resolve_uncertain_creation() {
+        let lease = Lease {
+            name: "_acme-challenge.example.test".into(),
+            value: "value".into(),
+            marker: "owned".into(),
+            record_id: Some("abc".into()),
+            phase: super::super::persist::LeasePhase::Created,
+            borrowed: false,
+        };
+        let record =
+            json!({"id":"abc","type":"TXT","name":lease.name,"content":"value","comment":"owned"});
+        check_confirmed(std::slice::from_ref(&record), &lease, "comment", record_id).unwrap();
+        assert!(
+            check_confirmed(&[], &lease, "comment", record_id)
+                .unwrap_err()
+                .to_string()
+                .contains("confirmed DNS record")
+        );
+        for field in ["id", "content", "comment"] {
+            let mut changed = record.clone();
+            changed[field] = json!("def");
+            assert!(check_confirmed(&[changed], &lease, "comment", record_id).is_err());
+        }
+        let mut uncertain = Lease {
+            record_id: None,
+            phase: super::super::persist::LeasePhase::CreateUncertain,
+            ..lease
+        };
+        assert!(recover_owned(&[], &mut uncertain, "comment", record_id).is_err());
+        assert!(uncertain.record_id.is_none());
     }
 }

@@ -932,3 +932,34 @@ Fast validation: `python3 tools/vectors/generate.py --check` and
 suite includes a real 120-second Retry-After test. Ignored experiments are not
 part of the passing runtime acceptance count. Rust 1.89 core tests and server
 compilation were checked; final change validation status is in the checkpoint.
+
+### Private renewal health
+
+`moon-naive status config.toml` reads the private `state_dir/acme/WORKER`
+observation in addition to validating the installed certificate. It reports
+worker running versus stopped/stale, process identity, heartbeat age, last
+successful installation, next attempt, failure phase and reconciliation flag.
+Heartbeat freshness uses Linux uptime, process start ticks and boot identity;
+a stale file or recycled PID cannot establish worker liveness. This is separate
+from data-plane readiness and does not perform a network handshake. Heartbeats
+run every five seconds while a renewal operation waits; observations older than
+15 seconds are stale. The last-success field is scoped to this worker run.
+Worker panic/stoppage does not disable a valid already-serving TLS generation.
+A persistence failure can stop renewal; inspect the journal and service logs.
+
+If a confirmed TXT record disappears or changes during propagation, the provider
+now reports that operator reconciliation is required and retains ownership. It
+does not recreate or adopt a foreign replacement. An uncertain creation with an
+empty listing remains uncertain. Do not clear journals to force issuance.
+
+### Source snapshots
+
+`cargo xtask source dist HEAD` resolves HEAD to a commit once and packages Git
+objects, including tracked vendor sources and licenses. An explicit commit may
+replace HEAD. Tracked worktree/index changes are rejected; untracked files are
+excluded, including untracked files under vendor. Symlinks and submodules are
+rejected. Executable bits are retained; SOURCE_REVISION records the resolved
+commit and SHA256SUMS is regenerated for the archive contents. The archive has
+its own checksum sidecar. This does not establish runtime correctness or sign
+its provenance. Commit reviewed changes before packaging; never add credentials
+just to make them eligible for an archive.

@@ -193,8 +193,9 @@ fn main() -> ExitCode {
         [cmd] if cmd == "audit-native" => audit_native(),
         [cmd, binary] if cmd == "check-elf" => release::check_elf(Path::new(binary)),
         [cmd, binary, output] if cmd == "dist" => release::dist(Path::new(binary), Path::new(output)),
-        [cmd, output] if cmd == "source" => release::source(Path::new(output)),
-        _ => Err("usage: cargo xtask verify [target] | audit-native | check-elf <binary> | dist <binary> <output-dir> | source <output-dir>".into()),
+        [cmd, output] if cmd == "source" => release::source(Path::new(output), "HEAD"),
+        [cmd, output, revision] if cmd == "source" => release::source(Path::new(output), revision),
+        _ => Err("usage: cargo xtask verify [target] | audit-native | check-elf <binary> | dist <binary> <output-dir> | source <output-dir> [revision]".into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

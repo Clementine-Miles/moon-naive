@@ -113,12 +113,32 @@ async fn control_loop<P: DnsProvider>(
     if mode == Mode::Cleanup {
         return Ok(());
     }
+    let mut health = acme::health::Worker::new(manager.health_path.clone())?;
     loop {
         if *stop.borrow() {
             break;
         }
-        let tick =
-            tokio::select! {biased;_=wait_stop(&mut stop)=>break,result=manager.tick()=>result?};
+        health.observation.next_attempt = manager.next_attempt();
+        health.observation.phase = manager.last_failure_phase().into();
+        health.pulse()?;
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+        let tick = {
+            let tick = manager.tick();
+            tokio::pin!(tick);
+            loop {
+                tokio::select! {biased;
+                    _=wait_stop(&mut stop)=>return Ok(()),
+                    result=&mut tick=>match result {Ok(tick)=>break tick,Err(error)=>{health.observation.reconciliation_required=true;return Err(error);}},
+                    _=heartbeat.tick()=>health.pulse()?,
+                }
+            }
+        };
+        if tick == Tick::Installed {
+            health.observation.last_success = acme::now();
+        }
+        health.observation.next_attempt = manager.next_attempt();
+        health.observation.phase = manager.last_failure_phase().into();
+        health.pulse()?;
         ready.send_replace(manager.ready());
         if tick != Tick::Idle {
             eprintln!(
