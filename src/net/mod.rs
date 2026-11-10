@@ -1,12 +1,15 @@
 //! H2/H3 frontends with shared authenticated egress and Pingora website engine.
 mod congestion;
 mod egress;
+pub(crate) use egress::connect_candidates;
+mod forward_cache;
 mod h2;
 mod h3;
 mod redirect;
 mod resources;
 mod site;
-
+#[cfg(test)]
+mod tests;
 pub(crate) mod tls;
 mod tunnel;
 
@@ -166,7 +169,7 @@ impl Reply {
 pub(crate) enum Plan {
     Site(Reply),
     Website(Head),
-    Forward(Head, Arc<site::Site>),
+    Forward(Head, Arc<site::Site>, resources::TunnelLease),
     Tunnel {
         target: egress::Stream,
         framed: Option<moon_naive_core::codec::Mode>,
@@ -176,6 +179,10 @@ pub(crate) enum Plan {
 }
 #[derive(Default)]
 pub struct Stats {
+    #[cfg(test)]
+    pub h3_driver_iterations: AtomicUsize,
+    #[cfg(test)]
+    pub h3_path_events: AtomicUsize,
     pub h2_connections: AtomicUsize,
     pub h3_connections: AtomicUsize,
     pub dials: AtomicUsize,
@@ -207,7 +214,7 @@ pub(crate) struct App {
     tcp_congestion: moon_naive_core::config::TcpCongestion,
     h1: bool,
     config: Arc<Config>,
-    forwards: std::sync::Mutex<std::collections::HashMap<(usize, String), Arc<site::Site>>>,
+    forwards: forward_cache::Cache<site::Site>,
 }
 impl App {
     fn load(config: &Arc<Config>) -> Result<Self> {
@@ -325,35 +332,39 @@ impl App {
                     head.scheme.as_deref().ok_or("missing scheme")?,
                     head.authority
                 );
-                let key = (user, origin.clone());
-                let mut sites = self
-                    .forwards
-                    .lock()
-                    .map_err(|_| "forward pool lock poisoned")?;
-                let site = if let Some(site) = sites.get(&key) {
-                    site.clone()
-                } else {
-                    let site = Arc::new(site::Site::forward(
-                        &self.config,
-                        &origin,
-                        user,
-                        self.egress.clone(),
-                        &self.site,
-                    )?);
-                    if sites.len() >= 128
-                        && let Some(old) = sites.keys().next().cloned()
-                    {
-                        sites.remove(&old);
-                    }
-                    sites.insert(key, site.clone());
-                    site
+                let Some(lease) = self.resources.forward(user) else {
+                    return Ok(Plan::Site(Reply::error(503)));
                 };
+                let slot = self.forwards.slot((user, origin.clone())).await;
+                let site = slot
+                    .get_or_try_init(|| async {
+                        // The permit belongs to the blocking job even if this waiter
+                        // is cancelled. No global cache lock covers TLS/pool setup.
+                        let permit = self
+                            .resources
+                            .initializers
+                            .clone()
+                            .try_acquire_owned()
+                            .map_err(|_| "forward initialization busy")?;
+                        let config = self.config.clone();
+                        let egress = self.egress.clone();
+                        let website = self.site.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let _permit = permit;
+                            site::Site::forward(&config, &origin, user, egress, &website)
+                                .map(Arc::new)
+                        })
+                        .await
+                        .map_err(|_| "forward initialization task failed")?
+                    })
+                    .await?
+                    .clone();
                 let mut sanitized = head.clone();
                 sanitized.binding = None;
                 sanitized
                     .headers
                     .retain(|(name, _)| !ingress::is_proxy_header(name));
-                return Ok(Plan::Forward(sanitized, site));
+                return Ok(Plan::Forward(sanitized, site, lease));
             }
         }
         let route = ingress::dispatch(
@@ -552,12 +563,7 @@ impl Network {
             }
         }
         app.site.stop_bridge();
-        {
-            let sites = app.forwards.lock().unwrap_or_else(|e| e.into_inner());
-            for site in sites.values() {
-                site.stop_bridge();
-            }
-        }
+        app.forwards.clear().await;
         // Shared shutdown receiver tells both drivers to stop accepting streams.
         let grace = app.graceful;
         let _ =

@@ -309,6 +309,36 @@ pub fn write_private_new(destination: &Path, bytes: &[u8]) -> Result<()> {
     result
 }
 
+#[cfg(test)]
+mod private_toml_tests {
+    use super::*;
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Token {
+        api_token: String,
+    }
+    #[test]
+    fn strict_toml_and_errors_never_include_secret_source() {
+        assert_eq!(
+            parse_toml::<Token>(b"api_token = 'private-value'")
+                .unwrap()
+                .api_token,
+            "private-value"
+        );
+        for input in [
+            b"{\"api_token\":\"private-value\"}".as_slice(),
+            b"api_token = 'private-value'\nextra = true",
+            b"api_token = 'private-value'\napi_token = 'duplicate-secret'",
+            b"api_token = 'private-value",
+            b"api_token = '\xff'",
+        ] {
+            let error = parse_toml::<Token>(input).err().unwrap().to_string();
+            assert!(!error.contains("private-value"));
+            assert!(!error.contains("duplicate-secret"));
+        }
+    }
+}
+
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 fn unique_id() -> String {
     format!(
@@ -506,5 +536,108 @@ impl DiskStore {
                     StoreFailure::Uncommitted
                 }
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!("naive-store-test-{}", unique_id())))
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    fn bundle(tag: u8) -> VerifiedBundle {
+        VerifiedBundle::from_validator(
+            Candidate {
+                chain_pem: vec![tag; 32],
+                key_pem: vec![tag; 16],
+            },
+            Lifetime {
+                not_before: 0,
+                not_after: 90,
+            },
+        )
+        .unwrap()
+    }
+    #[test]
+    fn atomic_pair_and_old_generation_are_preserved() {
+        let scratch = Scratch::new();
+        let mut s = DiskStore::open(&scratch.0).unwrap();
+        assert!(s.read_current().unwrap().is_none());
+        s.install(&bundle(1)).unwrap();
+        let old = s.read_current().unwrap().unwrap();
+        s.install(&bundle(2)).unwrap();
+        let new = s.read_current().unwrap().unwrap();
+        assert_ne!(old.generation, new.generation);
+        assert_eq!(new.candidate.chain_pem, vec![2; 32]);
+        assert_eq!(new.candidate.key_pem, vec![2; 16]);
+        assert_eq!(
+            read_bounded(&scratch.0.join(old.generation).join("key.pem"), 64).unwrap(),
+            vec![1; 16]
+        );
+    }
+    #[test]
+    fn lock_contention_cannot_replace_current() {
+        let scratch = Scratch::new();
+        let mut s = DiskStore::open(&scratch.0).unwrap();
+        s.install(&bundle(1)).unwrap();
+        let old = fs::read(scratch.0.join("CURRENT")).unwrap();
+        let lock = WriterLock::acquire(&scratch.0).unwrap();
+        assert!(s.install(&bundle(2)).is_err());
+        assert_eq!(fs::read(scratch.0.join("CURRENT")).unwrap(), old);
+        drop(lock);
+        s.install(&bundle(2)).unwrap();
+    }
+    #[test]
+    fn uncommitted_generation_is_not_visible() {
+        let scratch = Scratch::new();
+        let mut s = DiskStore::open(&scratch.0).unwrap();
+        s.install(&bundle(1)).unwrap();
+        let partial = scratch.0.join("generation-999");
+        private_dir(&partial, false).unwrap();
+        write_new(&partial.join("chain.pem"), b"incomplete new generation").unwrap();
+        assert_eq!(
+            s.read_current().unwrap().unwrap().candidate.chain_pem,
+            vec![1; 32]
+        );
+    }
+    #[test]
+    fn empty_material_and_pointer_traversal_are_rejected() {
+        assert!(
+            VerifiedBundle::from_validator(
+                Candidate {
+                    chain_pem: vec![],
+                    key_pem: vec![1]
+                },
+                Lifetime {
+                    not_before: 0,
+                    not_after: 10
+                }
+            )
+            .is_err()
+        );
+        let scratch = Scratch::new();
+        let s = DiskStore::open(&scratch.0).unwrap();
+        write_new(&scratch.0.join("CURRENT"), b"generation-../../other").unwrap();
+        assert!(s.read_current().is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_not_state_directories() {
+        use std::os::unix::fs::symlink;
+        let scratch = Scratch::new();
+        private_dir(&scratch.0, true).unwrap();
+        let target = scratch.0.join("target");
+        private_dir(&target, false).unwrap();
+        let link = scratch.0.join("link");
+        symlink(&target, &link).unwrap();
+        assert!(DiskStore::open(&link).is_err());
     }
 }

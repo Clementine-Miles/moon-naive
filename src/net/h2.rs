@@ -156,7 +156,10 @@ async fn process(
     let plan = admit_until_closed(app.prepare(&head), session.idle()).await?;
     match plan {
         Plan::Website(head) => return app.site.h2(session, head).await,
-        Plan::Forward(head, site) => return site.h2(session, head).await,
+        Plan::Forward(head, site, lease) => {
+            let _lease = lease;
+            return site.h2(session, head).await;
+        }
         Plan::Site(reply) => {
             write_header(&mut session, &reply, reply.body.is_empty())?;
             if !reply.body.is_empty() {
@@ -226,6 +229,45 @@ async fn admit_until_closed(
         biased;
         _ = closed => Err("H2 request cancelled during admission".into()),
         plan = prepare => plan,
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use moon_naive_core::policy::Budget;
+    use std::{cell::Cell, future};
+
+    #[tokio::test]
+    async fn known_reset_prevents_admission_side_effects() {
+        let started = Cell::new(false);
+        let prepare = async {
+            started.set(true);
+            Ok(Plan::Site(Reply::tunnel()))
+        };
+        assert!(
+            admit_until_closed(prepare, future::ready(()))
+                .await
+                .is_err()
+        );
+        assert!(!started.get());
+    }
+
+    #[tokio::test]
+    async fn reset_drops_pending_admission_and_releases_budget() {
+        let budget = Budget::new(1).unwrap();
+        let (started, wait_started) = tokio::sync::oneshot::channel();
+        let prepare = async {
+            let _permit = budget.acquire().unwrap();
+            started.send(()).unwrap();
+            future::pending::<Result<Plan>>().await
+        };
+        let closed = async {
+            wait_started.await.unwrap();
+            assert_eq!(budget.active(), 1);
+        };
+        assert!(admit_until_closed(prepare, closed).await.is_err());
+        assert_eq!(budget.active(), 0);
     }
 }
 
@@ -452,6 +494,168 @@ mod write_buffer {
     impl<S: Peek + Send> Peek for WriteBuffer<S> {
         async fn try_peek(&mut self, bytes: &mut [u8]) -> io::Result<bool> {
             self.inner.try_peek(bytes).await
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::{collections::VecDeque, future::Future, task::Waker};
+
+        #[derive(Debug)]
+        enum Action {
+            Accept(usize),
+            Pending,
+            Error(io::ErrorKind),
+        }
+        #[derive(Debug, Default)]
+        struct Writer {
+            actions: VecDeque<Action>,
+            output: Vec<u8>,
+            writes: Vec<usize>,
+            retry: Option<(usize, Vec<u8>)>,
+            flushes: usize,
+            closed: bool,
+        }
+        impl AsyncWrite for Writer {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                if let Some((pointer, previous)) = self.retry.take() {
+                    assert_eq!(bytes.as_ptr() as usize, pointer);
+                    assert_eq!(bytes, previous);
+                }
+                match self
+                    .actions
+                    .pop_front()
+                    .unwrap_or(Action::Accept(bytes.len()))
+                {
+                    Action::Accept(limit) => {
+                        let n = limit.min(bytes.len());
+                        self.output.extend_from_slice(&bytes[..n]);
+                        self.writes.push(n);
+                        Poll::Ready(Ok(n))
+                    }
+                    Action::Pending => {
+                        self.retry = Some((bytes.as_ptr() as usize, bytes.to_vec()));
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    Action::Error(kind) => Poll::Ready(Err(kind.into())),
+                }
+            }
+            fn poll_write_vectored(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &[IoSlice<'_>],
+            ) -> Poll<io::Result<usize>> {
+                panic!("TLS must receive one contiguous slice");
+            }
+            fn is_write_vectored(&self) -> bool {
+                true
+            }
+            fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                self.flushes += 1;
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                self.closed = true;
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        #[tokio::test]
+        async fn vectored_header_and_payload_flush_as_one_short_write() {
+            let mut io = WriteBuffer::new(Writer::default());
+            let payload = [7; 8192];
+            let slices = [
+                IoSlice::new(&[]),
+                IoSlice::new(b"123456789"),
+                IoSlice::new(&payload),
+            ];
+            assert_eq!(io.write_vectored(&slices).await.unwrap(), 8201);
+            assert!(io.inner.output.is_empty());
+            io.flush().await.unwrap();
+            assert_eq!(io.inner.writes, [8201]);
+            assert_eq!(&io.inner.output[..9], b"123456789");
+            assert_eq!(&io.inner.output[9..], payload);
+            assert_eq!(io.inner.flushes, 1);
+            assert_eq!(io.write_vectored(&[IoSlice::new(&[])]).await.unwrap(), 0);
+            assert_eq!(io.write(&[]).await.unwrap(), 0);
+        }
+
+        #[tokio::test]
+        async fn cancelled_flush_keeps_exact_pending_slice_before_new_data() {
+            for prefix in [0, 7] {
+                let mut inner = Writer::default();
+                if prefix != 0 {
+                    inner.actions.push_back(Action::Accept(prefix));
+                }
+                inner.actions.push_back(Action::Pending);
+                let mut io = WriteBuffer::new(inner);
+                io.write_all(b"abcdefghijkl").await.unwrap();
+                let mut cx = Context::from_waker(Waker::noop());
+                {
+                    let mut flushing = std::pin::pin!(io.flush());
+                    assert!(flushing.as_mut().poll(&mut cx).is_pending());
+                }
+                // The pinned future and its hidden storage were dropped;
+                // resuming via write must finish the previous SSL_write first.
+                io.write_all(b"XYZ").await.unwrap();
+                io.flush().await.unwrap();
+                assert_eq!(io.inner.output, b"abcdefghijklXYZ");
+                assert!(!io.flushing);
+                assert!(io.bytes.is_empty());
+            }
+        }
+
+        #[tokio::test]
+        async fn full_buffer_and_partial_vectored_writes_remain_bounded() {
+            let mut io = WriteBuffer::new(Writer::default());
+            let payload = vec![9; CAPACITY * 2 + 19];
+            let slices = [IoSlice::new(b"head"), IoSlice::new(&payload)];
+            assert_eq!(io.write_vectored(&slices).await.unwrap(), CAPACITY);
+            assert_eq!(io.bytes.len(), CAPACITY);
+            assert!(io.inner.output.is_empty());
+            io.write_all(&payload[CAPACITY - 4..]).await.unwrap();
+            AsyncWriteExt::shutdown(&mut io).await.unwrap();
+            assert!(io.inner.closed);
+            assert_eq!(io.inner.writes, [CAPACITY, CAPACITY, 23]);
+            assert_eq!(&io.inner.output[..4], b"head");
+            assert_eq!(&io.inner.output[4..], payload);
+        }
+
+        #[tokio::test]
+        async fn shutdown_preserves_pending_bytes_and_flush_reports_errors() {
+            let mut io = WriteBuffer::new(Writer {
+                actions: [Action::Pending].into(),
+                ..Writer::default()
+            });
+            io.write_all(b"last response").await.unwrap();
+            AsyncWriteExt::shutdown(&mut io).await.unwrap();
+            assert_eq!(io.inner.output, b"last response");
+            assert!(io.inner.closed);
+            for (action, kind) in [
+                (Action::Accept(0), io::ErrorKind::WriteZero),
+                (
+                    Action::Error(io::ErrorKind::BrokenPipe),
+                    io::ErrorKind::BrokenPipe,
+                ),
+            ] {
+                let mut io = WriteBuffer::new(Writer {
+                    actions: [action].into(),
+                    ..Writer::default()
+                });
+                io.write_all(b"retained").await.unwrap();
+                assert_eq!(io.flush().await.unwrap_err().kind(), kind);
+                assert_eq!(io.bytes, b"retained");
+                assert!(!io.inner.closed);
+            }
         }
     }
 }

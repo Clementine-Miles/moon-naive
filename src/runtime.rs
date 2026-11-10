@@ -278,3 +278,27 @@ fn notify_to(path: &std::ffi::OsStr, message: &str) -> Result<()> {
     socket.send(message.as_bytes())?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn an_already_requested_shutdown_opens_no_files_or_listeners() {
+        let config = Config::parse(include_str!("../config.example.toml")).unwrap();
+        let (_send, receive) = watch::channel(true);
+        serve(Arc::new(config), receive).await.unwrap();
+    }
+    #[test]
+    fn readiness_uses_the_systemd_datagram_protocol() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("notify.sock");
+        let receiver = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        notify_to(path.as_os_str(), "READY=1\nSTATUS=Serving H2/H3").unwrap();
+        let mut buffer = [0; 128];
+        let len = receiver.recv(&mut buffer).unwrap();
+        assert_eq!(&buffer[..len], b"READY=1\nSTATUS=Serving H2/H3");
+    }
+}

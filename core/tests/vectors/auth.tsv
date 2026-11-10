@@ -1,0 +1,17 @@
+# stream	offer	selected	method	authority	scheme	path	protocol	request	response; - = absent
+1	2	2	CONNECT	example.org:443	-	-	-	moon-naive 02.YftXdcdBhhTG4d0NZDsNy2POlBei72LjxfB2Hz4yjHo=	moon-naive 02.O6elSJUO7ItPoK1s8VN3H92MoK44fnWi3kSV2Pf4NGU=
+1	7	5	CONNECT	example.org:443	-	-	-	moon-naive 07.4O0H7gW9IwnF7eZ1ZsgMfSqz+9jcgdLQ5mgaLryjlcE=	moon-naive 05.dl0dKSwzP5jtoI/kTmpapZJBKBg3ES7A83HmlBQ2ObQ=
+1	7	6	CONNECT	example.org:443	-	-	-	moon-naive 07.4O0H7gW9IwnF7eZ1ZsgMfSqz+9jcgdLQ5mgaLryjlcE=	moon-naive 06.PsfSOarQmKXRkTe5ORgqLH0417XJAHvrcj6jq5Lhkb8=
+1	1	1	CONNECT	example.org:443	-	-	-	moon-naive 01.l4VcXKRZz7US3Am5o3eu8tiP8DwT2kN4OzEgLs5iKGk=	moon-naive 01.lRdv3R2rj1dZpm+B75wsVpGA+nDUxV5sZXvVvQhJJmg=
+0	2	2	CONNECT	example.org:443	-	-	-	moon-naive 02.C5anMx7JQomPKRRALIrRspOwfb7ERYuH4a5zWqG9jHs=	moon-naive 02.OULm7EYP0JHSJDtFKOfn1PZQgFzSWO1lCg7vKl7RkxQ=
+0	7	5	CONNECT	example.org:443	-	-	-	moon-naive 07.zyyYgmdrZ8ry7pvQfnGiYLvXQ7y+AzwVUNjKk06SCv8=	moon-naive 05.+fkAIvIR8OsDS8yzNog+toL7r+7WF+fvuZoVTAUQsKk=
+0	7	6	CONNECT	example.org:443	-	-	-	moon-naive 07.zyyYgmdrZ8ry7pvQfnGiYLvXQ7y+AzwVUNjKk06SCv8=	moon-naive 06.lGZARHlrhhxe5kLh9/h43QwVbBzi7xzxqYm+GkpOmyI=
+0	1	1	CONNECT	example.org:443	-	-	-	moon-naive 01.TJD184xuUDgjbOnMXKACnfKIHRmqqd2bFLI2dlSQz4k=	moon-naive 01.Hj5wDWq5j1UwOiMz+SxbmLLWoxhKBrFcW2SipgrCoPU=
+4	2	2	GET	example.org:443	https	/a%2Fb?q=1	-	moon-naive 02.33mGezssDOvdez8k5eWcBbw29tzFpq8ewQSu1wh+iTs=	moon-naive 02.G7TbMXNelC5pNYCUcGruF587RKwr9TIJ+Ns9nPW/1Fw=
+4	7	5	GET	example.org:443	https	/a%2Fb?q=1	-	moon-naive 07.x8WzmiOl+81xYMLCGlbZ8U3hlSTo02gmDGTmc1NXzNk=	moon-naive 05.mRbmhST1dnGXI1cWAQ+lRUvWd0bKCH3+4HRvzIpvyuk=
+4	7	6	GET	example.org:443	https	/a%2Fb?q=1	-	moon-naive 07.x8WzmiOl+81xYMLCGlbZ8U3hlSTo02gmDGTmc1NXzNk=	moon-naive 06.SjLUYbkwlar41f+e8FTdSv5/ky4CDqH4wZEo02LH2lM=
+4	1	1	GET	example.org:443	https	/a%2Fb?q=1	-	moon-naive 01.5QWOM4Toue9dSRWEuP+NE8DCj0GQNoizL1f6vKspMEY=	moon-naive 01.7ya1dXfeyLZ6qu09czA182laEVRsiCFIsgEbme8B7nY=
+8	2	2	CONNECT	example.org:443	https		websocket	moon-naive 02.s6IfjWll2ZlMr3jfOMcjkmniMxLkRxPf0L9bQWoxqm0=	moon-naive 02.fi3xuDqWzb/daVO435gnC4GTKHWCXa5e6h0vzMgsWnI=
+8	7	5	CONNECT	example.org:443	https		websocket	moon-naive 07.8zecCLc8WEdLuvyJbbpbwxqSdLtGrWN8pM8P6q6Yo1w=	moon-naive 05.mloLSfrmP7Jn4mOE+s3tJQyVnxF3jSnL46IUO2aA40c=
+8	7	6	CONNECT	example.org:443	https		websocket	moon-naive 07.8zecCLc8WEdLuvyJbbpbwxqSdLtGrWN8pM8P6q6Yo1w=	moon-naive 06./MKrIJOpKCNcAOzfw+HrwIoiqXqoZruHUdZ+AlPekzo=
+8	1	1	CONNECT	example.org:443	https		websocket	moon-naive 01.60+/6wWG7Qg8c9dUkpT+yFznNzS3KAPvCCBUGTJT06E=	moon-naive 01.IYHpBW6esB7No6SyVQwZBuwAewXnT4vLku7iWQf24nA=

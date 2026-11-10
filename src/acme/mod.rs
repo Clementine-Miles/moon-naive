@@ -31,3 +31,12 @@ pub fn random_below(bound: u64) -> Result<u64> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+pub(crate) mod lab_support;
+
+#[cfg(test)]
+pub(crate) mod lab;

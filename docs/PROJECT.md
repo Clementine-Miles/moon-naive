@@ -4,7 +4,7 @@
 
 本项目基于 Rust、Pingora、BoringSSL 和 quiche，面向 Linux x86_64。仅实现 moon-naive revision 4；官方 Naïve 客户端不兼容，已引入 Android/Linux Chromium 实验客户端源码，完整构建与互通尚未验收。
 
-测试、基准、实验工具、测试夹具、仅供验证的 vendor 示例及容器构建/运行入口已从当前源码树移除。生产 ACME staging、信任根和配置诊断保留；名称包含 test 的 CA 域名/公开根不等于测试源码。
+第一方离线/loopback 测试正在恢复；执行状态见 [实现记录](IMPLEMENTATION.md)，协议以 [mona revision 4](PROTOCOL.md) 为准。
 
 - [配置与迁移](#配置与迁移)
 - [协议与架构](#协议与架构)
@@ -398,64 +398,7 @@ H1始终进入固定网站反代；H2/H3逐请求验证认证，失败同样进�
 
 默认隧道任一方向实际进展更新600秒空闲期限。上传FIN只关闭目标写方向，下载可继续；reset、错误、空闲超时取消任务并释放额度。关闭的目标TCP不能由服务端透明“接续”，重新请求需要新的CONNECT；外层连接仍可复用，若外层也关闭则重新握手和认证。网站连接池另有自己的上游空闲期限。
 
-### CONNECT首部和认证协商
-
-代理仅允许完成TLS1.3握手后的H2/H3；保留标准TLS加密，禁用0-RTT、代理Fast Open和TCP Fast Open。H1及TLS1.2 H2只服务网站。
-
-1. 从实际外层连接取得32字节exporter：label=`EXPORTER-moon-naive-v4`，context显式空串；不得使用early exporter。使用实际HTTP流ID，不按CONNECT次数推算。
-2. `key=SHA256(b"moon-naive/v4/key\0" || UTF8(user) || b":" || UTF8(password))`。共享秘密应为高熵值，SHA256不是口令拉伸。
-3. 请求转录=`b"moon-naive/v4/request\0" || exporter || u64be(stream_id) || offer_byte || 0x00 || fields`。
-4. fields依次method、authority、scheme、path-and-query、protocol；存在字段=`u64be(UTF8字节数)||UTF8值`，缺失=8个0xff。普通CONNECT后三项缺失。使用线上实际值，不改变大小写、端口或编码。
-5. MAC=`HMAC-SHA256(key,SHA256(转录))`；使用标准带`=`Base64。提议用两位小写十六进制，整个认证字段值固定58字节。
-
-```text
-:method: CONNECT
-:authority: example.org:443
-proxy-authorization: moon-naive 07.<44字节Base64证明>
-```
-
-仅需要普通CONNECT伪首部和唯一认证字段，不追加随机Padding、FastOpen、旧Padding-Type-*或多余Host。客户端应使用Chromium实际HTTP栈，认证字段须never-index，避免人为捏造不一致的浏览器首部。
-
-| 位 | 含义 |
-| --- | --- |
-| 0x01 | 支持8条初期窗口 |
-| 0x02 | 支持16条初期窗口 |
-| 0x04 | 支持后段稀疏填充及持续记录边界 |
-
-至少提供一个窗口，未知位拒绝。提议03=两种有限窗口，07=两种窗口并允许稀疏后段。服务端优先配置中的窗口，否则选客户端提供的另一种；只有双方允许才选稀疏。选择中8/16位只能有一个：01、02、05、06分别对应8有限、16有限、8稀疏、16稀疏。同一连接不同流可以并存；不会为同一payload重复套8和16两层填充。双向使用同一选择，但计数与额度独立。
-
-```text
-:status: 200
-proxy-authentication-info: moon-naive 06.<44字节Base64证明>
-date: <正常HTTP日期>
-```
-
-成功响应无假正文、随机Padding首部或Server版本标识。响应MAC使用域`b"moon-naive/v4/response/200\0"`，选项字节为`原offer_byte || selected_byte`，其余字段同请求。客户端核验200、字段唯一性、选择属于提议、MAC正确之后才发送目标数据。连接、流、目标、提议或选择变化均会改变证明，请求证明不能反射为响应证明。HPACK/QPACK的编码长度仍会变化，固定58字节字段不等于固定包长。
-
-API为`authorization_with`/`verify_selection`；便利接口`authorization()`只提议02有限模式。没有连接级永久登录、时间戳重放窗口或nonce缓存。底层网络密文重放仍由TLS/QUIC处理，以上证明不替代证书验证。
-
-### 数据记录与预算
-
-```text
-u16be N | u8 P | N字节真实payload | P字节零填充
-```
-
-`1≤N≤16309`。空记录、控制/假流量记录、超量填充、截断记录均不接受。上传解码借用HTTP输入切片，仅将payload写到目标；下载直接读入BytesMut，在同一存储中编码并转移Bytes所有权。记录与HTTP DATA、TLS record、QUIC包不是同一边界，允许任意分片和合并。
-
-| 阶段 | Padding上限 | 服务端实际发送策略 |
-| --- | --- | --- |
-| 前8条 | P≤min(floor(N/8),63−8i)，i=0..7 | 小读块在0..上限采样；N≥8192时P=0 |
-| 前16条 | P≤min(floor(N/8),63−4i)，i=0..15 | 同上 |
-| 有限模式后段 | 无记录头和padding | 精确切换后直接透传，不再调用填充RNG |
-| 稀疏模式后段 | N<8192时P≤min(31,floor(N/32),可用额度)；否则P=0 | 有额度的小块以1/16概率尝试，结果可为0；大块不填充、不调用填充RNG |
-
-初期最坏额外开销：8条≤304字节/方向，16条≤576字节/方向，均含记录头。小块的padding≤payload/8不表示包含记录头的总开销也≤12.5%。后段每128字节真实payload赚取1字节padding额度，余额最多128字节，保留除法余数、没有初始赠送；收发双方校验。初期padding由单独的有限上限约束。数据记录头的3字节不计入此padding额度。
-
-稀疏模式持续保留3字节头来解析后续数据，不是全程附加填充。大块头开销约0.0184%，小块相对开销更高，不能宣称总开销恒低于1%。有限模式在第8/16条padding完全消费后释放解析状态；同一输入中的后续裸字节仍须原样保留。
-
-服务端有限模式原始阶段每次最多读取16375字节，为H2 DATA头保留9字节TLS写入空间；这是实现选择，不是解码边界或客户端约束。
-
-不随机拆分读块，不引入随机延迟，不等待凑满读块，不添加结束标记或额外小尾记录。满载时优先数据吞吐；低流量时仅对实际数据附加小额扰动。零填充用于减少无意义的随机内容生成；TLS密文本身仍然高熵，不能将零填充宣传为降低线上密文熵。
+认证、协商、记录格式、EOF 和错误规则以唯一权威 [mona 协议规范](PROTOCOL.md) 为准。独立向量及生成器见该文档。
 
 ### 真实网站与配置
 
@@ -960,3 +903,32 @@ Bundle SHA-256: `70548cf799245900c44e46a19513f59eb67badc9a5170ce9c9f04ffe1c7238b
 Google test roots apply only to the built-in Google staging directory with
 `issuer = "google"`. They are not added to production, custom directories,
 the CA API HTTPS client or any DNS-provider HTTPS client. Trust selection is restricted by issuer/environment/directory in the runtime validator. These are not production trust roots.
+
+## mona server implementation update
+
+The authoritative wire contract is [PROTOCOL.md](PROTOCOL.md). The current
+implementation and verification checkpoint is [IMPLEMENTATION.md](IMPLEMENTATION.md).
+Production client development is deferred; restored clients are test fixtures.
+
+Ordinary authenticated forwarding now uses `[proxy.forward]`, independent of
+`[website]`: maximum unique upload 1 GiB, connect deadline 10 seconds, upstream
+read/write timeouts 120 seconds, idle pooled connections 30 seconds, per-user
+concurrent forwards 32. Limits apply while streaming, without whole-body buffering.
+Older configurations remain parseable but no longer inherit website upload/time
+limits. Set explicit forward values to retain the previous effective policy.
+CONNECT continues using `[limits]`; configured fixed private website origins remain
+separate from public-destination egress policy. Forward requests acquire global
+active-stream and per-user admission before DNS and retain it through completion.
+
+Incomplete H3 request headers have an absolute 10-second deadline starting when
+request stream bytes become readable, before the H3 parser consumes them. Other
+traffic does not extend it. Expiry closes that connection (0x107), including other
+streams, to release partial parser state. This is a bounded-ownership choice,
+not a claim that an unbounded-memory vulnerability was established.
+
+Fast validation: `python3 tools/vectors/generate.py --check` and
+`cargo test --locked -p moon-naive-core`. Native loopback validation:
+`cargo test --locked -p moon-naive --lib -- --test-threads=4`. The synthetic ACME
+suite includes a real 120-second Retry-After test. Ignored experiments are not
+part of the passing runtime acceptance count. Rust 1.89 core tests and server
+compilation were checked; final change validation status is in the checkpoint.

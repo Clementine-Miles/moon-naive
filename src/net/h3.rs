@@ -160,6 +160,7 @@ struct Client {
     streams: HashMap<u64, Stream>,
     tx: Option<Packet>,
     handshake_deadline: Instant,
+    pending_headers: HashMap<u64, Instant>,
     _permit: Permit,
     _window: tokio::sync::OwnedSemaphorePermit,
     _generation: Arc<Generation>,
@@ -240,11 +241,12 @@ impl Stream {
                 self.task = Some(Abort(exchange.task));
                 self.completion = Some(exchange.completion);
             }
-            Plan::Forward(head, site) => {
-                let exchange = site.start(
+            Plan::Forward(head, site, lease) => {
+                let exchange = site.start_with_lease(
                     head,
                     self.input_done && self.request_trailers.is_none(),
                     wake,
+                    Some(lease),
                 );
                 self.website = Some(Website {
                     input: Some(exchange.input),
@@ -395,6 +397,10 @@ pub(super) async fn serve(
     let local = socket.local_addr()?;
     let mut draining: Option<Instant> = None;
     loop {
+        #[cfg(test)]
+        app.stats
+            .h3_driver_iterations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let now = Instant::now();
         // Sleep until actual transport/application work is due. A fixed 50 ms
         // sweep keeps every idle connection needlessly active for its lifetime.
@@ -432,6 +438,32 @@ pub(super) async fn serve(
                 }
             }
             if let Some(h3) = &mut client.h3 {
+                // Observe transport readiness BEFORE the H3 parser consumes a
+                // partial frame. Never read bytes behind that parser. Only client
+                // bidirectional request streams (including stream zero) qualify.
+                for id in client.conn.readable().filter(|id| id % 4 == 0) {
+                    if !client.streams.contains_key(&id) {
+                        client
+                            .pending_headers
+                            .entry(id)
+                            .or_insert(now + super::HEADER_TIMEOUT);
+                    }
+                }
+                // Close on timeout so quiche's partial field-section/QPACK state
+                // is released as well. Activity on any other stream cannot extend
+                // this absolute deadline. The map is bounded by max_streams.
+                if client.pending_headers.len() > app.profile.max_streams() as usize
+                    || client.pending_headers.values().any(|until| *until <= now)
+                {
+                    let _ = client.conn.close(true, 0x107, b"request headers deadline");
+                    client.pending_headers.clear();
+                    client.streams.clear();
+                    send_again = true; // send CONNECTION_CLOSE without waiting for peer traffic
+                    continue;
+                }
+                for until in client.pending_headers.values() {
+                    deadline = deadline.min(*until);
+                }
                 let ids: Vec<_> = client.streams.keys().copied().collect();
                 for id in ids {
                     let stream = client.streams.get_mut(&id).unwrap();
@@ -461,6 +493,7 @@ pub(super) async fn serve(
                 for _ in 0..128 {
                     match h3.poll(&mut client.conn) {
                         Ok((id, quiche::h3::Event::Headers { list, .. })) => {
+                            client.pending_headers.remove(&id);
                             if let Some(stream) = client.streams.get_mut(&id) {
                                 match parse_trailers(&list) {
                                     Ok(headers) if stream.request_trailers.is_none() => {
@@ -574,12 +607,14 @@ pub(super) async fn serve(
                             break;
                         }
                         Ok((id, quiche::h3::Event::Finished)) => {
+                            client.pending_headers.remove(&id);
                             if let Some(stream) = client.streams.get_mut(&id) {
                                 stream.input_done = true;
                                 stream.input = None;
                             }
                         }
                         Ok((id, quiche::h3::Event::Reset(_))) => {
+                            client.pending_headers.remove(&id);
                             client.streams.remove(&id);
                         }
                         Ok((_, quiche::h3::Event::GoAway))
@@ -635,7 +670,10 @@ pub(super) async fn serve(
             }
             let path_events = drain_path_events(&mut client.conn);
             send_again |= path_events == 64;
-
+            #[cfg(test)]
+            app.stats
+                .h3_path_events
+                .fetch_add(path_events, std::sync::atomic::Ordering::Relaxed);
             if let Some(t) = client.conn.timeout_instant() {
                 deadline = deadline.min(t);
             }
@@ -676,7 +714,7 @@ pub(super) async fn serve(
                     let generation=match tls.current(){Ok(g)=>g,Err(_)=>continue};
                     let conn={let mut config=generation.h3.lock().map_err(|_|"H3 config lock poisoned")?;quiche::accept(&header.dcid,Some(&quiche::ConnectionId::from_ref(&original)),local,from,&mut config)};
                     let Ok(conn)=conn else {continue;};
-                    clients.insert(cid.clone(),Client {conn,h3:None,exporter:None,streams:HashMap::new(),tx:None,handshake_deadline:Instant::now()+super::HEADER_TIMEOUT,_permit:permit,_window:window,_generation:generation});
+                    clients.insert(cid.clone(),Client {conn,h3:None,exporter:None,streams:HashMap::new(),tx:None,handshake_deadline:Instant::now()+super::HEADER_TIMEOUT,pending_headers:HashMap::new(),_permit:permit,_window:window,_generation:generation});
                 }
                 let client=clients.get_mut(&cid).unwrap();
                 if client.conn.recv(&mut buffer[..n],quiche::RecvInfo {from,to:local}).is_err(){continue;}
@@ -1156,4 +1194,261 @@ fn validate(key: &[u8], from: SocketAddr, server: &[u8], token: &[u8]) -> Option
         return None;
     }
     Some(token[9..9 + len].to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn driver_timer_rearms_after_cancel_and_expiry_without_early_wakeup() {
+        let timer = DriverTimer::new().unwrap();
+        // Cancel a registered wait, then leave its expiration unread.
+        tokio::select! {
+            biased;
+            _=timer.wait(Instant::now()+Duration::from_secs(60))=>panic!("early timer"),
+            _=std::future::ready(())=>{},
+        }
+        rustix::time::timerfd_settime(
+            timer.fd.get_ref(),
+            rustix::time::TimerfdTimerFlags::empty(),
+            &rustix::time::Itimerspec {
+                it_interval: rustix::time::Timespec::default(),
+                it_value: Duration::from_nanos(1).try_into().unwrap(),
+            },
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let deadline = Instant::now() + Duration::from_millis(3);
+        tokio::time::timeout(Duration::from_secs(1), timer.wait(deadline))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(Instant::now() >= deadline);
+        // An already due timer must return instead of arming a zero/disarmed fd.
+        tokio::time::timeout(Duration::from_secs(1), timer.wait(Instant::now()))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn coalesced_output_wake_keeps_bounded_website_drain_running() {
+        let case = crate::acme::lab_support::Case::new("coalesced-queue");
+        use super::super::tests::{QClient, fixture, network};
+        let f = fixture();
+        let network = network(&f, None).await;
+        let app = network.app.clone();
+        let addr = network.udp_addr().unwrap();
+        let (stop, rx) = watch::channel(false);
+        let server = tokio::spawn(network.run(rx));
+        let mut peer = QClient::new(addr, &f.ca).await;
+        let (tx, output) = mpsc::channel(16);
+        // Valid API messages that do not emit QUIC packets. One coalesced wake
+        // must drain them without relying on ACKs, timers, or further producers.
+        for _ in 0..9 {
+            tx.send(HttpTask::Body(None, false)).await.unwrap();
+        }
+        let mut stream = Stream {
+            website: Some(Website {
+                input: None,
+                output,
+                header: None,
+                headers_started: true,
+                trailers: None,
+            }),
+            request_trailers: None,
+            plan: None,
+            _prepare: None,
+            reply: None,
+            sent_headers: true,
+            site: false,
+            input: None,
+            output: None,
+            pending: Bytes::new(),
+            input_done: true,
+            output_done: false,
+            sent_fin: false,
+            task: None,
+            completion: None,
+            bridge_done: false,
+            _active: Active::new(app.stats.clone()),
+            _admission: app.resources.requests.acquire().unwrap(),
+            activity: Activity::new(),
+        };
+        let mut scratch = BytesMut::new();
+        let h3 = peer.h3.as_mut().unwrap();
+        let more = drive_stream(
+            &mut peer.conn,
+            h3,
+            0,
+            &mut stream,
+            &app,
+            Arc::new(Notify::new()),
+            &mut scratch,
+        )
+        .unwrap();
+        assert_eq!(
+            stream.website.as_ref().unwrap().output.len(),
+            5,
+            "one turn retains its four-item work bound"
+        );
+        case.event(
+            "local_work_continuation",
+            serde_json::json!({"remaining":5,"reschedule":more}),
+        );
+        assert!(
+            more,
+            "coalesced notifications cannot strand already queued work"
+        );
+        let mut turns = 1;
+        while drive_stream(
+            &mut peer.conn,
+            h3,
+            0,
+            &mut stream,
+            &app,
+            Arc::new(Notify::new()),
+            &mut scratch,
+        )
+        .unwrap()
+        {
+            turns += 1;
+            assert!(turns < 4, "an open empty queue must not busy-poll");
+        }
+        assert_eq!(stream.website.as_ref().unwrap().output.len(), 0);
+        drop(tx);
+        drop(stream);
+        assert_eq!(app.resources.requests.active(), 0);
+        assert_eq!(
+            app.stats.streams.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        drop(peer);
+        stop.send(true).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn paced_datagram_survives_backpressure_without_regeneration() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(1);
+        let mut pending = None;
+        let mut generated = 0;
+        let mut next = || {
+            generated += 1;
+            if generated == 1 {
+                Ok(Packet {
+                    data: vec![1, 2, 3],
+                    to: "127.0.0.1:1".parse().unwrap(),
+                    at: later,
+                })
+            } else {
+                Err(quiche::Error::Done)
+            }
+        };
+        assert_eq!(
+            transmit(
+                &mut pending,
+                &mut next,
+                |_| panic!("sent before pacing deadline"),
+                || now
+            )
+            .unwrap(),
+            TransmitWait::Pacing(later)
+        );
+        assert_eq!(
+            transmit(
+                &mut pending,
+                &mut next,
+                |_| Err(std::io::ErrorKind::WouldBlock.into()),
+                || later
+            )
+            .unwrap(),
+            TransmitWait::Writable
+        );
+        assert_eq!(pending.as_ref().unwrap().data, [1, 2, 3]);
+        let mut writes = 0;
+        assert_eq!(
+            transmit(
+                &mut pending,
+                &mut next,
+                |packet| {
+                    writes += 1;
+                    assert_eq!(packet.data, [1, 2, 3]);
+                    Ok(packet.data.len())
+                },
+                || later
+            )
+            .unwrap(),
+            TransmitWait::Idle
+        );
+        assert_eq!(writes, 1);
+        assert_eq!(generated, 2); // One packet followed by Done; no regeneration.
+        assert!(pending.is_none());
+    }
+    #[test]
+    fn transmit_budget_requires_continuation_and_keeps_next_paced_packet() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(1);
+        let mut pending = None;
+        let mut generated = 0;
+        let mut next = || {
+            generated += 1;
+            Ok(Packet {
+                data: vec![generated],
+                to: "127.0.0.1:1".parse().unwrap(),
+                at: if generated <= 64 { now } else { later },
+            })
+        };
+        let mut written = Vec::new();
+        assert_eq!(
+            transmit(
+                &mut pending,
+                &mut next,
+                |packet| {
+                    written.push(packet.data[0]);
+                    Ok(1)
+                },
+                || now
+            )
+            .unwrap(),
+            TransmitWait::Budget
+        );
+        assert_eq!(written, (1..=64).collect::<Vec<_>>());
+        assert_eq!(
+            transmit(
+                &mut pending,
+                &mut next,
+                |_| panic!("next packet is paced"),
+                || now
+            )
+            .unwrap(),
+            TransmitWait::Pacing(later)
+        );
+        assert_eq!(pending.as_ref().unwrap().data, [65]);
+    }
+    #[test]
+    fn retry_token_authenticates_address_cid_and_expiry() {
+        let key = [7; 32];
+        let from = "127.0.0.1:12345".parse().unwrap();
+        let original = [5; 8];
+        let server = [9; 20];
+        let token = mint(&key, from, &original, &server);
+        assert_eq!(
+            validate(&key, from, &server, &token),
+            Some(original.to_vec())
+        );
+        assert!(validate(&key, "127.0.0.1:12346".parse().unwrap(), &server, &token).is_none());
+        assert!(validate(&key, from, &[10; 20], &token).is_none());
+        let mut tampered = token.clone();
+        tampered[12] ^= 1;
+        assert!(validate(&key, from, &server, &tampered).is_none());
+        let mut expired = token;
+        expired[..8].copy_from_slice(&(crate::acme::now() - 61).to_be_bytes());
+        let split = expired.len() - 32;
+        let mut message = expired[..split].to_vec();
+        message.extend(from.to_string().bytes());
+        expired[split..].copy_from_slice(&boring::hash::hmac_sha256(&key, &message).unwrap());
+        assert!(validate(&key, from, &server, &expired).is_none());
+    }
 }

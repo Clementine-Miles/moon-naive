@@ -405,3 +405,300 @@ impl<T> Generations<T> {
         .map_err(|_| "bridge acquisition deadline")?
     }
 }
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn terminated_driver_is_replaced_without_replaying_post() {
+        use super::super::{Site, bridge::Generations};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = moon_naive_core::config::Config::parse(
+            &include_str!("../../../config.example.toml")
+                .replace("127.0.0.1:8080", &addr.to_string()),
+        )
+        .unwrap();
+        let site = Site::load(
+            &config,
+            moon_naive_core::policy::Budget::new(config.limits.max_streams).unwrap(),
+        )
+        .unwrap();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = requests.clone();
+        let origin = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    bytes.push(socket.read_u8().await.unwrap());
+                    if bytes.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                assert!(bytes.starts_with(b"POST "));
+                seen.fetch_add(1, Ordering::Relaxed);
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let generations = Generations::new(8);
+        let mut previous: Option<std::sync::Weak<Bridge>> = None;
+        for _ in 0..3 {
+            let bridge = generations
+                .get(Bridge::healthy, || Bridge::new(site.proxy.clone(), 8))
+                .await
+                .unwrap();
+            if let Some(old) = previous.take() {
+                assert!(old.upgrade().is_none());
+            }
+            let mut request = RequestHeader::build("POST", b"/", None).unwrap();
+            request
+                .insert_header("host", config.domain.clone())
+                .unwrap();
+            let (input, receive) = mpsc::channel(2);
+            drop(input);
+            let (send, mut output) = mpsc::channel(8);
+            let exchange = bridge.exchange(request, true, receive, send, Arc::new(Notify::new()));
+            let consume = async {
+                let mut status = None;
+                while let Some(task) = output.recv().await {
+                    if let HttpTask::Header(header, _) = task {
+                        status = Some(header.status);
+                    }
+                }
+                assert_eq!(status, Some(http::StatusCode::OK));
+            };
+            let (result, ()) = tokio::join!(exchange, consume);
+            result.unwrap();
+            bridge.client.abort();
+            while !bridge.client.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            assert!(!bridge.healthy());
+            previous = Some(Arc::downgrade(&bridge));
+            drop(bridge);
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        }
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
+        generations.close();
+        origin.abort();
+    }
+    use std::{future::pending, time::Duration};
+
+    #[test]
+    fn content_length_rejects_overflow_underflow_and_invalid_values() {
+        let mut request = RequestHeader::build("POST", b"/", None).unwrap();
+        request.insert_header("content-length", "3").unwrap();
+        let mut length = BodyLength::new(&request).unwrap();
+        assert!(length.finish().is_err());
+        length.data(2).unwrap();
+        assert!(length.data(2).is_err());
+        length.data(1).unwrap();
+        length.finish().unwrap();
+        for invalid in ["-1", "abc", "18446744073709551616"] {
+            request.insert_header("content-length", invalid).unwrap();
+            assert!(BodyLength::new(&request).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_upload_cancels_pending_response_and_releases_its_state() {
+        let (held, released) = tokio::sync::oneshot::channel::<()>();
+        let download = async move {
+            let _held = held;
+            pending::<Result<()>>().await
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            complete_exchange(
+                async { Err("upload failed".into()) },
+                download,
+                &AtomicBool::new(false),
+            ),
+        )
+        .await
+        .expect("upload failure must not wait for a response timeout");
+        assert_eq!(result.unwrap_err().to_string(), "upload failed");
+        assert!(released.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn upload_eof_waits_for_delayed_response() {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let started = AtomicBool::new(false);
+        let mut exchange = Box::pin(complete_exchange(
+            async { Ok(()) },
+            async { receive.await.map_err(Into::into) },
+            &started,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut exchange)
+                .await
+                .is_err()
+        );
+        send.send(()).unwrap();
+        exchange.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn early_response_cancels_unfinished_upload() {
+        let (held, released) = tokio::sync::oneshot::channel::<()>();
+        let upload = async move {
+            let _held = held;
+            pending::<Result<()>>().await
+        };
+        complete_exchange(upload, async { Ok(()) }, &AtomicBool::new(false))
+            .await
+            .unwrap();
+        assert!(released.await.is_err());
+        complete_exchange(
+            async { Err("upload closed".into()) },
+            async { Ok(()) },
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn early_response_body_survives_request_side_close() {
+        let started = AtomicBool::new(false);
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let mut exchange = Box::pin(complete_exchange(
+            async { Err("request side closed".into()) },
+            async {
+                started.store(true, Ordering::Relaxed);
+                receive.await.map_err(Into::into)
+            },
+            &started,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut exchange)
+                .await
+                .is_err()
+        );
+        send.send(()).unwrap();
+        exchange.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_response_cancels_upload() {
+        let (held, released) = tokio::sync::oneshot::channel::<()>();
+        let upload = async move {
+            let _held = held;
+            pending::<Result<()>>().await
+        };
+        let error = complete_exchange(
+            upload,
+            async { Err("response failed".into()) },
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "response failed");
+        assert!(released.await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    fn healthy(value: &AtomicBool) -> bool {
+        value.load(Ordering::Relaxed)
+    }
+    #[tokio::test(start_paused = true)]
+    async fn failed_construction_cools_down_then_recovers() {
+        let slot = Generations::new(4);
+        assert!(
+            slot.get(healthy, || async { Err("injected".into()) })
+                .await
+                .is_err()
+        );
+        assert!(
+            slot.get(healthy, || async { panic!("backoff bypassed") })
+                .await
+                .is_err()
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let first = slot
+            .get(healthy, || async { Ok(AtomicBool::new(true)) })
+            .await
+            .unwrap();
+        first.store(false, Ordering::Relaxed);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let next = slot
+            .get(healthy, || async { Ok(AtomicBool::new(true)) })
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &next));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_failure_has_one_replacement_and_bounded_retention() {
+        let slot = Arc::new(Generations::new(32));
+        let builds = Arc::new(AtomicUsize::new(0));
+        let mut previous: Option<std::sync::Weak<AtomicBool>> = None;
+        for _ in 0..64 {
+            let mut tasks = tokio::task::JoinSet::new();
+            for _ in 0..16 {
+                let slot = slot.clone();
+                let builds = builds.clone();
+                tasks.spawn(async move {
+                    slot.get(healthy, || async {
+                        builds.fetch_add(1, Ordering::Relaxed);
+                        tokio::task::yield_now().await;
+                        Ok(AtomicBool::new(true))
+                    })
+                    .await
+                    .unwrap()
+                });
+            }
+            let first = tasks.join_next().await.unwrap().unwrap();
+            if let Some(old) = previous.take() {
+                assert!(old.upgrade().is_none());
+            }
+            while let Some(next) = tasks.join_next().await {
+                assert!(Arc::ptr_eq(&first, &next.unwrap()));
+            }
+            assert_eq!(Arc::strong_count(&first), 2);
+            first.store(false, Ordering::Relaxed);
+            previous = Some(Arc::downgrade(&first));
+            drop(first);
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert_eq!(builds.load(Ordering::Relaxed), 64);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_constructor_releases_permit_and_shutdown_prevents_rebuild() {
+        let slot = Generations::new(1);
+        let mut pending = Box::pin(slot.get(healthy, std::future::pending));
+        tokio::select! { biased; _ = &mut pending => panic!("unexpected completion"), _ = tokio::task::yield_now() => {} }
+        drop(pending);
+        assert_eq!(slot.waiting.available_permits(), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        slot.get(healthy, || async { Ok(AtomicBool::new(true)) })
+            .await
+            .unwrap();
+        slot.close();
+        assert!(
+            slot.get(healthy, || async { panic!("construction after shutdown") })
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn construction_deadline_releases_admission() {
+        let slot = Generations::new(1);
+        assert!(slot.get(healthy, std::future::pending).await.is_err());
+        assert_eq!(slot.waiting.available_permits(), 1);
+        slot.get(healthy, || async { Ok(AtomicBool::new(true)) })
+            .await
+            .unwrap();
+    }
+}

@@ -13,6 +13,8 @@ pub(super) struct Resources {
     pub receive: Arc<Semaphore>,
     pub buffers: Arc<BufferPool>,
     users: Vec<Budget>,
+    forward_users: Vec<Budget>,
+    pub initializers: Arc<Semaphore>,
 }
 pub(crate) struct TunnelLease {
     _global: Permit,
@@ -29,6 +31,10 @@ impl TunnelLease {
 impl Resources {
     pub fn new(config: &Config, users: usize) -> super::Result<Self> {
         Ok(Self {
+            initializers: Arc::new(Semaphore::new(config.limits.max_pending_requests)),
+            forward_users: (0..users)
+                .map(|_| Budget::new(config.proxy.forward.max_requests_per_user))
+                .collect::<Result<_, _>>()?,
             connections: Budget::new(config.limits.max_connections)?,
             tunnels: Budget::new(config.limits.max_streams)?,
             requests: Budget::new(config.limits.max_streams.saturating_mul(2))?,
@@ -47,6 +53,15 @@ impl Resources {
                 .collect::<Result<_, _>>()?,
         })
     }
+    /// Held from authentication through DNS, retries and response completion.
+    pub fn forward(&self, user: usize) -> Option<TunnelLease> {
+        let global = self.tunnels.acquire()?;
+        let user = self.forward_users.get(user)?.acquire()?;
+        Some(TunnelLease {
+            _global: global,
+            _user: Some(user),
+        })
+    }
     pub fn tunnel(&self, user: Option<usize>) -> Option<TunnelLease> {
         let global = self.tunnels.acquire()?;
         let user = match user {
@@ -57,6 +72,24 @@ impl Resources {
             _global: global,
             _user: user,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn user_leases_rollback_partial_admission() {
+        let mut config = Config::parse(include_str!("../../config.example.toml")).unwrap();
+        config.limits.max_tunnels_per_user = 1;
+        let ledger = Resources::new(&config, 2).unwrap();
+        let a = ledger.tunnel(Some(0)).unwrap();
+        assert!(ledger.tunnel(Some(0)).is_none());
+        assert_eq!(ledger.tunnels.active(), 1);
+        let b = ledger.tunnel(Some(1)).unwrap();
+        drop(a);
+        drop(b);
+        assert_eq!(ledger.tunnels.active(), 0);
     }
 }
 
@@ -116,5 +149,22 @@ impl BufferPool {
             .acquire_many_owned(u32::try_from(bytes.len())?)
             .await?;
         Ok(self.wrap(bytes, permit))
+    }
+}
+#[cfg(test)]
+mod buffer_tests {
+    use super::*;
+    #[tokio::test]
+    async fn clones_and_slices_retain_charge_until_last_owner_drops() {
+        let pool = BufferPool::new(16);
+        let bytes = pool
+            .charge(bytes::Bytes::from_static(b"abcdefgh"))
+            .await
+            .unwrap();
+        let part = bytes.slice(2..4);
+        drop(bytes);
+        assert_eq!(pool.available.available_permits(), 8);
+        drop(part);
+        assert_eq!(pool.available.available_permits(), 16);
     }
 }

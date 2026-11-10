@@ -183,6 +183,8 @@ pub(crate) struct Site {
     pub(super) buffers: Arc<super::resources::BufferPool>,
     bridge: bridge::Generations<bridge::Bridge>,
     max_streams: u32,
+    #[cfg(test)]
+    stats: Arc<WebStats>,
 }
 pub(super) enum Input {
     Data(Bytes),
@@ -218,7 +220,8 @@ struct Context {
     origin: usize,
     attempt: usize,
     path: Option<String>,
-    uploaded: usize,
+    // Counts bytes offered to upstream attempts, including replay.
+    attempted_upload: usize,
     deadline: Option<tokio::time::Instant>,
     _tunnel: Option<super::resources::TunnelLease>,
 }
@@ -281,6 +284,8 @@ impl Site {
             buffers: super::resources::BufferPool::new(config.limits.max_total_buffer_bytes),
             bridge: bridge::Generations::new(config.limits.max_streams),
             max_streams: config.limits.max_streams as u32,
+            #[cfg(test)]
+            stats,
         })
     }
     pub(super) fn forward(
@@ -291,7 +296,15 @@ impl Site {
         website: &Self,
     ) -> Result<Self> {
         let router = Router {
-            config: config.website.clone(),
+            config: Website {
+                max_request_body_bytes: config.proxy.forward.max_request_body_bytes,
+                connect_timeout_secs: config.proxy.forward.connect_timeout_secs,
+                read_timeout_secs: config.proxy.forward.read_timeout_secs,
+                write_timeout_secs: config.proxy.forward.write_timeout_secs,
+                upstream_idle_secs: config.proxy.forward.upstream_idle_secs,
+                compression_level: 0,
+                ..Website::default()
+            },
             domain: config.domain.clone(),
             public_name: config.ech.as_ref().map(|ech| ech.public_name.clone()),
             pools: vec![],
@@ -314,6 +327,8 @@ impl Site {
             buffers: website.buffers.clone(),
             bridge,
             max_streams: config.limits.max_streams as u32,
+            #[cfg(test)]
+            stats: Arc::default(),
         })
     }
     pub fn stop_bridge(&self) {
@@ -352,11 +367,21 @@ impl Site {
         Ok(())
     }
     pub(super) fn start(self: &Arc<Self>, head: Head, end: bool, wake: Arc<Notify>) -> Exchange {
+        self.start_with_lease(head, end, wake, None)
+    }
+    pub(super) fn start_with_lease(
+        self: &Arc<Self>,
+        head: Head,
+        end: bool,
+        wake: Arc<Notify>,
+        lease: Option<super::resources::TunnelLease>,
+    ) -> Exchange {
         let (input, receive) = mpsc::channel(2);
         let (send, output) = mpsc::channel(2);
         let site = self.clone();
         let (result_send, completion) = oneshot::channel();
         let task = tokio::spawn(async move {
+            let _lease = lease;
             let result: Result<()> = async {
                 let bridge = site
                     .bridge
@@ -397,6 +422,10 @@ impl Site {
             task,
             completion,
         }
+    }
+    #[cfg(test)]
+    pub fn stats(&self) -> &Arc<WebStats> {
+        &self.stats
     }
 }
 fn request_header(head: &Head) -> Result<RequestHeader> {
@@ -659,10 +688,13 @@ impl ProxyHttp for Router {
         if s.was_upgraded() {
             return Ok(());
         }
-        ctx.uploaded = ctx
-            .uploaded
+        ctx.attempted_upload = ctx
+            .attempted_upload
             .saturating_add(body.as_ref().map_or(0, Bytes::len));
-        if ctx.uploaded > self.config.max_request_body_bytes {
+        // Pingora increments this only on a downstream read, never when its
+        // retry buffer is replayed. It also handles partial replay followed by
+        // new downstream data; resetting an attempt counter would undercount.
+        if s.as_ref().body_bytes_read() > self.config.max_request_body_bytes {
             return Err(pingora_core::Error::new(
                 pingora_core::ErrorType::HTTPStatus(413),
             ));

@@ -221,3 +221,147 @@ fn proof(key: &Hmac<Sha256>, transcript: &[u8; 32]) -> [u8; 32] {
     mac.update(transcript);
     mac.finalize().into_bytes().into()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn proofs_bind_connection_stream_and_every_target_field() {
+        let c = Credentials::new(&[("user", "a-long-test-secret-123")]).unwrap();
+        let mut binding = Binding {
+            exporter: [7; 32],
+            stream_id: 1,
+        };
+        fn context(binding: &Binding) -> Context<'_> {
+            Context {
+                binding,
+                method: "CONNECT",
+                authority: "example.org:443",
+                scheme: None,
+                path: None,
+                protocol: None,
+            }
+        }
+        let h = c.authorization(0, &context(&binding)).unwrap();
+        assert_eq!(c.principal(&[&h], &context(&binding)), Some(0));
+        assert!(c.principal(&[&h, &h], &context(&binding)).is_none());
+        let old_scheme = h.replacen("moon-naive", "Moon2", 1);
+        assert!(c.principal(&[&old_scheme], &context(&binding)).is_none());
+        assert!(
+            c.principal(&["Basic dXNlcjpwYXNz"], &context(&binding))
+                .is_none()
+        );
+        for index in 0..5 {
+            let mut ctx = context(&binding);
+            match index {
+                0 => ctx.method = "GET",
+                1 => ctx.authority = "other.org:443",
+                2 => ctx.scheme = Some("https"),
+                3 => ctx.path = Some(""),
+                _ => ctx.protocol = Some("websocket"),
+            };
+            assert!(c.principal(&[&h], &ctx).is_none());
+        }
+        binding.stream_id = 3;
+        assert!(c.principal(&[&h], &context(&binding)).is_none());
+        binding.stream_id = 1;
+        binding.exporter[0] ^= 1;
+        assert!(c.principal(&[&h], &context(&binding)).is_none());
+    }
+    #[test]
+    fn independent_python_hmac_vector_and_invalid_encoding() {
+        let c = Credentials::new(&[("user", "a-long-test-secret-123")]).unwrap();
+        let binding = Binding {
+            exporter: [7; 32],
+            stream_id: 1,
+        };
+        let ctx = Context {
+            binding: &binding,
+            method: "CONNECT",
+            authority: "example.org:443",
+            scheme: None,
+            path: None,
+            protocol: None,
+        };
+        assert_eq!(
+            c.authorization(0, &ctx).unwrap(),
+            "moon-naive 02.YftXdcdBhhTG4d0NZDsNy2POlBei72LjxfB2Hz4yjHo="
+        );
+        for h in [
+            "moon-naive invalid",
+            "moon-naive AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA?",
+            "moon-naive AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ] {
+            assert!(c.principal(&[h], &ctx).is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod negotiation_tests {
+    use super::*;
+    #[test]
+    fn offers_and_selections_are_authenticated_with_no_extra_headers() {
+        let credentials = Credentials::new(&[("user", "a-long-test-secret-123")]).unwrap();
+        let binding = Binding {
+            exporter: [7; 32],
+            stream_id: 1,
+        };
+        let context = Context {
+            binding: &binding,
+            method: "CONNECT",
+            authority: "example.org:443",
+            scheme: None,
+            path: None,
+            protocol: None,
+        };
+        let offer = Offer::from_bits(7).unwrap();
+        let request = credentials.authorization_with(0, &context, offer).unwrap();
+        assert_eq!(request.len(), 58);
+        assert_eq!(
+            credentials.authenticate(&[&request], &context),
+            Some((0, offer))
+        );
+        for replacement in ["03.", "0e.", "10.", "0F."] {
+            assert!(
+                credentials
+                    .authenticate(&[&request.replacen("07.", replacement, 1)], &context)
+                    .is_none()
+            );
+        }
+        for mode in [
+            Mode::from_bits(1).unwrap(),
+            Mode::from_bits(6).unwrap(),
+            Mode::from_bits(5).unwrap(),
+        ] {
+            let response = credentials
+                .confirmation_with(0, &context, offer, mode)
+                .unwrap();
+            assert_eq!(response.len(), 58);
+            assert_eq!(
+                credentials.verify_selection(0, &context, offer, &response),
+                Some(mode)
+            );
+            assert!(
+                credentials
+                    .verify_selection(0, &context, Offer::from_bits(3).unwrap(), &response)
+                    .is_none()
+            );
+            let changed = response.replacen(&format!("{:02x}.", mode.bits()), "02.", 1);
+            assert!(
+                credentials
+                    .verify_selection(0, &context, offer, &changed)
+                    .is_none()
+            );
+        }
+        assert!(
+            credentials
+                .verify_selection(0, &context, offer, &request)
+                .is_none()
+        );
+        assert_eq!(
+            credentials.confirmation(0, &context).unwrap(),
+            "moon-naive 02.O6elSJUO7ItPoK1s8VN3H92MoK44fnWi3kSV2Pf4NGU="
+        );
+    }
+}

@@ -101,6 +101,56 @@ pub fn allows_ip(ip: IpAddr, own_addresses: &[IpAddr]) -> bool {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn parses_bracketed_ipv6_and_rejects_ambiguity() {
+        assert_eq!(Authority::parse("[2606:4700::1111]:443").unwrap().port, 443);
+        assert_eq!(
+            Authority::parse("Example.COM:22").unwrap().host,
+            "example.com"
+        );
+        for s in [
+            "host",
+            "host:0",
+            "host:65536",
+            "host:+80",
+            "u@host:80",
+            "host:80/a",
+            "host:80\r\n",
+            "::1:80",
+            "[fe80::1%eth0]:80",
+        ] {
+            assert!(Authority::parse(s).is_err(), "{s:?}");
+        }
+    }
+    #[test]
+    fn acl_blocks_private_metadata_mapped_and_self() {
+        for s in [
+            "127.0.0.1",
+            "169.254.169.254",
+            "10.0.0.1",
+            "100.64.1.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "fc00::1",
+            "fe80::1",
+            "ff02::1",
+            "64:ff9b::7f00:1",
+        ] {
+            assert!(!allows_ip(s.parse().unwrap(), &[]), "{s}");
+        }
+        for s in ["1.1.1.1", "2606:4700::1111"] {
+            assert!(allows_ip(s.parse().unwrap(), &[]));
+        }
+        assert!(!allows_ip(
+            "1.1.1.1".parse().unwrap(),
+            &["::ffff:1.1.1.1".parse().unwrap()]
+        ));
+    }
+}
+
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -161,5 +211,35 @@ impl Budget {
 impl Drop for Permit {
     fn drop(&mut self) {
         self.shared.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    #[test]
+    fn cancellation_and_exhaustion_release_permits() {
+        let b = Budget::new(1).unwrap();
+        let p = b.acquire().unwrap();
+        assert!(b.acquire().is_none());
+        drop(p);
+        assert_eq!(b.active(), 0);
+    }
+    #[test]
+    fn concurrent_budget_never_overcommits() {
+        let b = Budget::new(4).unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                let b = b.clone();
+                scope.spawn(move || {
+                    for _ in 0..1000 {
+                        if let Some(_p) = b.acquire() {
+                            assert!(b.active() <= 4);
+                            std::thread::yield_now();
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(b.active(), 0);
     }
 }

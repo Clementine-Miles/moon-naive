@@ -2,7 +2,7 @@
 
 基于 **Rust、Pingora、BoringSSL 和 quiche** 的 H2/H3 代理服务端，当前版本 **0.7.0**，面向 Linux x86_64。支持固定源站反向代理，以及经过认证的 CONNECT 和 HTTP(S) 正向代理。
 
-仅支持 **moon-naive 修订4协议**，与官方 Naïve 客户端不兼容；Android/Linux 实验客户端源码已导入并初步适配；完整构建和互通尚未验收，见[项目手册](docs/PROJECT.md#androidlinux-实验客户端)。
+简称 **mona**，仅支持 **[moon-naive 修订4协议](docs/PROTOCOL.md)**，与官方 Naïve 客户端不兼容；Android/Linux 实验客户端源码已导入并初步适配；完整构建和互通尚未验收，见[项目手册](docs/PROJECT.md#androidlinux-实验客户端)。
 
 ## 证书管理
 
@@ -30,4 +30,4 @@ cargo build --release --locked -p moon-naive
 
 配置、协议、ACME 恢复、原生构建与部署统一见 [项目手册](docs/PROJECT.md)。
 
-当前源码不含自动化测试、基准、实验与容器入口；编译检查不等同运行验收。许可证：Apache-2.0。
+验证：`cargo test -p moon-naive-core --locked`、`cargo test -p moon-naive --lib --locked`。进度与已知差距见 [实现记录](docs/IMPLEMENTATION.md)。编译检查不等同运行验收。许可证：Apache-2.0。

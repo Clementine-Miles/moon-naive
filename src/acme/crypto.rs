@@ -111,3 +111,50 @@ impl HmacKey for Hmac {
         SigningAlgorithm::Hs256
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn pkcs8_reload_and_raw_jws_signature_verify() {
+        let (key, der) = PROVIDER.generate_key().unwrap();
+        let public = PKey::private_key_from_pkcs8(der.secret_pkcs8_der())
+            .unwrap()
+            .ec_key()
+            .unwrap();
+        let reloaded = SigningKeyProvider::load_key(&PROVIDER, der).unwrap();
+        let sig = reloaded.sign(b"independent JWS payload").unwrap();
+        assert_eq!(sig.len(), 64);
+        let signature = EcdsaSig::from_private_components(
+            BigNum::from_slice(&sig[..32]).unwrap(),
+            BigNum::from_slice(&sig[32..]).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            signature
+                .verify(&boring::sha::sha256(b"independent JWS payload"), &public)
+                .unwrap()
+        );
+        assert!(
+            !signature
+                .verify(&boring::sha::sha256(b"different payload"), &public)
+                .unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(key.as_jwk()).unwrap(),
+            serde_json::to_value(reloaded.as_jwk()).unwrap()
+        );
+    }
+    #[test]
+    fn rfc4231_hmac_sha256_vector() {
+        let signature = HmacKeyProvider::load_key(&PROVIDER, &[0x0b; 20]).sign(b"Hi There");
+        assert_eq!(
+            signature,
+            [
+                0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53, 0x5c, 0xa8, 0xaf, 0xce, 0xaf, 0x0b,
+                0xf1, 0x2b, 0x88, 0x1d, 0xc2, 0x00, 0xc9, 0x83, 0x3d, 0xa7, 0x26, 0xe9, 0x37, 0x6c,
+                0x2e, 0x32, 0xcf, 0xf7
+            ]
+        );
+    }
+}

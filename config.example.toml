@@ -137,3 +137,13 @@ b64_mac_key = "dGVzdC10ZXN0LXRlc3QtdGVzdA"
 # 完整配置、GTS EAB/staging、Cloudflare/LE、旧配置迁移见 docs/CONFIGURATION.md。
 # schema 2 主文件权限必须为 0600；服务用户需拥有文件及可写的 state_dir（0700）。
 # 新修订4客户端须单独准备；本示例不能使官方 NaïveProxy 客户端直接兼容。
+
+# Ordinary authenticated HTTP(S) forwarding; independent of [website] and CONNECT.
+# Bodies stream with backpressure; this is a cumulative unique-byte limit.
+[proxy.forward]
+max_request_body_bytes = 1073741824 # 1 GiB; older versions inherited website's 64 MiB
+connect_timeout_secs = 10
+read_timeout_secs = 120
+write_timeout_secs = 120
+upstream_idle_secs = 30
+max_requests_per_user = 32 # admission through response completion, including DNS

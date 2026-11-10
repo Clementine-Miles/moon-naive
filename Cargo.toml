@@ -8,7 +8,7 @@ publish.workspace = true
 autobins = false
 
 [[bin]]
-test = false
+test = true
 bench = false
 name = "moon-naive"
 path = "src/main.rs"
@@ -96,6 +96,11 @@ instant-acme = { path = "vendor/instant-acme" }
 
 
 [lib]
-test = false
-doctest = false
+test = true
+doctest = true
 bench = false
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

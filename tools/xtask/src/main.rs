@@ -165,6 +165,7 @@ fn verify(target: Option<&str>) -> Result<()> {
             "-D",
             "warnings",
         ],
+        vec!["test", "--workspace", "--locked"],
         vec!["build", "--package", "moon-naive", "--release", "--locked"],
     ] {
         if args[0] != "fmt"
@@ -180,7 +181,7 @@ fn verify(target: Option<&str>) -> Result<()> {
     }
     save_report(
         "verification",
-        "format=passed\nclippy=passed\nrelease compilation=passed\nruntime validation=not performed\n",
+        "format=passed\nclippy=passed\nrelease compilation=passed\nworkspace tests=passed\n",
     )
 }
 

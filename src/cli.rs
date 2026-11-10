@@ -10,7 +10,7 @@ use moon_naive_core::config::Config;
 use std::{fs, io::Read, path::Path, sync::Arc, time::Duration};
 use tokio::sync::watch;
 
-const HELP: &str = "moon-naive serve <config.toml>\nmoon-naive check <config.toml>\nmoon-naive check-config <config.toml>\nmoon-naive check-transport <config.toml>\nmoon-naive status [config.toml]\nmoon-naive acme <once|run|status|cleanup|check-ca> <config.toml>\nmoon-naive acme import-eab <gcloud-export.json> <eab.toml>\nmoon-naive config init <config.toml>\nmoon-naive config migrate <old.toml> <new.toml>\nmoon-naive ech <init|dns|check> <config.toml>\nmoon-naive --version\n\nserve obtains the first DNS-01 certificate, starts HTTPS websites and H2/H3 proxy, and renews automatically.\ncheck validates local setup without CA/DNS requests or listeners.\nconfig and secret files use TOML; see README.md and docs/CONFIGURATION.md.";
+const HELP: &str = "moon-naive serve <config.toml>\nmoon-naive check <config.toml>\nmoon-naive check-config <config.toml>\nmoon-naive check-transport <config.toml>\nmoon-naive status [config.toml]\nmoon-naive acme <once|run|status|cleanup|check-ca> <config.toml>\nmoon-naive acme import-eab <gcloud-export.json> <eab.toml>\nmoon-naive config init <config.toml>\nmoon-naive config migrate <old.toml> <new.toml>\nmoon-naive ech <init|dns|check> <config.toml>\nmoon-naive --version\n\nserve obtains the first DNS-01 certificate, starts HTTPS websites and H2/H3 proxy, and renews automatically.\ncheck validates local setup without CA/DNS requests or listeners.\nconfig and secret files use TOML; see README.md and docs/PROJECT.md.";
 
 fn config(path: &str) -> Result<Arc<Config>> {
     let mut text = String::new();
@@ -297,4 +297,100 @@ fn migrate(old: &str, new: &str) -> Result<()> {
     acme::persist::write_private_new(Path::new(new), text.as_bytes())?;
     println!("configuration migrated; source and ACME state unchanged");
     Ok(())
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn consolidates_legacy_credentials_atomically_without_overwrite_or_state_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let users = root.path().join("users.toml");
+        let dns = root.path().join("dns.toml");
+        let eab = root.path().join("eab.toml");
+        for (path, content) in [
+            (
+                &users,
+                "[[users]]\nusername='user'\npassword='migration-private-password'\n",
+            ),
+            (
+                &dns,
+                "apikey='private-api'\nsecretapikey='private-secret'\n",
+            ),
+            (
+                &eab,
+                "key_id='id'\nb64_mac_key='dGVzdC10ZXN0LXRlc3QtdGVzdA'\n",
+            ),
+        ] {
+            fs::write(path, content).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let mut text = include_str!("../config.example.toml").to_owned();
+        let mut doc: toml::Value = toml::from_str(&text).unwrap();
+        doc.as_table_mut()
+            .unwrap()
+            .insert("listener".into(), toml::Value::Table(Default::default()));
+        doc.as_table_mut()
+            .unwrap()
+            .insert("schema_version".into(), 1.into());
+        doc.as_table_mut().unwrap().remove("proxy");
+        doc["acme"]
+            .as_table_mut()
+            .unwrap()
+            .remove("dns_credentials");
+        doc["acme"].as_table_mut().unwrap().remove("eab");
+        doc["listener"]
+            .as_table_mut()
+            .unwrap()
+            .insert("fast_open".into(), false.into());
+        doc["listener"]
+            .as_table_mut()
+            .unwrap()
+            .insert("zero_rtt".into(), false.into());
+        doc.as_table_mut()
+            .unwrap()
+            .insert("credentials_file".into(), users.to_str().unwrap().into());
+        doc["acme"]
+            .as_table_mut()
+            .unwrap()
+            .insert("dns_token_file".into(), dns.to_str().unwrap().into());
+        doc["acme"]
+            .as_table_mut()
+            .unwrap()
+            .insert("eab_credentials_file".into(), eab.to_str().unwrap().into());
+        text = toml::to_string(&doc).unwrap();
+        let old = root.path().join("old.toml");
+        let new = root.path().join("new.toml");
+        fs::write(&old, &text).unwrap();
+        fs::set_permissions(&old, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&old, text.replace("fast_open = false", "fast_open = true")).unwrap();
+        assert!(migrate(old.to_str().unwrap(), new.to_str().unwrap()).is_err());
+        assert!(!new.exists());
+        fs::write(&old, &text).unwrap();
+        migrate(old.to_str().unwrap(), new.to_str().unwrap()).unwrap();
+        assert_eq!(fs::read_to_string(&old).unwrap(), text);
+        assert_eq!(
+            fs::metadata(&new).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let c = config(new.to_str().unwrap()).unwrap();
+        assert_eq!(c.schema_version, 2);
+        let migrated = fs::read_to_string(&new).unwrap();
+        assert!(!migrated.contains("fast_open") && !migrated.contains("zero_rtt"));
+        assert_eq!(c.proxy.users[0].password, "migration-private-password");
+        assert!(c.credentials_file.as_os_str().is_empty());
+        assert!(c.acme.dns_token_file.as_os_str().is_empty());
+        assert!(c.acme.eab_credentials_file.is_none());
+        assert!(migrate(old.to_str().unwrap(), new.to_str().unwrap()).is_err());
+        fs::set_permissions(&new, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(config(new.to_str().unwrap()).is_err());
+        assert!(
+            fs::read_dir(root.path()).unwrap().all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp"))
+        );
+    }
 }
