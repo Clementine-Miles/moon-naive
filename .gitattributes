@@ -1,2 +1,3 @@
 # Unified-diff context for an empty line contains a required single space.
 client/naiveproxy/chromium.patch -whitespace
+tools/acme-lab/pebble-lab.patch -whitespace

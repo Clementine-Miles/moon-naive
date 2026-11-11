@@ -106,7 +106,7 @@ indexes are docs/*.json. Non-Rust documentation/configuration is excluded here.
 | --- | ---: | ---: | ---: |
 | Production Rust files, including inline tests | 41 / 14571 | 38 / 15596 | 38 / 15711 |
 | Dedicated test files | 12 / 10433 | 8 / 8547 | 10 / 9834 |
-| Tools | 12 / 1655 | 6 / 970 | 9 / 1566 |
+| Tools | 12 / 1655 | 6 / 970 | 9 / 1567 |
 | Generated indexes | 5 / 46968 | 0 / 0 | 0 / 0 |
 | Vendor | 474 / 204942 | 277 / 76255 | 277 / 76281 |
 | Imported client | 0 / 0 | 58 / 7160 | 58 / 7160 |
@@ -207,3 +207,17 @@ then checked with 9 real activation tests (23.66s), denied-warning Clippy (10.74
 and locked release build (1m12s), all passed. These results replace earlier pending
 build notes. Source archive validation and remote revision are recorded after
 committing so packaging can enforce its clean tracked-worktree policy.
+
+Committed implementation snapshot `4560846` was packaged with
+`cargo xtask source work/refactor-source HEAD`: 567 archive members, no symlinks,
+no Git/build/work directories, all content SHA-256 entries valid and
+SOURCE_REVISION matching the commit. Extracted source passed
+`CARGO_TARGET_DIR=/workspace/moon-naive/target cargo check --manifest-path
+/workspace/scratch/mona-source-smoke/moon-naive-0.7.0-source/Cargo.toml --locked
+--offline -p moon-naive` (0.98s). Final delivery only adds documentation,
+required ARI evidence contracts/collector hashes and a scoped .gitattributes
+rule for required unified-diff whitespace; it does not change this Rust tree.
+The named ARI contracts were checked against the successful retained run's
+executed test names/manifests, and evidence oracles were rerun successfully.
+A new source snapshot is generated at the final committed revision before push.
+GitHub push targets branch `work`; no merge or production deployment is performed.

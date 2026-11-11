@@ -20,7 +20,8 @@ REPO = Path(__file__).resolve().parents[2]
 NAMESPACE = ['unshare', '--user', '--map-root-user', '--net', '--', 'sh', '-c',
              'ip link set lo up; exec "$@"', 'lab']
 # Named contracts, not a generated list that silently shrinks when a case is removed.
-ACME = ['nonce_endpoint_404_preserves_existing_order','order_endpoint_404_is_attributed_to_order',
+ACME = ['ari_remote_retry_after_is_not_clipped_by_local_recheck_policy',
+        'ari_rate_limit_wait_is_not_capped_by_local_recheck_policy','nonce_endpoint_404_preserves_existing_order','order_endpoint_404_is_attributed_to_order',
         'finalize_processing_honors_initial_retry_after_120','retry_after_maximum_does_not_panic',
         'outer_retry_after_overflow_does_not_persist_saturated_date','deferred_order_wait_survives_restart',
         'recovered_processing_preserves_first_retry_after','cancellation_during_order_wait_preserves_restart_deadline','retry_after_beyond_operation_deadline_defers_without_early_poll',
@@ -92,7 +93,7 @@ def baseline(run, env):
     values['lockfiles_sha256'] = {str(p): hashlib.sha256((REPO / p).read_bytes()).hexdigest()
                                  for p in [Path('Cargo.lock'), Path('vendor/instant-acme/Cargo.lock')]}
     values['source_sha256'] = {str(p.relative_to(REPO)): hashlib.sha256(p.read_bytes()).hexdigest()
-                               for p in sorted((REPO / 'src').rglob('*.rs'))}
+                               for p in sorted([*(REPO / 'src').rglob('*.rs'), *(REPO / 'core').rglob('*.rs'), *(REPO / 'tools/acme-lab').glob('*.py')])}
     values['tools'] = {}
     for name in ['PEBBLE_BIN', 'CHALLTESTSRV_BIN', 'ACME_LAB_TCPDUMP', 'ACME_LAB_TSHARK']:
         path = Path(env.get(name, '/nonexistent'))
