@@ -2635,3 +2635,5 @@ async fn h3_fragmented_headers_and_reset_release_pending_deadlines() {
     stop.send(true).unwrap();
     task.await.unwrap().unwrap();
 }
+
+mod performance;

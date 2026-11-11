@@ -75,6 +75,7 @@ impl Http {
         })
     }
     /// Test-CA control endpoints only; production CLI never enables cleartext.
+    #[cfg(test)]
     pub fn with_loopback_http(mut self) -> Self {
         self.allow_local_http = true;
         self

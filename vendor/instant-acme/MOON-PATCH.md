@@ -7,12 +7,10 @@ Source: https://github.com/djc/instant-acme at UPSTREAM_REVISION.
 
 Pinned features and cryptographic interfaces remain unchanged. This adds an Error enum variant / parsing API and changes polling timing; exhaustive downstream Error matches must be updated.
 
-## Runtime-only source distribution
+## Regression validation
 
-The pinned library and its explicit production feature selection are retained.
-Tests (including inline unit tests), benchmarks, examples, fixtures, test CI and
-development dependencies have been removed from this checkout at the repository
-owner's request; Cargo test/doctest/bench harnesses are disabled. This is a trimmed
-source distribution, not the complete upstream tree. Historical regression
-coverage is available in moon-naive commit bcf418ea1f99900da64ed2abbee292d2484dbbc7;
-it is not evidence of execution against this trimmed checkout.
+This remains a trimmed upstream source distribution. The two local RetryState
+regressions now run with `CARGO_TARGET_DIR=/tmp/mona-acme-target cargo test --manifest-path vendor/instant-acme/Cargo.toml
+--locked --no-default-features --features time,x509-parser --lib`. The test-only
+Tokio runtime feature changes no production TLS or signing backend. Application
+ACME fixtures cover endpoint attribution, restore/finalize waits and persistence.

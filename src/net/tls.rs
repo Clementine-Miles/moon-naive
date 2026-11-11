@@ -261,9 +261,7 @@ impl Generation {
     }
 }
 pub(super) async fn watch(config: Arc<Config>, slot: Slot, mut stop: watch::Receiver<bool>) {
-    let mut last_error = std::time::Instant::now()
-        .checked_sub(std::time::Duration::from_secs(60))
-        .unwrap();
+    let mut last_error: Option<std::time::Instant> = None;
     loop {
         if *stop.borrow() {
             break;
@@ -276,9 +274,9 @@ pub(super) async fn watch(config: Arc<Config>, slot: Slot, mut stop: watch::Rece
             Ok(Ok(true)) => eprintln!("event=tls_generation_loaded"),
             Ok(Ok(false)) => {}
             result => {
-                if last_error.elapsed() >= std::time::Duration::from_secs(60) {
+                if last_error.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(60)) {
                     eprintln!("event=tls_refresh_failed detail={result:?}");
-                    last_error = std::time::Instant::now();
+                    last_error = Some(std::time::Instant::now());
                 }
             }
         }

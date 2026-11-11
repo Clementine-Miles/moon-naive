@@ -42,3 +42,6 @@ pub(crate) mod lab_support;
 pub(crate) mod lab;
 
 pub(crate) mod health;
+
+#[cfg(test)]
+mod pebble;

@@ -24,7 +24,7 @@ cargo build --release --locked -p moon-naive
 
 ## 开发工具
 
-构建使用 Cargo；审计和源码打包统一使用 `cargo xtask audit-native`、`cargo xtask source dist`。Rust 工具位于 `tools/xtask/`。BoringSSL 仍需要上述 C/C++ 工具链，普通构建无需实验工具或容器环境；同平台重复构建可[复用 BoringSSL](docs/PROJECT.md#复用-boringssl避免重复调用-cmake)，避免再次调用 CMake。
+构建使用 Cargo；审计和源码打包统一使用 `cargo xtask audit-native`、`cargo xtask source dist`。Rust 工具位于 `tools/xtask/`。`cargo xtask verify` 包含实际测试；显式抓包实验统一从 `cargo xtask lab` 运行，前置工具和参数见[手册](docs/PROJECT.md#构建检查与维护边界)。BoringSSL 仍需要上述 C/C++ 工具链，普通构建无需实验工具或容器环境；同平台重复构建可[复用 BoringSSL](docs/PROJECT.md#复用-boringssl避免重复调用-cmake)，避免再次调用 CMake。
 
 ## 文档
 

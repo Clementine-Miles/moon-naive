@@ -80,6 +80,9 @@ upper_case_acronyms = "warn"
 use_self = "warn"
 
 [lib]
-test = false
+test = true
 doctest = false
 bench = false
+
+[dev-dependencies]
+tokio = { version = "1.22", features = ["rt", "time"] }

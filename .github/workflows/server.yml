@@ -25,3 +25,7 @@ jobs:
       - run: cargo test --locked --workspace -- --test-threads=4
       - run: cargo build --locked --release -p moon-naive
       - run: cargo xtask audit-native
+      - run: cargo xtask lab --only oracles --run "${RUNNER_TEMP}/mona-oracles"
+      - run: cargo test --manifest-path vendor/instant-acme/Cargo.toml --locked --no-default-features --features time,x509-parser --lib
+        env:
+          CARGO_TARGET_DIR: /tmp/mona-acme-validation

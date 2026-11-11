@@ -693,3 +693,28 @@ impl RetryState {
         ControlFlow::Continue(())
     }
 }
+
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    #[test]
+    fn retry_wait_checks_deadline_before_sleep() {
+        tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(async {
+            let mut state = RetryPolicy::new().initial_delay(Duration::from_secs(1))
+                .timeout(Duration::ZERO).state().unwrap();
+            let result = tokio::time::timeout(Duration::from_millis(100), state.wait(None)).await.unwrap();
+            assert!(matches!(result, ControlFlow::Break(Error::Timeout(None))));
+        });
+    }
+    #[test]
+    fn retry_wait_does_not_discard_last_permitted_attempt() {
+        tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(async {
+            let mut state = RetryPolicy::new().initial_delay(Duration::from_millis(1))
+                .backoff(1000.0).timeout(Duration::from_millis(500)).state().unwrap();
+            assert!(matches!(state.wait(None).await, ControlFlow::Continue(())));
+            let result = tokio::time::timeout(Duration::from_millis(100), state.wait(None)).await.unwrap();
+            assert!(matches!(result, ControlFlow::Break(Error::Timeout(None))));
+        });
+    }
+}

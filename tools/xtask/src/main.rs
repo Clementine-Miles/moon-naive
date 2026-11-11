@@ -188,6 +188,16 @@ fn verify(target: Option<&str>) -> Result<()> {
 fn main() -> ExitCode {
     let args: Vec<_> = env::args().skip(1).collect();
     let result = match args.as_slice() {
+        [cmd, args @ ..] if cmd == "lab" => {
+            let status = Command::new("python3")
+                .arg(root().join("tools/acme-lab/run.py"))
+                .args(args)
+                .current_dir(root())
+                .status();
+            status.map_err(Into::into).and_then(|status| {
+                check(status.success(), "laboratory failed; inspect its result.json")
+            })
+        }
         [cmd] if cmd == "verify" => verify(None),
         [cmd, target] if cmd == "verify" => verify(Some(target)),
         [cmd] if cmd == "audit-native" => audit_native(),
@@ -195,7 +205,7 @@ fn main() -> ExitCode {
         [cmd, binary, output] if cmd == "dist" => release::dist(Path::new(binary), Path::new(output)),
         [cmd, output] if cmd == "source" => release::source(Path::new(output), "HEAD"),
         [cmd, output, revision] if cmd == "source" => release::source(Path::new(output), revision),
-        _ => Err("usage: cargo xtask verify [target] | audit-native | check-elf <binary> | dist <binary> <output-dir> | source <output-dir> [revision]".into()),
+        _ => Err("usage: cargo xtask lab [--only SUITE] [--run DIR] | verify [target] | audit-native | check-elf <binary> | dist <binary> <output-dir> | source <output-dir> [revision]".into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

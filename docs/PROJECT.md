@@ -262,7 +262,7 @@ moon-naive acme once /etc/moon-naive/config.toml
 moon-naive acme cleanup /etc/moon-naive/config.toml
 ```
 
-`status` 本地重验已安装证书，不报告进程是否在运行。`check-ca` 只读 HTTPS directory，不创建账户或订单，不改 DNS。`once` 执行当前计划允许的一次协调，不强制提前续期；重试/无证书返回非零。`cleanup` 只重试 journal 记录的 DNS 清理。另有 `acme run` 供独立维护使用，不能与读取同一状态的 `serve` 同时运行。
+`status <config>` 本地重验已安装证书，并报告绑定 PID/启动时间/boot ID 的续期 worker 心跳；它不探测监听器。TLS-LOADED 是可过期的诊断观察，不能替代真实 H2/H3 握手。`check-ca` 只读 HTTPS directory，不创建账户或订单，不改 DNS。`once` 执行当前计划允许的一次协调，不强制提前续期；重试/无证书返回非零。`cleanup` 只重试 journal 记录的 DNS 清理。另有 `acme run` 供独立维护使用，不能与读取同一状态的 `serve` 同时运行。
 
 当前支持单机单域名；Google/Let's Encrypt CA 与 Porkbun/Cloudflare DNS 独立选择。多 SAN/通配符、按需域名、分布式锁、多 CA 自动切换和 OCSP stapling 不在本版本范围。公网签发需要实际域名与私有凭据；本次本地测试不替代公网 CA/DNS 验收。
 
@@ -679,13 +679,20 @@ ACME 已完成订单的证书若已过期或进入更新窗口，先验证身份
 
 ## 构建检查与维护边界
 
-当前只保留生产编译、格式、Clippy、依赖/源摘要和发布产物检查；不提供自动化测试或实验入口。Cargo 的 test/doctest/bench harness 已关闭。`verify [target]` 不执行目标程序；不再提供旧 test、test-isolated、lab、verify-run 或 platform-smoke 命令。
+当前已恢复 core/server 单元与真实 loopback 集成测试。`cargo xtask verify` 执行格式、Clippy、工作区测试及 release 构建；跨目标运行需该目标可执行。`cargo xtask lab` 是唯一公开实验入口，委托 `tools/acme-lab/run.py` 的单一 suite 定义；私有 Python 保留抓包和独立密码分析，`result.json` 为唯一机器判定结果。默认测试无需抓包；显式 lab 模式要求所选场景、抓包和解码验证全部存在且成功。
+
+- 快速：`cargo test --locked -p moon-naive-core`，`python3 tools/vectors/generate.py --check`。
+- 普通集成：`cargo test --locked --workspace`。
+- 证据判定反例：`cargo xtask lab --only oracles --run /tmp/mona-oracles-UNIQUE`。
+- 隔离实验：`cargo xtask lab --only acme --run /tmp/mona-acme-UNIQUE --tcpdump /path/to/tcpdump --tshark /path/to/tshark`。输出目录必须全新且在源码树之外。
+- Pebble：同一入口 `--only pebble`，另指定 `--pebble`、`--challtestsrv`、`--pebble-source`；测试 pin 为 `d52948ce25e7c1576bcd18ff0e20a1c24ec7c44b`，在外部 checkout 应用 `tools/acme-lab/pebble-lab.patch` 后构建。它只修改测试 CA，不进入生产。
+- Linux 实验需要 `unshare` 用户/网络命名空间、`iproute2`、tcpdump、tshark，以及 Python cryptography。缺前置工具会失败，不报告跳过为通过。安装与工具路径由操作者提供，不隐式下载未验证工具。
 
 固定 Pin：Pingora `4487f7b2ab50f159e4a2cf4f6a6b813f61bb6e19`，quiche `925b225825e2188f8e58e359114150500557bf61`，instant-acme 如上。删除测试辅助依赖不会升级生产包。vendor 是保留 pin 的运行库裁剪副本，裁剪范围和生产补丁分别记录于 [Pingora](../vendor/pingora/MOON-NAIVE-PATCHES.md) 与 [instant-acme](../vendor/instant-acme/MOON-PATCH.md)。修改后同步各 vendor SHA256SUMS 及根清单，保留上游版权和许可证。
 
 构建依赖 C/C++、make、CMake、libclang、Linux headers、Perl、pkg-config、Git 与系统 CA；同平台 BoringSSL 复用方法见原生构建章节。构建、摘要、tar.gz、ELF 检查由 tools/xtask 的 Rust 工具完成，不依赖实验 Python/Go 程序。
 
-当前检查结果仅说明本次清理后的构建与静态检查情况，不能代替已删除的 codec、半关闭、恢复、权限和真实网络回归覆盖。实验客户端的真实互通、其他目标/MSRV、长期运行、公网 CA/DNS、性能与 DPI 可识别性不能由编译成功推导。
+本轮实际执行结果见 [实施检查点](IMPLEMENTATION.md)；下文历史记录不等同于当前测试结果。实验客户端的真实互通、其他目标/MSRV、长期运行、公网 CA/DNS、性能与 DPI 可识别性不能由编译成功推导。
 
 合并前的审阅与实验记录保留于 Git 提交 [bcf418e](https://github.com/Clementine-Miles/moon-naive/tree/bcf418ea1f99900da64ed2abbee292d2484dbbc7/docs)，对应当时源码；不得作为当前提交的测试执行成功。仓库外既有抓包、密钥和 journal 工件未纳入源代码归档。
 
