@@ -79,6 +79,8 @@ pub fn allows_ip(ip: IpAddr, own_addresses: &[IpAddr]) -> bool {
                 (Ipv4Addr::new(172, 16, 0, 0), 12),
                 (Ipv4Addr::new(192, 0, 0, 0), 24),
                 (Ipv4Addr::new(192, 0, 2, 0), 24),
+                // Deprecated 6to4 relay anycast (RFC 7526), not public origin space.
+                (Ipv4Addr::new(192, 88, 99, 0), 24),
                 (Ipv4Addr::new(192, 168, 0, 0), 16),
                 (Ipv4Addr::new(198, 18, 0, 0), 15),
                 (Ipv4Addr::new(198, 51, 100, 0), 24),
@@ -132,6 +134,10 @@ mod tests {
             "169.254.169.254",
             "10.0.0.1",
             "100.64.1.1",
+            "192.88.99.0",
+            "192.88.99.1",
+            "192.88.99.255",
+            "::ffff:192.88.99.1",
             "::1",
             "::ffff:127.0.0.1",
             "fc00::1",
@@ -141,7 +147,12 @@ mod tests {
         ] {
             assert!(!allows_ip(s.parse().unwrap(), &[]), "{s}");
         }
-        for s in ["1.1.1.1", "2606:4700::1111"] {
+        for s in [
+            "1.1.1.1",
+            "192.88.98.255",
+            "192.88.100.0",
+            "2606:4700::1111",
+        ] {
             assert!(allows_ip(s.parse().unwrap(), &[]));
         }
         assert!(!allows_ip(

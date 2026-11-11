@@ -14,6 +14,7 @@ name = "moon-naive"
 path = "src/main.rs"
 
 [dependencies]
+nix = { version = "0.31.3", default-features = false, features = ["net"] }
 moon-naive-core.workspace = true
 pingora-core = { git = "https://github.com/cloudflare/pingora.git", rev = "4487f7b2ab50f159e4a2cf4f6a6b813f61bb6e19", default-features = false, features = ["boringssl"] }
 pingora-http = { git = "https://github.com/cloudflare/pingora.git", rev = "4487f7b2ab50f159e4a2cf4f6a6b813f61bb6e19" }

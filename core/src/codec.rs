@@ -349,6 +349,18 @@ mod tests {
 #[cfg(test)]
 mod negotiated_tests {
     use super::*;
+    #[test]
+    fn finite_sixteen_client_offer_is_supported_by_every_server_preference() {
+        let offer = Offer::from_bits(0x02).unwrap();
+        for initial in [8, 16] {
+            for sparse in [false, true] {
+                let selected = offer.select(initial, sparse);
+                assert_eq!(selected.bits(), 0x02);
+                assert!(offer.accepts(selected));
+            }
+        }
+    }
+
     // A new stream (or the other direction) must not inherit the connection's
     // earlier traffic counters, negotiated mode, or earned sparse credit.
     #[test]

@@ -185,6 +185,9 @@ impl Pool {
                 addresses,
             ));
         }
+        let local = super::super::egress::local_addresses()
+            .await
+            .map_err(|_| pingora_core::Error::new_up(pingora_core::ErrorType::ConnectError))?;
         let addresses: Vec<_> = cache
             .as_ref()
             .expect("resolved addresses")
@@ -194,7 +197,7 @@ impl Pool {
             .filter(|address| {
                 !(address.port() == self.frontend.port()
                     && (super::super::egress::same_ip(address.ip(), self.frontend.ip())
-                        || super::super::egress::is_local(address.ip())
+                        || super::super::egress::is_local(address.ip(), &local)
                         || self
                             .public_addresses
                             .iter()
@@ -359,10 +362,14 @@ impl ForwardOrigin {
         if addresses.len() > 32 {
             return Err(fail());
         }
+        let local = super::super::egress::local_addresses()
+            .await
+            .map_err(|_| fail())?;
         let addresses: Vec<_> = addresses
             .into_iter()
             .filter(|a| {
-                allows_ip(a.ip(), &self.egress.own) && !super::super::egress::is_local(a.ip())
+                allows_ip(a.ip(), &self.egress.own)
+                    && !super::super::egress::is_local(a.ip(), &local)
             })
             .collect();
         let addr = *addresses.first().ok_or_else(fail)?;

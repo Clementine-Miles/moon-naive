@@ -175,3 +175,12 @@ padding, malformed sizes, truncation, context binding and response domains.
 The loopback server suite additionally exercises actual TLS exporters and IDs.
 This specification is not evidence that every runtime acceptance case has passed;
 see [implementation record](IMPLEMENTATION.md) for current results and gaps.
+
+### Experimental finite-sixteen client profile
+
+The imported C++ test/experimental client offers only `0x02`. Every supported
+server preference (`initial_records` 8 or 16, sparse enabled or disabled) selects
+`0x02` for this offer: preferences cannot select an unoffered capability. Thus
+its fixed confirmation/codec profile is consistent; no global server restriction
+or wire change is necessary. This is covered by the core negotiation regression,
+not a claim of production client readiness.

@@ -233,7 +233,8 @@ where
         tokio::select! {biased;
             _=wait_stop(&mut shutdown)=>{notify("STOPPING=1\nSTATUS=Draining connections")?;let _=stop.send(true);network.await},
             result=control.wait()=>{
-                eprintln!("event=renewal_stopped reconcile_required=true detail={result:?}");
+                // Remote Problem bodies and URLs are not safe operational log fields.
+                eprintln!("event=renewal_stopped reconcile_required=true failed={}", result.is_err());
                 if let Err(error) = notify("STATUS=Network continues with TLS/ECH admission checks; renewal stopped, explicit reconciliation required") {
                     eprintln!("event=renewal_status_report_failed detail={error}");
                 }
@@ -261,8 +262,8 @@ where
         result.is_ok() && cleanup.is_ok()
     );
     if serving {
-        if let Err(error) = cleanup {
-            eprintln!("event=renewal_cleanup_failed reconcile_required=true detail={error}");
+        if cleanup.is_err() {
+            eprintln!("event=renewal_cleanup_failed reconcile_required=true");
         }
         // The same post-startup renewal failure must have the same consequence
         // whether control.wait or the explicit network shutdown won the select.

@@ -61,7 +61,7 @@ async fn lookup_in(
     })
     .await
 }
-async fn run_job<T: Send + 'static>(
+pub(crate) async fn run_job<T: Send + 'static>(
     pool: Arc<Semaphore>,
     job: impl FnOnce() -> std::io::Result<T> + Send + 'static,
 ) -> std::io::Result<T> {

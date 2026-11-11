@@ -23,24 +23,40 @@ pub(super) fn same_ip(a: IpAddr, b: IpAddr) -> bool {
     }
     normalize(a) == normalize(b)
 }
-pub(super) fn is_local(ip: IpAddr) -> bool {
-    let ip = match ip {
-        IpAddr::V6(v) => v.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
-        _ => ip,
-    };
-    if ip.is_loopback() || ip.is_unspecified() {
-        return true;
-    }
-    // UDP connect selects a route/source without transmitting a datagram. Unlike
-    // a successful bind(), this does not classify every address as local on a
-    // host with ip_nonlocal_bind enabled.
-    let bind = if ip.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
-    std::net::UdpSocket::bind(bind).is_ok_and(|socket| {
-        socket.connect(SocketAddr::new(ip, 9)).is_ok()
-            && socket
-                .local_addr()
-                .is_ok_and(|local| same_ip(local.ip(), ip))
-    })
+/// Fresh interface snapshot for one admission, never a time-based security cache.
+/// getifaddrs runs outside the async worker; its permit survives cancellation.
+pub(super) async fn local_addresses() -> std::io::Result<Vec<IpAddr>> {
+    static JOBS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    crate::resolve::run_job(
+        JOBS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(8)))
+            .clone(),
+        || {
+            let interfaces = nix::ifaddrs::getifaddrs().map_err(std::io::Error::from)?;
+            let mut addresses = Vec::new();
+            for interface in interfaces {
+                let Some(address) = interface.address else {
+                    continue;
+                };
+                let ip = address
+                    .as_sockaddr_in()
+                    .map(|a| IpAddr::V4(a.ip()))
+                    .or_else(|| address.as_sockaddr_in6().map(|a| IpAddr::V6(a.ip())));
+                if let Some(ip) = ip {
+                    if addresses.len() == 4096 {
+                        return Err(std::io::Error::other(
+                            "local interface address limit exceeded",
+                        ));
+                    }
+                    addresses.push(ip);
+                }
+            }
+            Ok(addresses)
+        },
+    )
+    .await
+}
+pub(super) fn is_local(ip: IpAddr, local: &[IpAddr]) -> bool {
+    ip.is_loopback() || ip.is_unspecified() || local.iter().any(|own| same_ip(*own, ip))
 }
 
 #[derive(Clone)]
@@ -127,9 +143,10 @@ impl Egress {
         if addresses.len() > 32 {
             return Err(502);
         }
+        let local = local_addresses().await.map_err(|_| 502u16)?;
         let addresses: Vec<_> = addresses
             .into_iter()
-            .filter(|a| allows_ip(a.ip(), &self.own) && !is_local(a.ip()))
+            .filter(|a| allows_ip(a.ip(), &self.own) && !is_local(a.ip(), &local))
             .collect();
         if addresses.is_empty() {
             return Err(403);
@@ -146,9 +163,10 @@ impl Egress {
             let target = Authority::parse(&addresses[0].to_string()).map_err(|_| 502u16)?;
             return self.dial(&target).await;
         }
+        let local = local_addresses().await.map_err(|_| 502u16)?;
         let addresses = addresses
             .into_iter()
-            .filter(|a| allows_ip(a.ip(), &self.own) && !is_local(a.ip()))
+            .filter(|a| allows_ip(a.ip(), &self.own) && !is_local(a.ip(), &local))
             .collect::<Vec<_>>();
         if addresses.is_empty() {
             return Err(403);
@@ -552,6 +570,40 @@ async fn socks(stream: &mut Stream, config: &ProxyUpstream, target: SocketAddr) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn local_snapshot_recognizes_loopback_and_mapped_interfaces() {
+        let addresses = local_addresses().await.unwrap();
+        assert!(is_local("127.0.0.1".parse().unwrap(), &addresses));
+        let own = "192.0.2.17".parse().unwrap();
+        assert!(is_local("::ffff:192.0.2.17".parse().unwrap(), &[own]));
+        assert!(!is_local(own, &[]));
+        assert!(!is_local("192.0.2.18".parse().unwrap(), &[own]));
+    }
+
+    #[tokio::test]
+    #[ignore = "explicit isolated network namespace with iproute2"]
+    async fn local_snapshot_observes_interface_addition_and_removal() {
+        assert_eq!(
+            std::env::var("MONA_INTERFACE_TEST_NETNS").as_deref(),
+            Ok("1")
+        );
+        let ip = "192.0.2.17".parse().unwrap();
+        assert!(!is_local(ip, &local_addresses().await.unwrap()));
+        let edit = |action| {
+            std::process::Command::new("ip")
+                .args(["addr", action, "192.0.2.17/32", "dev", "lo"])
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(edit("add"));
+        let added = local_addresses().await.unwrap();
+        assert!(edit("del"));
+        let removed = local_addresses().await.unwrap();
+        assert!(is_local(ip, &added));
+        assert!(!is_local(ip, &removed));
+    }
+
     #[tokio::test]
     async fn candidate_fallback_in_both_address_family_orders() {
         let algorithm = moon_naive_core::config::TcpCongestion::System;

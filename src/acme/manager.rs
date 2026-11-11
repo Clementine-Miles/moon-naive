@@ -206,7 +206,13 @@ impl<P: DnsProvider> Manager<P> {
                 );
             };
             self.account().await?;
-            match self.account.as_ref().unwrap().order(url.clone()).await {
+            match self
+                .account
+                .as_ref()
+                .ok_or("ACME account unavailable after restoration")?
+                .order(url.clone())
+                .await
+            {
                 Ok(mut order) => {
                     if order.state().status == OrderStatus::Pending {
                         let mut found = false;
@@ -305,6 +311,8 @@ impl<P: DnsProvider> Manager<P> {
                 let delay = base.saturating_add(random_below(base / 5 + 1)?);
                 self.journal.next_attempt = now()
                     .saturating_add(delay)
+                    // A durable order wait survives errors and transport observation resets.
+                    .max(self.journal.next_attempt)
                     .max(self.http.retry_after.load(Ordering::Relaxed));
                 self.persist()?;
                 Ok(Tick::RetryScheduled)
@@ -359,7 +367,14 @@ impl<P: DnsProvider> Manager<P> {
                 csr,
             });
         }
-        if self.journal.order.as_ref().unwrap().url.is_empty() {
+        if self
+            .journal
+            .order
+            .as_ref()
+            .ok_or("ACME order missing during reconciliation")?
+            .url
+            .is_empty()
+        {
             self.phase = "new-order";
             // newOrder has no protocol idempotency token. A crash in its response
             // gap is bounded by this persistent cooldown, not called exactly-once.
@@ -371,22 +386,33 @@ impl<P: DnsProvider> Manager<P> {
             if let Some(id) = old_id {
                 request = request.replaces(id);
             }
-            let account = self.account.as_ref().unwrap();
+            let account = self
+                .account
+                .as_ref()
+                .ok_or("ACME account unavailable after restoration")?;
             let order = match account.new_order(&request).await {
                 Err(instant_acme::Error::Unsupported(_)) => {
                     account.new_order(&NewOrder::new(&identifiers)).await?
                 }
                 result => result?,
             };
-            self.journal.order.as_mut().unwrap().url = order.url().into();
+            self.journal
+                .order
+                .as_mut()
+                .ok_or("ACME order missing after creation")?
+                .url = order.url().into();
             self.persist()?;
         }
-        let saved = self.journal.order.as_ref().unwrap();
+        let saved = self
+            .journal
+            .order
+            .as_ref()
+            .ok_or("ACME order missing during reconciliation")?;
         self.phase = "recover-order";
         let mut order = match self
             .account
             .as_ref()
-            .unwrap()
+            .ok_or("ACME account unavailable during order restoration")?
             .order(saved.url.clone())
             .await
         {
@@ -498,7 +524,14 @@ impl<P: DnsProvider> Manager<P> {
         if order.state().status == OrderStatus::Ready {
             self.phase = "finalize";
             order
-                .finalize_csr(&self.journal.order.as_ref().unwrap().csr)
+                .finalize_csr(
+                    &self
+                        .journal
+                        .order
+                        .as_ref()
+                        .ok_or("ACME order missing during reconciliation")?
+                        .csr,
+                )
                 .await?;
         }
         self.phase = "certificate-download";
@@ -510,7 +543,7 @@ impl<P: DnsProvider> Manager<P> {
                 .journal
                 .order
                 .as_ref()
-                .unwrap()
+                .ok_or("ACME order missing during certificate download")?
                 .key_pem
                 .as_bytes()
                 .to_vec(),
@@ -651,23 +684,20 @@ impl<P: DnsProvider> Manager<P> {
         let ari_wait = self.http.retry_after.swap(previous_wait, Ordering::Relaxed);
         let (info, check_after) = match result {
             Ok(info) => info,
-            Err(error) => {
-                let wait = if matches!(
-                    error,
-                    instant_acme::Error::Response {
-                        status: 429 | 503,
-                        ..
-                    }
-                ) {
-                    ari_wait
-                } else {
-                    ari_wait.min(now().saturating_add(86400))
-                };
-                self.journal.ari_check_at = self.journal.ari_check_at.max(wait);
+            Err(_) => {
+                // The local retry interval never overrides a remote not-before hint,
+                // including one on an unsuccessful ARI response.
+                self.journal.ari_check_at = self.journal.ari_check_at.max(ari_wait);
                 return;
             }
         };
-        self.journal.ari_check_at = now().saturating_add(check_after.as_secs().clamp(60, 86400));
+        // ARI is independent of order waits and certificate renew_at. A remote
+        // delay can exceed the local recheck cadence without postponing renewal.
+        let local = now().saturating_add(60);
+        let Some(remote) = now().checked_add(check_after.as_secs()) else {
+            return; // retain bounded local fallback; never persist a saturated date
+        };
+        self.journal.ari_check_at = local.max(remote).max(ari_wait);
         let (Ok(start), Ok(end)) = (
             u64::try_from(info.suggested_window.start.unix_timestamp()),
             u64::try_from(info.suggested_window.end.unix_timestamp()),

@@ -1304,7 +1304,7 @@ async fn two_managers_contend_for_same_directory_without_corrupting_key() {
     assert!(Manager::open(&config, env.provider("none"), env.http()).is_ok());
 }
 #[tokio::test]
-async fn ari_check_interval_has_an_upper_bound() {
+async fn ari_remote_retry_after_is_not_clipped_by_local_recheck_policy() {
     let env = Environment::start("ari-long", Mode::Normal).await;
     let _capture = env.capture();
     let config = env.config();
@@ -1329,8 +1329,21 @@ async fn ari_check_interval_has_an_upper_bound() {
     assert_eq!(manager.tick().await.unwrap(), super::manager::Tick::Idle);
     let after = env.case.journal(&config.state_dir, "long-interval");
     assert!(
-        after["ari_check_at"].as_u64().unwrap() <= super::now() + 86400,
-        "proposed ARI check maximum: 24h; this cap does not apply to order Retry-After"
+        after["ari_check_at"].as_u64().unwrap() >= super::now() + 3153599999,
+        "remote ARI Retry-After must not be clipped by the local recheck cadence"
+    );
+    // Restoring the account sets its short local cooldown; ARI must not turn
+    // that into the remote century-long not-before date.
+    assert!(after["next_attempt"].as_u64().unwrap() <= super::now() + 3);
+    assert!(after["renew_at"].as_u64().unwrap() < after["ari_check_at"].as_u64().unwrap());
+    let requests = &env.state.lock().unwrap().requests;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.starts_with("GET /renewal-info/"))
+            .count(),
+        2,
+        "both initial scheduling and the long Retry-After response must be exercised"
     );
 }
 

@@ -1420,6 +1420,7 @@ dependencies = [
  "instant-acme",
  "memchr",
  "moon-naive-core",
+ "nix",
  "pingora-core",
  "pingora-http",
  "pingora-proxy",
