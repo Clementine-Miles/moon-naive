@@ -1,6 +1,61 @@
 # Implementation and validation checkpoint
 
-## Current stage: correctness and maintainability refactor (2026-11-11)
+## Latest stage: real Pebble recovery and evidence gate (2026-11-11)
+
+Baseline `c4004b7`, branch `work`, clean worktree. Production Rust, wire protocol,
+configuration and dependency revisions are unchanged in this stage. The next
+outstanding acceptance item, actual isolated Pebble execution, is now completed.
+
+- Built external Pebble commit `d52948ce25e7c1576bcd18ff0e20a1c24ec7c44b`
+  with the existing laboratory patch, Go 1.24.4, `-mod=readonly`; Go was extracted
+  outside the checkout from signed Debian packages. No Go server sidecar was added.
+- Fixed runner provenance collection's obsolete hard-coded Go installation path;
+  use PATH discovery, preserving one public xtask entry and one suite definition.
+- Required JOSE evidence now covers every Pebble scenario, not only synthetic
+  ACME cases. A regression supplies seven captures and a successful mock decoder
+  with zero verified JWS: all seven must fail. The positive counterpart must pass.
+- Real tests: issuance/restart/renewal with DNS outage, EAB/account recovery,
+  acknowledged challenge timeout, SIGTERM, crash/restart, bounded continuous
+  badNonce rejection and authorization reuse. **7 passed, 0 failed, 0 ignored**
+  in 61.18s. Capture analysis: 7 cases, 103 valid JWS, 1 valid EAB, zero errors.
+  No sleeps/retries/production semantics were adjusted to achieve this result.
+
+Executed command (after activating Rust and selecting crypto-capable Python and
+Go on PATH, with GOROOT pointing to the extracted Go distribution):
+
+```sh
+cargo xtask lab --only pebble --run /workspace/scratch/mona-next-pebble \
+  --home /workspace/scratch/mona-lab-tools \
+  --pebble /workspace/scratch/mona-lab-tools/bin/pebble \
+  --challtestsrv /workspace/scratch/mona-lab-tools/bin/pebble-challtestsrv \
+  --pebble-source /workspace/scratch/mona-lab-tools/pebble-src
+cargo xtask lab --only oracles --run /workspace/scratch/mona-next-oracles-final
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo xtask audit-native
+python3 -m py_compile tools/acme-lab/run.py tools/acme-lab/analyze.py
+cargo build --locked --release -p moon-naive
+```
+
+All passed; release validation reused the unchanged Rust build. Oracles include
+4 unittest cases plus runner contract assertions.
+The prior workspace/release results below are historical for the unchanged Rust
+source tree; they are not relabeled as new runtime executions. The authoritative
+new run result is `/workspace/scratch/mona-next-pebble/result.json`; private bundle
+SHA-256 `fc1ab421874fec9efd225118d67af0fc374eee991636ab0414077642d34aefcc`.
+Tool versions/hashes and exact commands are retained in that run's baseline.
+Raw keys, journals, captures, downloaded tools and CA sources remain outside Git.
+
+File map: only the existing `tools/acme-lab/run.py` changes behavior; no new
+modules, files, abstractions or state owners. Under the counting method below,
+tools remain 9 files, 1567 → 1587 lines (20 lines of regression/gate work); all
+production/test/vendor/client source buckets are unchanged. Source checksums and
+this report are refreshed separately. The earlier “Pebble not executed” limitation
+is closed. Detailed error taxonomy, remaining resource/fairness stress coverage
+and the broader original server acceptance remain open; no production readiness
+or public-CA/provider validation is inferred from a controlled Pebble run.
+
+## Previous stage: correctness and maintainability refactor (2026-11-11)
 
 The actual starting checkout was `work` at `da8ed48`, following local commits
 `1379712` and repository baseline `d99433c`. The requested review baseline
@@ -189,9 +244,9 @@ admission and drains within configured graceful_timeout_secs (default 300s);
 systemd TimeoutStopSec is 360s. Preserve private journals/generations for restart
 or rollback; never delete uncertain DNS intents to force progress.
 
-Current-stage limitations: real Pebble scenarios are restored but not executed
-here (no built patched Pebble/challtestsrv provided); build the documented pinned
-external CA and run `cargo xtask lab --only pebble`. Required capture ACME suite
+Previous-stage limitation (now closed above): real Pebble scenarios had been
+restored but not executed. Reproduce using the pinned external CA and
+`cargo xtask lab --only pebble`. Required capture ACME suite
 uses a controlled synthetic CA/provider, not Pebble or a public CA. No production
 DNS, production certificates, deployment, merge, release publication or production
 client development occurred. Detailed error taxonomy and full original server

@@ -101,7 +101,7 @@ def baseline(run, env):
             values['tools'][name] = {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
             version_args = ([str(path), '--version'] if 'TCPDUMP' in name else
                             [str(path), '-v'] if 'TSHARK' in name else
-                            [str(Path(env.get('ACME_LAB_HOME', '/workspace/.moon-naive-acme-lab')) / 'tools/go/bin/go'), 'version', '-m', str(path)])
+                            [shutil.which('go', path=env.get('PATH')) or 'go', 'version', '-m', str(path)])
             version = subprocess.run(version_args, env=env, capture_output=True, text=True)
             values['tools'][name]['version'] = {'exit_code': version.returncode, 'stdout': version.stdout, 'stderr': version.stderr}
     (run / 'baseline.json').write_text(json.dumps(values, indent=2))
@@ -118,7 +118,7 @@ def needs_jose(name):
     non_jws = ['external_cancellation_closes_socket_and_owned_driver',
                'cloudflare_durable_send_gap_retains_uncertainty',
                'porkbun_durable_send_gap_retains_uncertainty']
-    return any(matches(name,n) for n in ACME) and not any(matches(name,n) for n in non_jws)
+    return any(matches(name,n) for n in ACME + PEBBLE) and not any(matches(name,n) for n in non_jws)
 
 def evidence(run, records):
     errors=[];summaries=[]
@@ -165,8 +165,28 @@ def self_test():
         summaries, errors = evidence(Path(directory), [dict(name='acme', tests=ACME)])
         assert not summaries and errors, 'empty artifact directory must fail'
     assert needs_jose('acme::lab::nonce_endpoint_404_preserves_existing_order')
+    for test in PEBBLE:
+        assert needs_jose('acme::pebble::'+test), test
     assert not needs_jose('acme::lab::external_cancellation_closes_socket_and_owned_driver')
     assert not needs_jose('acme::lab::cloudflare_durable_send_gap_retains_uncertainty')
+    # A successful decoder with captures but no JOSE verification must still fail.
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        for test in PEBBLE:
+            case = root/test; case.mkdir()
+            (case/'manifest.json').write_text(json.dumps(dict(test_name='acme::pebble::'+test)))
+            (case/'wire.pcap').write_bytes(b'fixture')
+            (case/'events.jsonl').write_text('')
+        records = [dict(name='pebble', tests=PEBBLE)]
+        with patch.dict(os.environ, ACME_LAB_TSHARK='fixture-decoder'):
+            with patch.object(analyze, 'analyze', return_value=dict(errors=[], valid_jose=0)) as decoder:
+                summaries, errors = evidence(root, records)
+                assert decoder.call_count == len(PEBBLE)
+                assert len([e for e in errors if e.startswith('JOSE not observed:')]) == len(PEBBLE)
+            with patch.object(analyze, 'analyze', return_value=dict(errors=[], valid_jose=1, eab_valid=1)):
+                summaries, errors = evidence(root, records)
+                assert len(summaries) == len(PEBBLE) and not errors
     return analyze.self_test()
 
 def main():
