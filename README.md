@@ -28,6 +28,6 @@ cargo build --release --locked -p moon-naive
 
 ## 文档
 
-配置、协议、ACME 恢复、原生构建与部署统一见 [项目手册](docs/PROJECT.md)。
+配置、协议、ACME 恢复、原生构建与部署统一见 [项目手册](docs/PROJECT.md)。组件、认证流量路由、源码比例与 Go 边界见[架构解析](docs/PROJECT.md#当前组件与所有权2026-11-12)。
 
 验证：`cargo test -p moon-naive-core --locked`、`cargo test -p moon-naive --lib --locked`。进度与已知差距见 [实现记录](docs/IMPLEMENTATION.md)。编译检查不等同运行验收。许可证：Apache-2.0。

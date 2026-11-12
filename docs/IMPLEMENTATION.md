@@ -276,3 +276,20 @@ The named ARI contracts were checked against the successful retained run's
 executed test names/manifests, and evidence oracles were rerun successfully.
 A new source snapshot is generated at the final committed revision before push.
 GitHub push targets branch `work`; no merge or production deployment is performed.
+
+## Mainline integration and architecture explanation (2026-11-12)
+
+User authorized merging work to main. Actual remote main was `d99433c`, work was
+`a5a6207`; main was an ancestor, so `git merge --ff-only work` included all six
+work commits without rewriting history or resolving conflicts. Initial worktree
+was clean. Current component/routing/technology inventory was added to PROJECT
+and linked from README; production source and dependencies are unchanged.
+
+New checks executed for this integration: `cargo xtask audit-native` passed;
+`cargo test --locked -p moon-naive-core` passed 31 unit + 2 independent vector
+tests; no zero-test target is counted. Prior full-server and real Pebble results
+remain documented above. The GitHub connector returned no legacy statuses/PR
+workflow runs for work HEAD; that does not establish CI success or failure.
+Architecture statistics count tracked source physical lines by extension, with
+scope and exclusions stated in PROJECT. No Go source/module is tracked. Go is
+used only by the optional external Pebble CA fixture, outside production builds.

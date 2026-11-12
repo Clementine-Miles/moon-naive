@@ -386,6 +386,90 @@ ACME journal 写入版本 3，保留版本 1/2 的保守读取迁移。创建结
 
 ## 协议与架构
 
+### 当前组件与所有权（2026-11-12）
+
+生产交付是一个 Rust `moon-naive` 服务进程。数据面使用 Tokio 多线程异步运行时；
+ACME/DNS 控制面在同进程的独立 OS 线程和单线程 Tokio runtime 上运行，避免控制面
+网络等待和持久化 fsync 占用数据面线程。它不是多个语言服务之间的 RPC 架构。
+
+| 组件 | 实际职责与边界 |
+| --- | --- |
+| `core/src` | 配置、每流认证、能力协商、记录编解码、入口分派、目标地址策略；纯 Rust 协议逻辑，不负责拨号或证书 IO |
+| `src/net/h2.rs` | TCP/TLS 接入，Pingora H2 session 适配；未协商 H2 时按配置提供 H1 网站入口 |
+| `src/net/h3.rs` | UDP/QUIC/H3 接入、quiche 驱动、流状态和传输信用；H3 自带 TLS 1.3 |
+| `src/net/mod.rs` | 共享 App、认证后路由决策与准入；并非另一个公网代理服务 |
+| `src/net/site` | Pingora 网站/普通正向代理、固定源站池、头部清理、流式响应、压缩与 WebSocket；H3 网站/正向请求通过有界内存 H2 bridge 复用 Pingora，不另开公网 H2 端口 |
+| `src/net/tunnel.rs` | mona CONNECT 的双向字节流、填充记录、背压、半关闭与空闲期限；普通网站和 WebSocket 不用该记录格式 |
+| `src/net/egress.rs`、`src/resolve.rs` | 有界解析和拨号、具体 IP 候选检查、本机接口检查、HTTP/HTTPS/SOCKS5 下一跳；配置下一跳失败不会静默改为直连 |
+| `resources.rs`、`forward_cache.rs` | 全局/用户/连接与缓冲额度；按用户和 origin 隔离的 128 项 LRU、惰性 300 秒 TTL 和单次初始化，初始化不持有全局缓存锁 |
+| `src/net/tls.rs`、`src/trust.rs` | BoringSSL TLS/ECH、信任根、不可变 TLS generation；旧连接保留旧代，新代验证后原子替换 |
+| `src/acme` | instant-acme 的 JWS/nonce/EAB/订单协议，加 Rust DNS provider、持久 journal、证书安装和私有健康诊断；发布证书、网络加载和写状态文件是不同事实 |
+| `src/runtime.rs`、`src/cli.rs` | 启动、readiness、控制线程、SIGTERM 排空、本地配置/证书运维命令 |
+| `tools/xtask` | Rust 验证、依赖/源码审计和按提交打包；Python 仅用于独立向量和实验编排/抓包密码验证 |
+| `client/naiveproxy` | 导入的 C++/Chromium 与 Kotlin Android 实验客户端，不进入服务端 Cargo 构建；不是已验收的生产客户端 |
+
+### 未认证与已认证流量怎样走
+
+```mermaid
+flowchart TD
+    U[HTTPS 请求] --> T{入口}
+    T -->|H1 网站| W[固定网站策略 / Pingora]
+    T -->|H2 / H3| V[HTTP 格式、首部、流额度检查]
+    V --> X{网站 extended CONNECT WebSocket?}
+    X -->|是，网站域名与路由合法| S[网站 WebSocket / 固定源站 / 共享 tunnel 额度]
+    X -->|否| A{当前流 mona 认证有效?}
+    A -->|缺失或失败| W
+    A -->|有效| R{请求类型}
+    R -->|普通 CONNECT| C[用户与全局额度 / 解析 / 具体 IP 策略 / 拨号]
+    C --> P[响应认证确认 / mona 双向隧道]
+    R -->|普通 HTTP，非本站目标| F[独立 forward 策略 / 用户额度 / Pingora]
+    R -->|普通 HTTP，本站目标| W
+    W --> O[配置中的源站池]
+    F --> E[受限公网候选 / 可选下一跳]
+```
+
+- 认证是 **每个 H2/H3 请求流** 的事实，基于真实 TLS exporter、真实 stream ID 和请求上下文；
+  同一连接上的后一条流仍须认证。H2 网站可以使用 TLS 1.2，但认证代理要求 TLS 1.3；
+  H1 不提供 mona 认证代理入口。标准 ALPN 仍为 h2/h3，没有产品专用 ALPN。
+- 缺失、重复、畸形、重放或上下文不匹配的认证不会获得任意出站权限；代理认证首部会被清除，
+  然后交给普通网站逻辑。普通网站按本站域名/路径处理，因此结果可能是正常内容、404 或 405，
+  并非保证所有错误请求都返回 200。HTTP 语法错误、额度或协议错误也可能先行拒绝。
+- 未认证请求可以触发**已配置固定网站源站**的正常解析与连接；不能把请求 authority 当任意拨号目标。
+  固定源站允许受信任的私网后端；任意正向/CONNECT 目标使用不同的公网与自连接防护策略，
+  对解析出的具体 IP 检查并拨该候选。网站 WebSocket 是公共站点功能，也只通向固定路由。
+- 有效普通 CONNECT 在目标拨通后才返回成功与响应证明，随后使用协商的 mona framing。
+  有效普通 HTTP(S) 请求若目标非本站，才走独立 `[proxy.forward]` 策略；并非复用网站上传限额。
+  有效认证本身不会让本站域名绕开网站配置，也不会取消目标 ACL 或全局/用户额度。
+- TLS 终止型 CDN/反代会改变 TLS exporter；不能把客户端的通道绑定认证直接透传为本服务的认证。
+
+### 技术栈比例与 Go 边界
+
+统计基准为合入的 `a5a6207`。使用 `git ls-files`，按扩展名统计 `.rs/.c/.cc/.cpp/.cxx/
+.h/.hpp/.py/.sh/.kt/.java/.go` 文件的原始物理行数（含空行、注释和内嵌测试），排除文档、
+JSON/TOML/YAML、补丁文本、构建产物及仓库外依赖源码。这是源码构成，不是二进制体积、CPU
+占比或依赖完整源码占比；不同范围不能混算。
+
+| 范围 | 实际统计 |
+| --- | --- |
+| 自有服务端 `src/` + `core/src/` | 47 个 Rust 文件，25,416 行：Rust 100%；含测试夹具，并非纯生产逻辑 LOC |
+| 自有服务端与工具 `src/` + `core/` + `tools/` | Rust 26,456 行（98.05%），Python 525 行（1.95%）；52 个 Rust、3 个 Python 文件 |
+| 全部 Git 跟踪源码，含 vendor 与实验客户端 | 共 96,954 行；Rust 91,057（93.92%），C++ 3,903（4.03%），C/C++ 头文件 1,146（1.18%），Python 621（0.64%），Kotlin 227（0.23%） |
+| Git 跟踪的 Go 源码/模块 | `.go`、`go.mod`、`go.sum` 均为 0 |
+
+服务端网络、认证、策略、控制和运维逻辑是 Rust；TLS/密码学刻意使用 **C/C++ BoringSSL**，
+并经 Rust boring/tokio-boring 绑定。quiche、Pingora、instant-acme 为 Rust。BoringSSL 与 quiche
+完整依赖源码不都在 Git 跟踪树中，故全仓比例不能用来宣称最终程序的原生代码仅占上述比例。
+`rustls-pki-types` 用于证书/密钥数据类型，不等于启用 Rustls TLS 后端；native audit 验证所选后端。
+
+**生产运行、普通 Cargo 构建、默认 `cargo test --workspace` 和现有默认 CI 都不依赖 Go。**
+唯一有意保留的 Go 相关部分是可选的真实 ACME 实验：仓库外 Pebble/challtestsrv 测试 CA 和
+仓库内 129 行 `tools/acme-lab/pebble-lab.patch`，Rust 的 cfg(test) 夹具调用这些外部测试进程。
+它们不会链接进或随服务端启动，不是生产 sidecar。构建该 CA 及记录其 Go 构建信息需要 Go。
+完整 `cargo xtask lab` 默认包括 Pebble；不使用 Go 时选择普通 workspace 测试或
+`cargo xtask lab --only acme`（Rust 合成 CA/provider，抓包分析使用 Python、tcpdump、tshark）。
+保留真实 CA 实验有助于发现仅用自有 mock 无法覆盖的状态机问题；无需为避免测试工具的 Go
+而新增一套自研 CA。`xtask` 也已有禁止生产构建目录混入 Go 源码/模块的审计。
+
 当前版本 **0.7.0**，认证域与 exporter 使用修订4。**不产生空闲假流量，不为真实反代添加Padding首部或改写正文**。采用认证协商的8/16条初期窗口，可选低比例后段填充。旧moon-naive和官方Naïve客户端不兼容；实验客户端初步适配见下文；尚未通过完整构建与互通验收。
 
 ### 路由与连接
