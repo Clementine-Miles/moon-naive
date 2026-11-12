@@ -198,6 +198,7 @@ pub fn dist(binary: &Path, directory: &Path) -> Result<()> {
     for (source, destination, executable) in [
         ("README.md", "README.md", false),
         ("docs/PROJECT.md", "docs/PROJECT.md", false),
+        ("docs/PROTOCOL.md", "docs/PROTOCOL.md", false),
         ("LICENSE", "LICENSE", false),
         (
             "deploy/moon-naive.service",

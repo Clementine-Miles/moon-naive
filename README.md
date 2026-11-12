@@ -1,33 +1,20 @@
 # moon-naive
 
-基于 **Rust、Pingora、BoringSSL 和 quiche** 的 H2/H3 代理服务端，当前版本 **0.7.0**，面向 Linux x86_64。支持固定源站反向代理，以及经过认证的 CONNECT 和 HTTP(S) 正向代理。
+**mona 0.7.0**：面向 Linux x86_64 的 Rust 服务端，使用 Pingora、BoringSSL 和 quiche，
+提供真实网站反代、认证 H2/H3 CONNECT 与普通 HTTP(S) 正向代理，内置 DNS-01 证书续期。
+仅支持 [moon-naive 修订 4](docs/PROTOCOL.md)，不兼容官方 NaiveProxy；生产客户端尚未完成。
 
-简称 **mona**，仅支持 **[moon-naive 修订4协议](docs/PROTOCOL.md)**，与官方 Naïve 客户端不兼容；Android/Linux 实验客户端源码已导入并初步适配；完整构建和互通尚未验收，见[项目手册](docs/PROJECT.md#androidlinux-实验客户端)。
-
-## 证书管理
-
-内置 `instant-acme` 客户端，负责账户注册、EAB、DNS-01 签发及自动续期，无需安装 `acme.sh` 或配置 cron。Porkbun DNS 凭据、CA（Google Trust Services / Let's Encrypt）和代理设置集中于一份私有 TOML。程序持久化账户与订单，清理挑战记录，校验证书后原子安装并热更新；续期失败时继续使用仍有效的证书。
-
-## 构建与运行
-
-需要 Rust 1.89+、C/C++、CMake、libclang、Perl 和 pkg-config。
+需要 Rust 1.89+、C/C++、make、CMake、libclang、Perl、pkg-config；生产运行无需 Go/Python。
 
 ```sh
 cargo build --release --locked -p moon-naive
 ./target/release/moon-naive config init /path/to/config.toml
-# 按 config.example.toml 填写域名、用户、DNS/EAB 凭据和 website.origin，接受 CA 条款。
-./target/release/moon-naive check-config /path/to/config.toml
+# 填写真实域名、用户、源站与 DNS/EAB 凭据，阅读并接受 CA 条款；配置权限 0600。
+./target/release/moon-naive check /path/to/config.toml
 ./target/release/moon-naive serve /path/to/config.toml
 ```
 
-配置文件权限须为 `0600`，父目录须已存在。默认监听 TCP/UDP 443；首次运行自动申请证书，网站请求转发至配置的源站。
-
-## 开发工具
-
-构建使用 Cargo；审计和源码打包统一使用 `cargo xtask audit-native`、`cargo xtask source dist`。Rust 工具位于 `tools/xtask/`。`cargo xtask verify` 包含实际测试；显式抓包实验统一从 `cargo xtask lab` 运行，前置工具和参数见[手册](docs/PROJECT.md#构建检查与维护边界)。BoringSSL 仍需要上述 C/C++ 工具链，普通构建无需实验工具或容器环境；同平台重复构建可[复用 BoringSSL](docs/PROJECT.md#复用-boringssl避免重复调用-cmake)，避免再次调用 CMake。
-
-## 文档
-
-配置、协议、ACME 恢复、原生构建与部署统一见 [项目手册](docs/PROJECT.md)。组件、认证流量路由、源码比例与 Go 边界见[架构解析](docs/PROJECT.md#当前组件与所有权2026-11-12)。
-
-验证：`cargo test -p moon-naive-core --locked`、`cargo test -p moon-naive --lib --locked`。进度与已知差距见 [实现记录](docs/IMPLEMENTATION.md)。编译检查不等同运行验收。许可证：Apache-2.0。
+[项目手册](docs/PROJECT.md) 统一说明配置、组件与认证路由、证书恢复、部署、实验及许可。
+唯一配置模板是 [config.example.toml](config.example.toml)；state_dir 必须持久保存。
+开发入口：`cargo xtask verify`、`cargo xtask vectors --check`、`cargo xtask lab`。
+[验证与待办](docs/PROJECT.md#维护与验证记录) 区分已执行测试和未验收能力。许可证：[Apache-2.0](LICENSE)。

@@ -183,3 +183,142 @@ fn digest_directory(directory: &Path) -> Result<String> {
     check(expected == actual, "vendored file inventory mismatch")?;
     Ok(format!("{:x}", Sha256::digest(manifest)))
 }
+
+/// Independent v4 reference serializer: never calls application/core auth or codec.
+/// Existing checked-in Python-generated known answers must remain byte-identical.
+pub fn vectors(verify: bool) -> Result<()> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use hmac::{Hmac, Mac};
+    fn proof(
+        domain: &[u8],
+        stream: u64,
+        offer: u8,
+        selected: u8,
+        fields: &[Option<&str>],
+    ) -> Result<String> {
+        let mut transcript = domain.to_vec();
+        transcript.extend([7; 32]);
+        transcript.extend(stream.to_be_bytes());
+        transcript.extend([offer, selected]);
+        for field in fields {
+            match field {
+                Some(text) => {
+                    transcript.extend((text.len() as u64).to_be_bytes());
+                    transcript.extend(text.as_bytes());
+                }
+                None => transcript.extend(u64::MAX.to_be_bytes()),
+            }
+        }
+        let key = Sha256::digest(b"moon-naive/v4/key\0user:a-long-test-secret-123");
+        let mut mac = Hmac::<Sha256>::new_from_slice(&key)?;
+        mac.update(&Sha256::digest(transcript));
+        Ok(STANDARD.encode(mac.finalize().into_bytes()))
+    }
+    let mut auth=vec!["# stream\toffer\tselected\tmethod\tauthority\tscheme\tpath\tprotocol\trequest\tresponse; - = absent".to_owned()];
+    for (stream, fields) in [
+        (
+            1,
+            [Some("CONNECT"), Some("example.org:443"), None, None, None],
+        ),
+        (
+            0,
+            [Some("CONNECT"), Some("example.org:443"), None, None, None],
+        ),
+        (
+            4,
+            [
+                Some("GET"),
+                Some("example.org:443"),
+                Some("https"),
+                Some("/a%2Fb?q=1"),
+                None,
+            ],
+        ),
+        (
+            8,
+            [
+                Some("CONNECT"),
+                Some("example.org:443"),
+                Some("https"),
+                Some(""),
+                Some("websocket"),
+            ],
+        ),
+    ] {
+        for (offer, selected) in [(2, 2), (7, 5), (7, 6), (1, 1)] {
+            let request = format!(
+                "moon-naive {offer:02x}.{}",
+                proof(b"moon-naive/v4/request\0", stream, offer, 0, &fields)?
+            );
+            let response = format!(
+                "moon-naive {selected:02x}.{}",
+                proof(
+                    b"moon-naive/v4/response/200\0",
+                    stream,
+                    offer,
+                    selected,
+                    &fields
+                )?
+            );
+            auth.push(format!(
+                "{stream}\t{offer}\t{selected}\t{}\t{request}\t{response}",
+                fields.map(|f| f.unwrap_or("-")).join("\t")
+            ));
+        }
+    }
+    fn hex(data: &[u8]) -> String {
+        data.iter().map(|b| format!("{b:02x}")).collect()
+    }
+    let mut framing = vec!["# name\tmode\twire hex\tpayload hex\tvalid EOF".into()];
+    let mut frame = |name: &str, mode: u8, wire: &[u8], payload: &[u8], ok: bool| {
+        framing.push(format!(
+            "{name}\t{mode}\t{}\t{}\t{}",
+            hex(wire),
+            hex(payload),
+            u8::from(ok)
+        ))
+    };
+    for (mode, count) in [(1, 8), (2, 16), (5, 8), (6, 16)] {
+        let mut wire = Vec::new();
+        let mut payload = b"abcdefgh".repeat(count);
+        for i in 0..count {
+            wire.extend(b"\0\x08\x01abcdefgh");
+            wire.push(i as u8 + 1);
+        }
+        if mode < 4 {
+            wire.extend(b"\0\0\xffRAW");
+            payload.extend(b"\0\0\xffRAW");
+        } else {
+            wire.extend(b"\0\x80\x01");
+            wire.extend([b'x'; 128]);
+            wire.push(254);
+            payload.extend([b'x'; 128]);
+        }
+        frame(&format!("transition-{mode}"), mode, &wire, &payload, true);
+    }
+    frame("coalesced", 2, b"\0\x01\0a\0\x02\0bc", b"abc", true);
+    frame("empty-stream", 2, b"", b"", true);
+    for (name, wire) in [
+        ("empty-record", &b"\0\0\0"[..]),
+        ("oversize", &b"\xff\xff\0"[..]),
+        ("padding-budget", &b"\0\x08\x02abcdefgh\0\0"[..]),
+        ("truncated-header", &b"\0"[..]),
+        ("truncated-payload", &b"\0\x02\0a"[..]),
+        ("truncated-padding", &b"\0\x08\x01abcdefgh"[..]),
+    ] {
+        frame(name, 2, wire, b"", false);
+    }
+    for (name, lines) in [("auth.tsv", auth), ("framing.tsv", framing)] {
+        let path = root().join("core/tests/vectors").join(name);
+        let data = lines.join("\n") + "\n";
+        if verify {
+            check(
+                fs::read(&path)? == data.as_bytes(),
+                &format!("{}: regenerate vectors", path.display()),
+            )?;
+        } else {
+            fs::write(path, data)?;
+        }
+    }
+    Ok(())
+}

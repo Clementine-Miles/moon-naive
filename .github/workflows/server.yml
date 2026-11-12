@@ -8,7 +8,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89.0
-      - run: python3 tools/vectors/generate.py --check
+      - run: cargo xtask vectors --check
       - run: cargo test --locked -p moon-naive-core
   server:
     runs-on: ubuntu-24.04

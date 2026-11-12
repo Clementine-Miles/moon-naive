@@ -233,3 +233,17 @@ def self_test():
             self.assertTrue(protocol_errors([{'payload_keys':['csr']}]))
             self.assertTrue(protocol_errors([{'payload_keys':['externalAccountBinding'],'eab_hs256_valid':True,'eab_bound':False}]))
     return unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Evidence)).wasSuccessful()
+
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--self-test', action='store_true')
+    parser.add_argument('--case', type=Path)
+    parser.add_argument('--tshark')
+    args = parser.parse_args()
+    if args.self_test:
+        raise SystemExit(0 if self_test() else 1)
+    if not args.case or not args.tshark:
+        parser.error('--case and --tshark are required')
+    print(json.dumps(analyze(args.case, args.tshark)))

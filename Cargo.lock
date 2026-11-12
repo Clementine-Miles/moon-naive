@@ -2879,11 +2879,15 @@ dependencies = [
 name = "xtask"
 version = "0.7.0"
 dependencies = [
+ "base64 0.22.1",
  "flate2",
  "goblin",
+ "hmac",
+ "nix",
  "serde_json",
  "sha2",
  "tar",
+ "tempfile",
  "toml",
 ]
 

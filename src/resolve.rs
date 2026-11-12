@@ -110,8 +110,8 @@ mod tests {
             time::{Duration, Instant},
         };
         let case = crate::acme::lab_support::Case::new("system-resolver-cancel");
-        let address = std::env::var("ACME_LAB_DNS_LISTEN")
-            .expect("run tools/acme-lab/run.py --only resolver");
+        let address =
+            std::env::var("ACME_LAB_DNS_LISTEN").expect("run cargo xtask lab --only resolver");
         let _capture = case.capture(&[53]);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
