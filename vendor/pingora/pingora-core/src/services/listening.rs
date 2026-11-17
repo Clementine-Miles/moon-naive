@@ -25,7 +25,6 @@ use crate::listeners::AcceptAllFilter;
 use crate::listeners::{
     ConnectionFilter, ListenerConfig, Listeners, ServerAddress, TcpSocketOptions, TransportStack,
 };
-use crate::protocols::http::custom::server::Session as CustomServerSession;
 use crate::protocols::Stream;
 #[cfg(unix)]
 use crate::server::ListenFds;
@@ -38,7 +37,6 @@ use pingora_error::Result;
 use pingora_runtime::current_handle;
 use pingora_timeout::timeout;
 use std::fs::Permissions;
-use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,14 +44,10 @@ use std::time::Duration;
 pub type RuntimeOptsOverride = Arc<dyn Fn(&RuntimeOpts) -> Option<RuntimeOpts> + Send + Sync>;
 
 /// The type of service that is associated with a list of listening endpoints and a particular application
-pub struct Service<A, DS = ()>
-where
-    DS: CustomServerSession,
-{
+pub struct Service<A> {
     name: String,
     listeners: Listeners,
     app_logic: Option<A>,
-    _custom_session: PhantomData<fn() -> DS>,
     /// The number of preferred threads. `None` to follow global setting.
     pub threads: Option<usize>,
     runtime_opts_override: Option<RuntimeOptsOverride>,
@@ -61,17 +55,13 @@ where
     connection_filter: Arc<dyn ConnectionFilter>,
 }
 
-impl<A, DS> Service<A, DS>
-where
-    DS: CustomServerSession,
-{
-    /// Create a new [`Service`] with a concrete custom downstream session type.
-    pub fn new_with_custom_session(name: String, app_logic: A) -> Self {
+impl<A> Service<A> {
+    /// Create a new [`Service`] with the given application (see [`crate::apps`]).
+    pub fn new(name: String, app_logic: A) -> Self {
         Service {
             name,
             listeners: Listeners::new(),
             app_logic: Some(app_logic),
-            _custom_session: PhantomData,
             threads: None,
             runtime_opts_override: None,
             #[cfg(feature = "connection_filter")]
@@ -79,17 +69,13 @@ where
         }
     }
 
-    /// Create a new [`Service`] with listeners and a concrete custom downstream session type.
-    pub fn with_listeners_and_custom_session(
-        name: String,
-        listeners: Listeners,
-        app_logic: A,
-    ) -> Self {
+    /// Create a new [`Service`] with the given application (see [`crate::apps`]) and the given
+    /// [`Listeners`].
+    pub fn with_listeners(name: String, listeners: Listeners, app_logic: A) -> Self {
         Service {
             name,
             listeners,
             app_logic: Some(app_logic),
-            _custom_session: PhantomData,
             threads: None,
             runtime_opts_override: None,
             #[cfg(feature = "connection_filter")]
@@ -201,24 +187,7 @@ where
     }
 }
 
-impl<A> Service<A, ()> {
-    /// Create a new [`Service`] with the given application (see [`crate::apps`]).
-    pub fn new(name: String, app_logic: A) -> Self {
-        Self::new_with_custom_session(name, app_logic)
-    }
-
-    /// Create a new [`Service`] with the given application (see [`crate::apps`]) and the given
-    /// [`Listeners`].
-    pub fn with_listeners(name: String, listeners: Listeners, app_logic: A) -> Self {
-        Self::with_listeners_and_custom_session(name, listeners, app_logic)
-    }
-}
-
-impl<A, DS> Service<A, DS>
-where
-    A: ServerApp<DS> + Send + Sync + 'static,
-    DS: CustomServerSession,
-{
+impl<A: ServerApp + Send + Sync + 'static> Service<A> {
     pub async fn handle_event(event: Stream, app_logic: Arc<A>, shutdown: ShutdownWatch) {
         debug!("new event!");
         let mut reuse_event = app_logic.process_new(event, &shutdown).await;
@@ -306,11 +275,7 @@ where
 }
 
 #[async_trait]
-impl<A, DS> ServiceTrait for Service<A, DS>
-where
-    A: ServerApp<DS> + Send + Sync + 'static,
-    DS: CustomServerSession,
-{
+impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
     async fn start_service(
         &mut self,
         #[cfg(unix)] fds: Option<ListenFds>,

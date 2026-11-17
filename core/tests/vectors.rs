@@ -95,7 +95,9 @@ fn independent_python_authentication_vectors() {
 }
 fn hex(s: &str) -> Vec<u8> {
     s.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|b| u8::from_str_radix(std::str::from_utf8(b).unwrap(), 16).unwrap())
         .collect()
 }

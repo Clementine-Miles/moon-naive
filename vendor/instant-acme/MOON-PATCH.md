@@ -14,3 +14,7 @@ regressions now run with `CARGO_TARGET_DIR=/tmp/mona-acme-target cargo test --ma
 --locked --no-default-features --features time,x509-parser --lib`. The test-only
 Tokio runtime feature changes no production TLS or signing backend. Application
 ACME fixtures cover endpoint attribution, restore/finalize waits and persistence.
+
+Baseline advanced to 1909bed8eee54d7289d64b3e9ff573ac5b272676. Upstream changes
+since the previous baseline affect only Cargo.lock; retained library source is
+identical upstream and the local ACME patches remain.

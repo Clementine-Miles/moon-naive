@@ -183,6 +183,14 @@ pub(crate) struct Site {
     pub(super) buffers: Arc<super::resources::BufferPool>,
     bridge: bridge::Generations<bridge::Bridge>,
     max_streams: u32,
+    listener_name: String,
+    // Only a globally cached origin owns its endpoint views. Views own the
+    // shared Proxy, not this parent Site, so global LRU eviction drops all idle
+    // views/pools together without invalidating active exchanges.
+    endpoint_views: std::sync::Mutex<std::collections::HashMap<String, Arc<Site>>>,
+    idle: Duration,
+    endpoint_tunnels:
+        Arc<std::sync::RwLock<std::collections::HashMap<String, moon_naive_core::policy::Budget>>>,
     #[cfg(test)]
     stats: Arc<WebStats>,
 }
@@ -196,13 +204,43 @@ pub(super) struct Exchange {
     pub task: tokio::task::JoinHandle<()>,
     pub completion: oneshot::Receiver<Result<()>>,
 }
+#[derive(Clone)]
+struct EndpointAltSvc(Option<String>);
+#[derive(Clone)]
+struct EndpointTunnels(moon_naive_core::policy::Budget);
+struct ListenerPolicy {
+    name: String,
+    bind: std::net::SocketAddr,
+    tcp_enabled: bool,
+    alt: Option<String>,
+    connect: Duration,
+}
+fn listener_policies(config: &Config) -> Vec<ListenerPolicy> {
+    config
+        .effective_listeners()
+        .iter()
+        .map(|e| ListenerPolicy {
+            name: e.name.clone(),
+            bind: e.listener.tcp,
+            tcp_enabled: e.listener.h1 || e.listener.h2,
+            alt: (e.listener.h3
+                && e.listener.tcp.is_ipv4() == e.listener.udp.is_ipv4()
+                && (e.listener.udp.ip().is_unspecified()
+                    || e.listener.udp.ip() == e.listener.tcp.ip()))
+            .then(|| format!("h3=\":{}\"; ma=86400", e.listener.udp.port())),
+            connect: Duration::from_secs(e.limits.as_ref().unwrap().connect_timeout_secs),
+        })
+        .collect()
+}
 struct Router {
     config: Website,
     domain: String,
     public_name: Option<String>,
     pools: Vec<Arc<upstream::Pool>>,
     routes: Vec<(moon_naive_core::website::Route, usize)>,
-    alt_svc: String,
+    listeners: Vec<ListenerPolicy>,
+    endpoint_tunnels:
+        Arc<std::sync::RwLock<std::collections::HashMap<String, moon_naive_core::policy::Budget>>>,
     forward: Option<upstream::ForwardOrigin>,
     tunnels: Option<moon_naive_core::policy::Budget>,
     stats: Arc<WebStats>,
@@ -255,6 +293,7 @@ impl Site {
             .collect();
         routes.sort_by_key(|(r, _)| std::cmp::Reverse(r.path_prefix.len()));
         let stats = Arc::default();
+        let endpoint_tunnels = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
         let router = Router {
             config: config.website.clone(),
             domain: config.domain.clone(),
@@ -264,7 +303,8 @@ impl Site {
             stats: Arc::clone(&stats),
             forward: None,
             tunnels: Some(tunnels),
-            alt_svc: format!("h3=\":{}\"; ma=86400", config.listener.udp.port()),
+            listeners: listener_policies(config),
+            endpoint_tunnels: endpoint_tunnels.clone(),
         };
         let conf = Arc::new(ServerConf {
             ca_file: crate::trust::system_ca_file().map(|path| path.to_string_lossy().into_owned()),
@@ -284,9 +324,65 @@ impl Site {
             buffers: super::resources::BufferPool::new(config.limits.max_total_buffer_bytes),
             bridge: bridge::Generations::new(config.limits.max_streams),
             max_streams: config.limits.max_streams as u32,
+            listener_name: config.effective_listeners()[0].name.clone(),
+            endpoint_views: Default::default(),
+            idle: Duration::from_secs(config.limits.idle_timeout_secs),
+            endpoint_tunnels,
             #[cfg(test)]
             stats,
         })
+    }
+    pub(super) fn endpoint(
+        &self,
+        name: &str,
+        limits: &moon_naive_core::config::Limits,
+        buffers: Arc<super::resources::BufferPool>,
+        tunnels: moon_naive_core::policy::Budget,
+    ) -> Self {
+        self.endpoint_tunnels
+            .write()
+            .expect("endpoint registry poisoned")
+            .insert(name.to_owned(), tunnels);
+        let mut bridge = bridge::Generations::new(limits.max_streams);
+        bridge.share_shutdown(&self.bridge);
+        Self {
+            proxy: self.proxy.clone(),
+            pools: self.pools.clone(),
+            buffers,
+            bridge,
+            max_streams: limits.max_streams as u32,
+            listener_name: name.to_owned(),
+            endpoint_views: Default::default(),
+            idle: Duration::from_secs(limits.idle_timeout_secs),
+            endpoint_tunnels: self.endpoint_tunnels.clone(),
+            #[cfg(test)]
+            stats: self.stats.clone(),
+        }
+    }
+    /// Bound endpoint view retention by the lifetime of this globally cached
+    /// origin. Construction only clones shared state; no IO or await occurs
+    /// under the view-map lock.
+    pub(super) fn cached_endpoint(
+        &self,
+        name: &str,
+        limits: &moon_naive_core::config::Limits,
+        buffers: Arc<super::resources::BufferPool>,
+        tunnels: moon_naive_core::policy::Budget,
+    ) -> Result<Arc<Self>> {
+        let mut views = self
+            .endpoint_views
+            .lock()
+            .map_err(|_| "endpoint view cache poisoned")?;
+        if let Some(view) = views.get(name) {
+            return Ok(view.clone());
+        }
+        // Config validation permits at most 16 distinct listener names.
+        if views.len() >= 16 {
+            return Err("endpoint view cache capacity exceeded".into());
+        }
+        let view = Arc::new(self.endpoint(name, limits, buffers, tunnels));
+        views.insert(name.to_owned(), view.clone());
+        Ok(view)
     }
     pub(super) fn forward(
         config: &Config,
@@ -310,7 +406,8 @@ impl Site {
             pools: vec![],
             routes: vec![],
             stats: Arc::default(),
-            alt_svc: String::new(),
+            listeners: listener_policies(config),
+            endpoint_tunnels: website.endpoint_tunnels.clone(),
             forward: Some(upstream::ForwardOrigin::new(origin, user, egress)?),
             tunnels: None,
         };
@@ -327,6 +424,10 @@ impl Site {
             buffers: website.buffers.clone(),
             bridge,
             max_streams: config.limits.max_streams as u32,
+            listener_name: config.effective_listeners()[0].name.clone(),
+            endpoint_views: Default::default(),
+            idle: Duration::from_secs(config.limits.idle_timeout_secs),
+            endpoint_tunnels: website.endpoint_tunnels.clone(),
             #[cfg(test)]
             stats: Arc::default(),
         })
@@ -340,12 +441,12 @@ impl Site {
         mut stop: watch::Receiver<bool>,
     ) -> Result<()> {
         let mut session = ServerSession::new_http1(stream);
-        session.set_keepalive(Some(super::HEADER_TIMEOUT.as_secs()));
+        session.set_keepalive(Some(self.idle.as_secs()));
         // We drive Pingora sessions directly rather than through http_app's
         // accept loop, so initialize its persisted reuse counter here.
         session.set_keepalive_reuses_remaining(Some(999));
         loop {
-            session.set_read_timeout(Some(Duration::from_secs(30)));
+            session.set_read_timeout(Some(self.idle));
             session.set_write_timeout(Some(Duration::from_secs(30)));
             let shutdown = stop.clone();
             let reused = tokio::select! { _ = stop.changed() => break, r = self.proxy.process_new_http(session, &shutdown) => r };
@@ -359,7 +460,7 @@ impl Site {
         Ok(())
     }
     pub async fn h2(&self, mut session: HttpSession, head: Head) -> Result<()> {
-        *session.req_header_mut() = request_header(&head)?;
+        *session.req_header_mut() = request_header(&head, &self.listener_name)?;
         let (_send, stop) = watch::channel(false);
         self.proxy
             .process_new_http(ServerSession::new_http2(session), &stop)
@@ -397,7 +498,7 @@ impl Site {
                     .await?;
                 bridge
                     .exchange(
-                        request_header(&head)?,
+                        request_header(&head, &site.listener_name)?,
                         end,
                         receive,
                         send.clone(),
@@ -428,7 +529,7 @@ impl Site {
         &self.stats
     }
 }
-fn request_header(head: &Head) -> Result<RequestHeader> {
+fn request_header(head: &Head, listener_name: &str) -> Result<RequestHeader> {
     let target = if head.method == "CONNECT" {
         head.authority.as_str()
     } else {
@@ -441,6 +542,7 @@ fn request_header(head: &Head) -> Result<RequestHeader> {
             && name != "content-length"
             && !is_forwarded_header(name)
             && !is_proxy_header(name)
+            && name != "x-moon-internal-listener"
         {
             request.append_header(
                 http::header::HeaderName::from_bytes(name.as_bytes())?,
@@ -448,6 +550,7 @@ fn request_header(head: &Head) -> Result<RequestHeader> {
             )?;
         }
     }
+    request.insert_header("x-moon-internal-listener", listener_name)?;
     // Head::valid already checked every duplicate/comma value for equality.
     // Emit one decimal value so every H1/H2 origin sees identical framing.
     if let Some(value) = head.header("content-length") {
@@ -476,8 +579,64 @@ impl ProxyHttp for Router {
     async fn early_request_filter(
         &self,
         s: &mut Session,
-        _ctx: &mut Context,
+        ctx: &mut Context,
     ) -> pingora_core::Result<()> {
+        let marker = if s.req_header().version == http::Version::HTTP_2 {
+            s.req_header()
+                .headers
+                .get("x-moon-internal-listener")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        } else {
+            None
+        };
+        s.req_header_mut().remove_header("x-moon-internal-listener");
+        let local = s.server_addr().and_then(|a| a.as_inet()).copied();
+        let endpoint = self
+            .listeners
+            .iter()
+            .find(|policy| {
+                marker.as_ref().map_or_else(
+                    || {
+                        local.is_some_and(|local| {
+                            policy.tcp_enabled
+                                && local.is_ipv4() == policy.bind.is_ipv4()
+                                && local.port() == policy.bind.port()
+                                && (policy.bind.ip().is_unspecified()
+                                    || policy.bind.ip() == local.ip())
+                        })
+                    },
+                    |name| name == &policy.name,
+                )
+            })
+            .or_else(|| (self.listeners.len() == 1).then(|| &self.listeners[0]));
+        let alt = endpoint.and_then(|policy| policy.alt.clone());
+        let connect = endpoint.map_or(
+            Duration::from_secs(self.config.connect_timeout_secs),
+            |policy| {
+                policy
+                    .connect
+                    .min(Duration::from_secs(self.config.connect_timeout_secs))
+            },
+        );
+        ctx.deadline = Some(tokio::time::Instant::now() + connect);
+        let tunnels = endpoint
+            .and_then(|policy| {
+                self.endpoint_tunnels
+                    .read()
+                    .ok()?
+                    .get(&policy.name)
+                    .cloned()
+            })
+            .or_else(|| self.tunnels.clone());
+        if let Some(tunnels) = tunnels {
+            s.req_header_mut()
+                .extensions_mut()
+                .insert(EndpointTunnels(tunnels));
+        }
+        s.req_header_mut()
+            .extensions_mut()
+            .insert(EndpointAltSvc(alt));
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
         if matches!(
             s.req_header().version,
@@ -583,7 +742,11 @@ impl ProxyHttp for Router {
                     }
                     ctx._tunnel = Some(
                         super::resources::TunnelLease::anonymous(
-                            self.tunnels.as_ref().expect("website ledger"),
+                            &s.req_header()
+                                .extensions
+                                .get::<EndpointTunnels>()
+                                .expect("website ledger")
+                                .0,
                         )
                         .ok_or_else(|| {
                             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(503))
@@ -708,8 +871,14 @@ impl ProxyHttp for Router {
         _ctx: &mut Context,
     ) -> pingora_core::Result<()> {
         upstream::clean_response(response);
-        if self.forward.is_none() {
-            response.insert_header("alt-svc", self.alt_svc.as_str())?;
+        if self.forward.is_none()
+            && let Some(alt) = s
+                .req_header()
+                .extensions
+                .get::<EndpointAltSvc>()
+                .and_then(|a| a.0.as_deref())
+        {
+            response.insert_header("alt-svc", alt)?;
         }
         if s.req_header().version == http::Version::HTTP_11
             && s.req_header().method != http::Method::HEAD
@@ -810,7 +979,15 @@ impl ProxyHttp for Router {
 }
 impl Router {
     async fn send_local(&self, s: &mut Session, mut reply: Reply) -> pingora_core::Result<()> {
-        reply.headers.push(("alt-svc".into(), self.alt_svc.clone()));
+        if self.forward.is_none()
+            && let Some(alt) = s
+                .req_header()
+                .extensions
+                .get::<EndpointAltSvc>()
+                .and_then(|a| a.0.as_ref())
+        {
+            reply.headers.push(("alt-svc".into(), alt.clone()));
+        }
         send_local(s, reply).await
     }
 }
@@ -842,4 +1019,85 @@ pub(super) fn forbidden_trailer(name: &str) -> bool {
         ]
         .iter()
         .any(|field| normalized_header_eq(name, field))
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use moon_naive_core::policy::Budget;
+
+    fn forward_origin() -> (Arc<Site>, moon_naive_core::config::Limits, Budget) {
+        let config = Config::parse(include_str!("../../../config.example.toml")).unwrap();
+        let tunnels = Budget::new(config.limits.max_streams).unwrap();
+        let website = Site::load(&config, tunnels.clone()).unwrap();
+        let egress = super::super::egress::Egress::new(&config, Arc::default()).unwrap();
+        let site = Site::forward(&config, "http://1.1.1.1", 0, egress, &website).unwrap();
+        (Arc::new(site), config.limits, tunnels)
+    }
+
+    #[tokio::test]
+    async fn global_origin_eviction_releases_all_idle_endpoint_views_and_shared_pool() {
+        let cache = super::super::forward_cache::Cache::<Site>::default();
+        let (origin, limits, tunnels) = forward_origin();
+        let slot = cache.slot((0, "http://1.1.1.1".into())).await;
+        assert!(slot.set(origin.clone()).is_ok());
+        let pool = Arc::downgrade(&origin.proxy);
+        let mut children = Vec::new();
+        for index in 0..16 {
+            let name = format!("device-port-{index}");
+            let buffers = super::super::resources::BufferPool::new(32 * 1024);
+            let view = origin
+                .cached_endpoint(&name, &limits, buffers.clone(), tunnels.clone())
+                .unwrap();
+            let same = origin
+                .cached_endpoint(&name, &limits, buffers.clone(), tunnels.clone())
+                .unwrap();
+            assert!(Arc::ptr_eq(&view, &same));
+            assert!(Arc::ptr_eq(&view.proxy, &origin.proxy));
+            assert!(Arc::ptr_eq(&view.buffers, &buffers));
+            assert!(view.endpoint_views.lock().unwrap().is_empty());
+            children.push(Arc::downgrade(&view));
+        }
+        assert!(
+            origin
+                .cached_endpoint("overflow", &limits, origin.buffers.clone(), tunnels)
+                .is_err()
+        );
+        assert_eq!(origin.endpoint_views.lock().unwrap().len(), 16);
+        drop(origin);
+        drop(slot);
+        // Exercise the real global LRU, rather than merely dropping a standalone
+        // parent. Empty entries need no fake backend or network connection.
+        for index in 0..128 {
+            cache
+                .slot((0, format!("http://origin-{index}.example")))
+                .await;
+        }
+        assert!(children.into_iter().all(|view| view.upgrade().is_none()));
+        assert!(pool.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn active_endpoint_view_survives_eviction_without_retaining_its_parent() {
+        let cache = super::super::forward_cache::Cache::<Site>::default();
+        let (origin, limits, tunnels) = forward_origin();
+        let slot = cache.slot((0, "http://1.1.1.1".into())).await;
+        assert!(slot.set(origin.clone()).is_ok());
+        let parent = Arc::downgrade(&origin);
+        let pool = Arc::downgrade(&origin.proxy);
+        let active = origin
+            .cached_endpoint("device-port", &limits, origin.buffers.clone(), tunnels)
+            .unwrap();
+        drop(origin);
+        drop(slot);
+        for index in 0..128 {
+            cache
+                .slot((0, format!("http://origin-{index}.example")))
+                .await;
+        }
+        assert!(parent.upgrade().is_none());
+        assert!(pool.upgrade().is_some());
+        drop(active);
+        assert!(pool.upgrade().is_none());
+    }
 }

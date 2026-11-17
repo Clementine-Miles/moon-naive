@@ -1029,6 +1029,7 @@ async fn http_redirect_uses_canonical_host_and_rejects_proxy_requests() {
         ..server
     };
     let stats = server.stats.clone();
+    let https_port = server.tcp_addr().unwrap().port();
     let (stop, rx) = watch::channel(false);
     let task = tokio::spawn(server.run(rx));
     for (request, status, location) in [
@@ -1062,7 +1063,7 @@ async fn http_redirect_uses_canonical_host_and_rejects_proxy_requests() {
             assert!(
                 reply.contains(&format!(
                     "location: https://proxy.example.test:{}/a?q=1",
-                    f.config.listener.tcp.port()
+                    https_port
                 )),
                 "{reply}"
             );

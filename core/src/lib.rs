@@ -1,4 +1,5 @@
 //! Transport-independent, testable Naïve server policies. No network listeners.
+pub mod acl;
 pub mod auth;
 pub mod codec;
 pub mod config;

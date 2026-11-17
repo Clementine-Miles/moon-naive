@@ -9,7 +9,7 @@ use pingora_core::protocols::{
     http::v2::server::{self, H2Accept, HttpSession},
     l4::stream::Stream as L4,
 };
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 use tokio::{io::AsyncWriteExt, net::TcpStream, sync::watch};
 
 pub(super) async fn serve(
@@ -32,8 +32,11 @@ pub(super) async fn serve(
     let digest = SocketDigest::from_raw_fd(socket.as_raw_fd());
     socket.set_socket_digest(digest);
     let stream = tokio::time::timeout(
-        Duration::from_secs(10),
-        pingora_core::protocols::tls::server::handshake(&generation.h2, socket),
+        app.handshake,
+        pingora_core::protocols::tls::server::handshake(
+            generation.h2_for(app.endpoint_index)?,
+            super::rate::RateStream::new(socket, app.rate.clone()),
+        ),
     )
     .await??;
     // ALPN callback is not invoked if absent; only the configured website may fall back to H1.
@@ -45,6 +48,9 @@ pub(super) async fn serve(
             return app.site.h1(Box::new(stream), stop).await;
         }
         return Err("strict H2 ALPN required".into());
+    }
+    if !app.h2 {
+        return Err("H2 disabled on this endpoint".into());
     }
     let ssl = stream.get_ssl().ok_or("missing TLS state")?;
     let exporter = if ssl.version2() == Some(boring::ssl::SslVersion::TLS1_3) {
@@ -76,11 +82,8 @@ pub(super) async fn serve(
         .initial_connection_window_size(app.profile.connection_window())
         .max_send_buffer_size(CHUNK * 2);
     let stream: pingora_core::protocols::Stream = Box::new(write_buffer::WriteBuffer::new(stream));
-    let mut conn = tokio::time::timeout(
-        Duration::from_secs(10),
-        server::handshake(stream, Some(options)),
-    )
-    .await??;
+    let mut conn =
+        tokio::time::timeout(app.handshake, server::handshake(stream, Some(options))).await??;
     let mut tasks = tokio::task::JoinSet::new();
     app.stats
         .h2_connections

@@ -1,6 +1,6 @@
 # moon-naive Pingora patch set
 
-Baseline: https://github.com/cloudflare/pingora/tree/4487f7b2ab50f159e4a2cf4f6a6b813f61bb6e19
+Baseline: https://github.com/cloudflare/pingora/tree/f86ffda5d3ae5c3baf5125682138b33b26c01b08
 
 Local changes provide HTTP/2 informational responses; request trailers on H1/H2;
 H1 chunked response trailers; and extraction of upgraded H1 streams together with
@@ -105,3 +105,12 @@ upgraded connections are not reusable. The first-party mixed H1/H2/H3 admission
 regression holds the shared tunnel lease until the duplex operation finishes,
 including a delayed download after upload EOF. Ordinary framed HTTP behavior is
 unchanged. Only the three related Rust files were edited; no vendor reformat.
+
+## 0.9.1 stable update
+
+Rebased retained runtime sources on upstream 0.9.1. Existing protocol, codec,
+retry, and half-close patches remain. Upstream test-only changes are not
+reintroduced into this runtime-only distribution. Removed upstream's obsolete
+OffloadRuntime::spawn_abort_on_drop and its tokio-util dependency, plus the
+unused proxy clap dependency. Package versions and checksum inventory reflect
+the resulting reviewed sources.

@@ -30,24 +30,23 @@ use tokio::sync::oneshot;
 
 use super::*;
 
-impl<SV, C, DS> HttpProxy<SV, C, DS>
+impl<SV, C> HttpProxy<SV, C>
 where
     C: custom::Connector,
-    DS: DownstreamSession,
 {
     /// Proxy to a custom protocol upstream.
     /// Returns (reuse_server, error)
     pub(crate) async fn proxy_to_custom_upstream(
         &self,
-        session: &mut Session<DS>,
+        session: &mut Session,
         client_session: &mut C::Session,
         reused: bool,
         peer: &HttpPeer,
-        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+        ctx: &mut SV::CTX,
     ) -> (bool, Option<Box<Error>>)
     where
-        SV: ProxyHttp<DS> + Send + Sync,
-        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
     {
         #[cfg(windows)]
         let raw = client_session.fd() as std::os::windows::io::RawSocket;
@@ -76,14 +75,14 @@ where
     /// Returns (reuse_server, error)
     async fn custom_proxy_down_to_up(
         &self,
-        session: &mut Session<DS>,
+        session: &mut Session,
         client_session: &mut C::Session,
         peer: &HttpPeer,
-        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+        ctx: &mut SV::CTX,
     ) -> (bool, Option<Box<Error>>)
     where
-        SV: ProxyHttp<DS> + Send + Sync,
-        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
     {
         client_session.set_read_timeout(peer.options.read_timeout);
         client_session.set_write_timeout(peer.options.write_timeout);
@@ -285,8 +284,8 @@ where
     #[allow(clippy::too_many_arguments)]
     async fn process_upstream_tasks_custom(
         &self,
-        session: &mut Session<DS>,
-        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+        session: &mut Session,
+        ctx: &mut SV::CTX,
         initial_task: HttpTask,
         rx: &mut mpsc::Receiver<HttpTask>,
         serve_from_cache: &mut ServeFromCache,
@@ -294,8 +293,8 @@ where
         response_state: &mut ResponseStateMachine,
     ) -> Result<Option<bool>>
     where
-        SV: ProxyHttp<DS> + Send + Sync,
-        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
     {
         if serve_from_cache.should_discard_upstream() {
             // Serving the cached response and discarding the upstream one; nothing
@@ -371,10 +370,10 @@ where
     #[allow(clippy::too_many_arguments)]
     async fn custom_bidirection_down_to_up(
         &self,
-        session: &mut Session<DS>,
+        session: &mut Session,
         client_body: &mut Box<dyn BodyWrite>,
         mut rx: mpsc::Receiver<HttpTask>,
-        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+        ctx: &mut SV::CTX,
         mut upstream_custom_message_filter_rx: mpsc::Receiver<(
             Bytes,
             oneshot::Sender<Option<Bytes>>,
@@ -388,8 +387,8 @@ where
         pipe_state: Arc<AtomicU8>,
     ) -> Result<bool>
     where
-        SV: ProxyHttp<DS> + Send + Sync,
-        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
     {
         let mut cancel_downstream_reader_tx = Some(cancel_downstream_reader_tx);
 
@@ -719,16 +718,16 @@ where
 
     async fn custom_response_filter(
         &self,
-        session: &mut Session<DS>,
+        session: &mut Session,
         mut task: HttpTask,
-        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+        ctx: &mut SV::CTX,
         serve_from_cache: &mut ServeFromCache,
         range_body_filter: &mut RangeBodyFilter,
         from_cache: bool, // are the task from cache already
     ) -> Result<HttpTask>
     where
-        SV: ProxyHttp<DS> + Send + Sync,
-        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
     {
         if !from_cache {
             self.upstream_filter(session, &mut task, ctx).await?;
@@ -824,8 +823,7 @@ where
                 let mut data = range_body_filter.filter_body(data);
                 if let Some(duration) = self
                     .inner
-                    .response_body_filter(session, &mut data, eos, ctx)
-                    .await?
+                    .response_body_filter(session, &mut data, eos, ctx)?
                 {
                     trace!("delaying response for {duration:?}");
                     time::sleep(duration).await;
@@ -842,8 +840,7 @@ where
                 // range body filter doesn't apply to upgraded body
                 if let Some(duration) = self
                     .inner
-                    .response_body_filter(session, &mut data, eos, ctx)
-                    .await?
+                    .response_body_filter(session, &mut data, eos, ctx)?
                 {
                     trace!("delaying upgraded response for {duration:?}");
                     time::sleep(duration).await;
@@ -898,15 +895,15 @@ where
 
     async fn send_body_to_custom(
         &self,
-        session: &mut Session<DS>,
+        session: &mut Session,
         mut data: Option<Bytes>,
         end_of_body: bool,
         client_body: &mut Box<dyn BodyWrite>,
-        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+        ctx: &mut SV::CTX,
     ) -> Result<bool>
     where
-        SV: ProxyHttp<DS> + Send + Sync,
-        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
     {
         session
             .downstream_modules_ctx

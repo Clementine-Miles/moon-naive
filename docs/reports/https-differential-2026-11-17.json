@@ -1,0 +1,779 @@
+{
+  "schema": 1,
+  "kind": "representative_excerpt",
+  "observed_on": "2026-11-17",
+  "source_report_sha256": "0f347483a96372a7a827ea34bce813916192ddd3577b8ac27741c0e612464d9d",
+  "success": true,
+  "observation_count": 510,
+  "distinct_case_counts": {
+    "h1": 10,
+    "h2": 33,
+    "h3": 34,
+    "tls": 8
+  },
+  "invalid_observations": [],
+  "reference": {
+    "archive_sha512": "747df7ee74de188485157a383633a1a963fd9233b71fbb4a69ddcbcc589ce4e2cc82dacf5dbbe136cb51d17e14c59daeb5d9bc92487610b0f3b93680b2646546",
+    "binary_sha256": "4ef1f68c70219536b2711fd16547a79841a2dec2d6b4e56b1e3e5e9da76028e6",
+    "name": "Caddy",
+    "source": "https://github.com/caddyserver/caddy/releases/tag/v2.10.2",
+    "tls": "same ephemeral certificate/key and CA as Moon; h1/h2/h3; TLS 1.2/1.3; no public CA",
+    "version": "v2.10.2 h1:g/gTYjGMD0dec+UgMw8SnfmJ3I9+M2TdvoRL/Ovu6U8="
+  },
+  "configuration_identity_sha256": "7bc56c0d6b3e9d8b99c8f46a3bf2a90e25f0243d2d04d94ed167e9908a7aac59",
+  "configuration": {
+    "admin": false,
+    "certificate": "same ephemeral chain/key as Moon",
+    "handler": "reverse_proxy",
+    "moon_flow_profile": {
+      "h2_connection_window": 524288,
+      "h2_stream_window": 262144,
+      "h3_connection_window": 524288,
+      "h3_stream_window": 57344
+    },
+    "origin": "shared loopback fixture",
+    "protocols": [
+      "h1",
+      "h2",
+      "h3"
+    ],
+    "public_ca_requests": false,
+    "reference": "Caddy v2.10.2"
+  },
+  "environment": {
+    "alt_svc_validation": "raw H1/H2/H3 announcements checked against actual bound UDP ports before normalization",
+    "arch": "x86_64",
+    "header_order": "H1/H3 preserve wire order; H2 application headers use decoded HeaderMap iteration; raw HPACK frame observations are separate",
+    "moon_version": "0.7.0",
+    "network": "loopback",
+    "normalizations": [
+      "Date marked dynamic",
+      "Alt-Svc bound port marked; ma preserved",
+      "reserved H3 GREASE id/value marked dynamic"
+    ],
+    "os": "linux",
+    "repetitions": 3,
+    "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+    "test_executable_sha256": "378a8d3197bd2f1ab08ee27865575e3acdf2f03be001d07cc98f13923ba5dc19",
+    "wire_protocol_revision": 4
+  },
+  "difference_count": 396,
+  "difference_categories": {
+    "headers": 105,
+    "transport": 39,
+    "body": 69,
+    "status": 24,
+    "error_code": 3,
+    "outcome": 9,
+    "client_packet_statistics": 9,
+    "experiment": 3,
+    "frames": 60,
+    "events": 54,
+    "reuse_probe_sent": 6,
+    "reuse_response_headers": 6,
+    "response_bytes": 3,
+    "framed_echo_verified": 6
+  },
+  "normal_requests": [
+    {
+      "body": {
+        "length": 50,
+        "sha256": "d743890e4526c576b7069e6a3c765a9180bc095053d727fe5baa4a0b90edaa45"
+      },
+      "case": "normal",
+      "connection": "request explicitly asked for close",
+      "elapsed_micros": 146528,
+      "headers": [
+        [
+          "content-type",
+          "text/html; charset=utf-8"
+        ],
+        [
+          "content-length",
+          "50"
+        ],
+        [
+          "date",
+          "<dynamic-date>"
+        ],
+        [
+          "alt-svc",
+          "h3=\":<bound-port>\"; ma=86400"
+        ],
+        [
+          "vary",
+          "accept-encoding"
+        ],
+        [
+          "connection",
+          "close"
+        ]
+      ],
+      "outcome": "eof",
+      "protocol": "h1",
+      "repetition": 0,
+      "server": "moon",
+      "status": 200,
+      "tls": {
+        "alpn": "http/1.1",
+        "certificate_sha256": "649702b9852082b87de93fdb4f95963fc82abf86778ff05389c249e49c5e6e7f",
+        "chain_length": 2,
+        "cipher": "TLS_AES_128_GCM_SHA256",
+        "session_reused": false,
+        "version": "TLSv1.3"
+      }
+    },
+    {
+      "body": {
+        "length": 50,
+        "sha256": "d743890e4526c576b7069e6a3c765a9180bc095053d727fe5baa4a0b90edaa45"
+      },
+      "case": "normal",
+      "elapsed_micros": 100569,
+      "headers": [
+        [
+          "content-type",
+          "text/html; charset=utf-8"
+        ],
+        [
+          "content-length",
+          "50"
+        ],
+        [
+          "date",
+          "<dynamic-date>"
+        ],
+        [
+          "alt-svc",
+          "h3=\":<bound-port>\"; ma=86400"
+        ],
+        [
+          "vary",
+          "accept-encoding"
+        ]
+      ],
+      "outcome": "finished",
+      "protocol": "h2",
+      "repetition": 0,
+      "reuse": true,
+      "server": "moon",
+      "status": 200,
+      "tls": {
+        "alpn": "h2",
+        "certificate_sha256": "649702b9852082b87de93fdb4f95963fc82abf86778ff05389c249e49c5e6e7f",
+        "chain_length": 2,
+        "cipher": "TLS_AES_128_GCM_SHA256",
+        "session_reused": false,
+        "version": "TLSv1.3"
+      }
+    },
+    {
+      "body": {
+        "length": 50,
+        "sha256": "d743890e4526c576b7069e6a3c765a9180bc095053d727fe5baa4a0b90edaa45"
+      },
+      "case": "normal",
+      "elapsed_micros": 65499,
+      "headers": [
+        [
+          "content-type",
+          "text/html; charset=utf-8"
+        ],
+        [
+          "content-length",
+          "50"
+        ],
+        [
+          "date",
+          "<dynamic-date>"
+        ],
+        [
+          "alt-svc",
+          "h3=\":<bound-port>\"; ma=86400"
+        ],
+        [
+          "vary",
+          "accept-encoding"
+        ]
+      ],
+      "outcome": "finished",
+      "protocol": "h3",
+      "repetition": 0,
+      "server": "moon",
+      "status": 200,
+      "tls": {
+        "alpn": "h3",
+        "certificate_sha256": "649702b9852082b87de93fdb4f95963fc82abf86778ff05389c249e49c5e6e7f",
+        "chain_length": 2,
+        "cipher": "TLS_AES_128_GCM_SHA256",
+        "session_reused": false,
+        "version": "TLSv1.3"
+      },
+      "transport": {
+        "ack_delay_exponent": 3,
+        "active_connection_id_limit": 2,
+        "disable_active_migration": true,
+        "h3_settings": [
+          [
+            6,
+            32768
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            7,
+            0
+          ],
+          [
+            8,
+            1
+          ],
+          [
+            "<dynamic-reserved-grease-id>",
+            "<dynamic-grease-value>"
+          ]
+        ],
+        "initial_max_data": 524288,
+        "initial_max_stream_data_bidi_local": 57344,
+        "initial_max_stream_data_bidi_remote": 57344,
+        "initial_max_stream_data_uni": 65536,
+        "initial_max_streams_bidi": 8,
+        "initial_max_streams_uni": 16,
+        "max_ack_delay_ms": 25,
+        "max_idle_timeout_ms": 3000,
+        "max_udp_payload_size": 1350,
+        "retry_observed": true
+      }
+    },
+    {
+      "body": {
+        "length": 50,
+        "sha256": "d743890e4526c576b7069e6a3c765a9180bc095053d727fe5baa4a0b90edaa45"
+      },
+      "case": "normal",
+      "connection": "request explicitly asked for close",
+      "elapsed_micros": 85750,
+      "headers": [
+        [
+          "alt-svc",
+          "h3=\":<bound-port>\"; ma=2592000"
+        ],
+        [
+          "content-length",
+          "50"
+        ],
+        [
+          "content-type",
+          "text/html; charset=utf-8"
+        ],
+        [
+          "date",
+          "<dynamic-date>"
+        ],
+        [
+          "via",
+          "1.1 Caddy"
+        ],
+        [
+          "connection",
+          "close"
+        ]
+      ],
+      "outcome": "eof",
+      "protocol": "h1",
+      "repetition": 0,
+      "server": "reference",
+      "status": 200,
+      "tls": {
+        "alpn": "http/1.1",
+        "certificate_sha256": "649702b9852082b87de93fdb4f95963fc82abf86778ff05389c249e49c5e6e7f",
+        "chain_length": 2,
+        "cipher": "TLS_AES_128_GCM_SHA256",
+        "session_reused": false,
+        "version": "TLSv1.3"
+      }
+    },
+    {
+      "body": {
+        "length": 50,
+        "sha256": "d743890e4526c576b7069e6a3c765a9180bc095053d727fe5baa4a0b90edaa45"
+      },
+      "case": "normal",
+      "elapsed_micros": 41621,
+      "headers": [
+        [
+          "alt-svc",
+          "h3=\":<bound-port>\"; ma=2592000"
+        ],
+        [
+          "content-type",
+          "text/html; charset=utf-8"
+        ],
+        [
+          "date",
+          "<dynamic-date>"
+        ],
+        [
+          "via",
+          "1.1 Caddy"
+        ],
+        [
+          "content-length",
+          "50"
+        ]
+      ],
+      "outcome": "finished",
+      "protocol": "h2",
+      "repetition": 0,
+      "reuse": true,
+      "server": "reference",
+      "status": 200,
+      "tls": {
+        "alpn": "h2",
+        "certificate_sha256": "649702b9852082b87de93fdb4f95963fc82abf86778ff05389c249e49c5e6e7f",
+        "chain_length": 2,
+        "cipher": "TLS_AES_128_GCM_SHA256",
+        "session_reused": false,
+        "version": "TLSv1.3"
+      }
+    },
+    {
+      "body": {
+        "length": 50,
+        "sha256": "d743890e4526c576b7069e6a3c765a9180bc095053d727fe5baa4a0b90edaa45"
+      },
+      "case": "normal",
+      "elapsed_micros": 39859,
+      "headers": [
+        [
+          "via",
+          "1.1 Caddy"
+        ],
+        [
+          "content-type",
+          "text/html; charset=utf-8"
+        ],
+        [
+          "content-length",
+          "50"
+        ],
+        [
+          "date",
+          "<dynamic-date>"
+        ]
+      ],
+      "outcome": "finished",
+      "protocol": "h3",
+      "repetition": 0,
+      "server": "reference",
+      "status": 200,
+      "tls": {
+        "alpn": "h3",
+        "certificate_sha256": "649702b9852082b87de93fdb4f95963fc82abf86778ff05389c249e49c5e6e7f",
+        "chain_length": 2,
+        "cipher": "TLS_AES_128_GCM_SHA256",
+        "session_reused": false,
+        "version": "TLSv1.3"
+      },
+      "transport": {
+        "ack_delay_exponent": 3,
+        "active_connection_id_limit": 4,
+        "disable_active_migration": false,
+        "h3_settings": [
+          [
+            8,
+            1
+          ]
+        ],
+        "initial_max_data": 786432,
+        "initial_max_stream_data_bidi_local": 524288,
+        "initial_max_stream_data_bidi_remote": 524288,
+        "initial_max_stream_data_uni": 524288,
+        "initial_max_streams_bidi": 100,
+        "initial_max_streams_uni": 100,
+        "max_ack_delay_ms": 26,
+        "max_idle_timeout_ms": 30000,
+        "max_udp_payload_size": 1452,
+        "retry_observed": false
+      }
+    }
+  ],
+  "representative_differences": [
+    {
+      "case": "normal",
+      "category": "headers",
+      "classification": "review_required",
+      "moon": [
+        [
+          "content-type",
+          "text/html; charset=utf-8"
+        ],
+        [
+          "content-length",
+          "50"
+        ],
+        [
+          "date",
+          "<dynamic-date>"
+        ],
+        [
+          "alt-svc",
+          "h3=\":<bound-port>\"; ma=86400"
+        ],
+        [
+          "vary",
+          "accept-encoding"
+        ],
+        [
+          "connection",
+          "close"
+        ]
+      ],
+      "protocol": "h1",
+      "reference": [
+        [
+          "alt-svc",
+          "h3=\":<bound-port>\"; ma=2592000"
+        ],
+        [
+          "content-length",
+          "50"
+        ],
+        [
+          "content-type",
+          "text/html; charset=utf-8"
+        ],
+        [
+          "date",
+          "<dynamic-date>"
+        ],
+        [
+          "via",
+          "1.1 Caddy"
+        ],
+        [
+          "connection",
+          "close"
+        ]
+      ],
+      "repetition": 0,
+      "reproducibility": {
+        "same_moon_observation_count": 3,
+        "timing": "descriptive only; no deterministic timing assertion",
+        "total_repetitions": 3
+      },
+      "severity": "observable"
+    },
+    {
+      "case": "normal",
+      "category": "transport",
+      "classification": "expected_implementation_or_configuration_difference",
+      "moon": {
+        "ack_delay_exponent": 3,
+        "active_connection_id_limit": 2,
+        "disable_active_migration": true,
+        "h3_settings": [
+          [
+            6,
+            32768
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            7,
+            0
+          ],
+          [
+            8,
+            1
+          ],
+          [
+            "<dynamic-reserved-grease-id>",
+            "<dynamic-grease-value>"
+          ]
+        ],
+        "initial_max_data": 524288,
+        "initial_max_stream_data_bidi_local": 57344,
+        "initial_max_stream_data_bidi_remote": 57344,
+        "initial_max_stream_data_uni": 65536,
+        "initial_max_streams_bidi": 8,
+        "initial_max_streams_uni": 16,
+        "max_ack_delay_ms": 25,
+        "max_idle_timeout_ms": 3000,
+        "max_udp_payload_size": 1350,
+        "retry_observed": true
+      },
+      "protocol": "h3",
+      "reference": {
+        "ack_delay_exponent": 3,
+        "active_connection_id_limit": 4,
+        "disable_active_migration": false,
+        "h3_settings": [
+          [
+            8,
+            1
+          ]
+        ],
+        "initial_max_data": 786432,
+        "initial_max_stream_data_bidi_local": 524288,
+        "initial_max_stream_data_bidi_remote": 524288,
+        "initial_max_stream_data_uni": 524288,
+        "initial_max_streams_bidi": 100,
+        "initial_max_streams_uni": 100,
+        "max_ack_delay_ms": 26,
+        "max_idle_timeout_ms": 30000,
+        "max_udp_payload_size": 1452,
+        "retry_observed": false
+      },
+      "repetition": 0,
+      "reproducibility": {
+        "same_moon_observation_count": 3,
+        "timing": "descriptive only; no deterministic timing assertion",
+        "total_repetitions": 3
+      },
+      "severity": "observable"
+    },
+    {
+      "case": "invalid_method_token",
+      "category": "events",
+      "classification": "review_required",
+      "moon": [
+        {
+          "error_code": 270,
+          "event": "reset",
+          "stream": 0
+        },
+        {
+          "event": "headers",
+          "fields": [
+            [
+              ":status",
+              "200"
+            ],
+            [
+              "content-type",
+              "text/html; charset=utf-8"
+            ],
+            [
+              "content-length",
+              "50"
+            ],
+            [
+              "date",
+              "<dynamic-date>"
+            ],
+            [
+              "alt-svc",
+              "h3=\":<bound-port>\"; ma=86400"
+            ],
+            [
+              "vary",
+              "accept-encoding"
+            ]
+          ],
+          "status": 200,
+          "stream": 4
+        },
+        {
+          "event": "finished",
+          "stream": 4
+        }
+      ],
+      "protocol": "h3",
+      "reference": [
+        {
+          "event": "headers",
+          "fields": [
+            [
+              ":status",
+              "502"
+            ],
+            [
+              "server",
+              "Caddy"
+            ],
+            [
+              "date",
+              "<dynamic-date>"
+            ],
+            [
+              "content-length",
+              "0"
+            ]
+          ],
+          "status": 502,
+          "stream": 0
+        },
+        {
+          "event": "finished",
+          "stream": 0
+        },
+        {
+          "event": "headers",
+          "fields": [
+            [
+              ":status",
+              "200"
+            ],
+            [
+              "via",
+              "1.1 Caddy"
+            ],
+            [
+              "content-type",
+              "text/html; charset=utf-8"
+            ],
+            [
+              "content-length",
+              "50"
+            ],
+            [
+              "date",
+              "<dynamic-date>"
+            ]
+          ],
+          "status": 200,
+          "stream": 4
+        },
+        {
+          "event": "finished",
+          "stream": 4
+        }
+      ],
+      "repetition": 0,
+      "reproducibility": {
+        "same_moon_observation_count": 3,
+        "timing": "descriptive only; no deterministic timing assertion",
+        "total_repetitions": 3
+      },
+      "severity": "observable"
+    },
+    {
+      "case": "settings_ack_invalid_ping",
+      "category": "frames",
+      "classification": "review_required",
+      "moon": [
+        {
+          "flags": 0,
+          "length": 24,
+          "settings": [
+            [
+              3,
+              8
+            ],
+            [
+              4,
+              65536
+            ],
+            [
+              6,
+              32768
+            ],
+            [
+              8,
+              1
+            ]
+          ],
+          "stream": 0,
+          "type": 4
+        },
+        {
+          "flags": 1,
+          "length": 0,
+          "stream": 0,
+          "type": 4
+        },
+        {
+          "flags": 0,
+          "increment": 458753,
+          "length": 4,
+          "stream": 0,
+          "type": 8
+        },
+        {
+          "error_code": 1,
+          "flags": 0,
+          "last_stream": 0,
+          "length": 8,
+          "stream": 0,
+          "type": 7
+        }
+      ],
+      "protocol": "h2",
+      "reference": [
+        {
+          "flags": 0,
+          "length": 30,
+          "settings": [
+            [
+              5,
+              1048576
+            ],
+            [
+              3,
+              250
+            ],
+            [
+              6,
+              1048896
+            ],
+            [
+              1,
+              4096
+            ],
+            [
+              4,
+              1048576
+            ]
+          ],
+          "stream": 0,
+          "type": 4
+        },
+        {
+          "flags": 1,
+          "length": 0,
+          "stream": 0,
+          "type": 4
+        },
+        {
+          "flags": 0,
+          "increment": 983041,
+          "length": 4,
+          "stream": 0,
+          "type": 8
+        },
+        {
+          "error_code": 6,
+          "flags": 0,
+          "last_stream": 0,
+          "length": 8,
+          "stream": 0,
+          "type": 7
+        }
+      ],
+      "repetition": 0,
+      "reproducibility": {
+        "same_moon_observation_count": 3,
+        "timing": "descriptive only; no deterministic timing assertion",
+        "total_repetitions": 3
+      },
+      "severity": "observable"
+    }
+  ],
+  "unmeasured": [
+    "ordinary authenticated forward requests beyond CONNECT remain covered by Moon regressions; not yet compared here",
+    "HPACK/QPACK dynamic compression traces and extended malformed frame/fuzz corpus beyond deterministic pseudoheader and PING probes",
+    "SETTINGS timing and header/body timing distributions across network environments; elapsed times here are descriptive loopback samples",
+    "TLS extension and exhaustive cipher preference enumeration; resumption sampled with OpenSSL only where available",
+    "H3 slow-reader flow-control update timing and extensive reset storms, half-closed states and graceful GOAWAY ordering",
+    "kernel path QUIC loss/delay/NAT rebinding, migration attempts, CID rotation, congestion/pacing/retransmission benchmarks; three bounded post-handshake client UDP perturbations measured here",
+    "malformed TLS/QUIC handshake corpus and packet-level CONNECTION_CLOSE comparison"
+  ],
+  "warning": "Observed differences are measurements, not an undetectability guarantee. Expected stack differences remain fingerprintable. Unmeasured scenarios are not passing tests.",
+  "reproduce": "cargo xtask differential --caddy /absolute/path/to/verified/caddy --run /absolute/new/report/directory",
+  "excerpt_note": "Only selected repetition-0 observations are retained here; observation_count and difference_count describe the complete three-repetition source report, not this excerpt."
+}

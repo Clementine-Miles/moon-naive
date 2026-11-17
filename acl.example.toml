@@ -1,0 +1,32 @@
+# Install as /etc/moon-naive/acl.toml, owned by the service user, mode 0600.
+# Reference from [proxy] acl_file in the main TOML. This is a restrictive example:
+# edit the destinations to match your own use. Rules are ordered, first-match.
+default = "deny"
+
+[[rules]]
+action = "deny"
+suffix = "blocked.example.org"
+
+[[rules]]
+action = "allow"
+domain = "example.org"
+ports = ["443"]
+
+[[rules]]
+action = "allow"
+suffix = "example.net" # includes apex and descendants, never notexample.net
+ports = ["80", "443", "8000-8080"]
+
+[[rules]]
+action = "allow"
+ip = "1.1.1.1"
+ports = ["443", "853"]
+
+[[rules]]
+action = "allow"
+cidr = "2606:4700::/32"
+ports = ["443"]
+
+# A rule without a selector matches all destinations on its optional ports.
+# Mandatory private/special-use/local/self address restrictions always apply,
+# including to explicit allow rules; this file cannot grant a private-IP bypass.

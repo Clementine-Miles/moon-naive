@@ -60,19 +60,18 @@ static NOT_PURGEABLE: Lazy<ResponseHeader> = Lazy::new(|| gen_purge_response(405
 // on cache storage or proxy error
 static INTERNAL_ERROR: Lazy<ResponseHeader> = Lazy::new(|| error_resp::gen_error_response(500));
 
-impl<SV, C, DS> HttpProxy<SV, C, DS>
+impl<SV, C> HttpProxy<SV, C>
 where
     C: custom::Connector,
-    DS: DownstreamSession,
 {
     pub(crate) async fn proxy_purge(
         &self,
-        session: &mut Session<DS>,
-        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+        session: &mut Session,
+        ctx: &mut SV::CTX,
     ) -> Option<(bool, Option<Box<Error>>)>
     where
-        SV: ProxyHttp<DS> + Send + Sync,
-        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
     {
         let purge_status = if session.cache.enabled() {
             let purged = match self.inner.purge_action(session, ctx) {

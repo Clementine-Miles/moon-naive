@@ -121,11 +121,21 @@ fn drain_path_events(conn: &mut quiche::Connection) -> usize {
 }
 // Keep exactly one packet when pacing or socket backpressure defers it. QUIC
 // has already assigned its packet number and charged congestion control.
+#[cfg(test)]
 fn transmit(
+    pending: &mut Option<Packet>,
+    next: impl FnMut() -> std::result::Result<Packet, quiche::Error>,
+    send: impl FnMut(&Packet) -> std::io::Result<usize>,
+    now: impl FnMut() -> Instant,
+) -> Result<TransmitWait> {
+    transmit_with_rate(pending, next, send, now, None)
+}
+fn transmit_with_rate(
     pending: &mut Option<Packet>,
     mut next: impl FnMut() -> std::result::Result<Packet, quiche::Error>,
     mut send: impl FnMut(&Packet) -> std::io::Result<usize>,
     mut now: impl FnMut() -> Instant,
+    rate: Option<&Arc<super::rate::Rate>>,
 ) -> Result<TransmitWait> {
     for _ in 0..64 {
         if pending.is_none() {
@@ -139,8 +149,21 @@ fn transmit(
         if packet.at > now() {
             return Ok(TransmitWait::Pacing(packet.at));
         }
+        let grant = if let Some(rate) = rate {
+            match rate.try_reserve(super::rate::Direction::Download, packet.data.len(), now()) {
+                Ok(grant) => Some(grant),
+                Err(at) => return Ok(TransmitWait::Pacing(at)),
+            }
+        } else {
+            None
+        };
         match send(packet) {
-            Ok(n) if n == packet.data.len() => *pending = None,
+            Ok(n) if n == packet.data.len() => {
+                if let Some(grant) = grant {
+                    grant.commit(n);
+                }
+                *pending = None;
+            }
             Ok(_) => return Err("partial UDP datagram send".into()),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 return Ok(TransmitWait::Writable);
@@ -153,6 +176,23 @@ fn transmit(
     // even if there is no incoming ACK or application notification to wake us.
     Ok(TransmitWait::Budget)
 }
+fn send_stateless(
+    socket: &UdpSocket,
+    rate: &Arc<super::rate::Rate>,
+    bytes: &[u8],
+    to: SocketAddr,
+) -> std::io::Result<usize> {
+    let grant = rate
+        .try_reserve(
+            super::rate::Direction::Download,
+            bytes.len(),
+            Instant::now(),
+        )
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::WouldBlock))?;
+    let n = socket.try_send_to(bytes, to)?;
+    grant.commit(n);
+    Ok(n)
+}
 struct Client {
     conn: quiche::Connection,
     h3: Option<quiche::h3::Connection>,
@@ -162,7 +202,7 @@ struct Client {
     handshake_deadline: Instant,
     pending_headers: HashMap<u64, Instant>,
     _permit: Permit,
-    _window: tokio::sync::OwnedSemaphorePermit,
+    _window: super::resources::BytePermit,
     _generation: Arc<Generation>,
 }
 struct Stream {
@@ -392,7 +432,11 @@ pub(super) async fn serve(
     h3_config.set_max_field_section_size(32768);
     h3_config.set_qpack_max_table_capacity(0);
     h3_config.set_qpack_blocked_streams(0);
-    let wake = app.resources.buffers.wake.clone();
+    // Stream completion is endpoint-local. Global byte-credit wakeups fan out
+    // separately; sharing Notify::notify_one between endpoint drivers could
+    // wake a sibling and strand this endpoint's ready authentication result.
+    let wake = Arc::new(Notify::new());
+    let buffer_wake = app.resources.buffers.wake.clone();
     let timer = DriverTimer::new()?;
     let local = socket.local_addr()?;
     let mut draining: Option<Instant> = None;
@@ -643,7 +687,7 @@ pub(super) async fn serve(
                     let _ = client.conn.close(true, NO_ERROR, b"");
                 }
             }
-            let progress = transmit(
+            let progress = transmit_with_rate(
                 &mut client.tx,
                 || {
                     let mut out = vec![0; 1350];
@@ -657,6 +701,7 @@ pub(super) async fn serve(
                 },
                 |packet| socket.try_send_to(&packet.data, packet.to),
                 Instant::now,
+                Some(&app.rate),
             );
             match progress {
                 Ok(TransmitWait::Idle) => {}
@@ -688,33 +733,38 @@ pub(super) async fn serve(
                 for client in clients.values_mut() {if let Some(h3)=&mut client.h3 {let _=h3.send_goaway(&mut client.conn,(1u64<<62)-4);}}
             },
             _=wake.notified()=>{},
+            _=buffer_wake.notified()=>{},
             ready=socket.writable(),if send_blocked=>{ready?;},
             _=tokio::task::yield_now(),if send_again=>{},
             result=timer.wait(deadline)=>{result?;},
             packet=socket.recv_from(&mut buffer)=>{
                 let (n,from)=packet?;
+                // UDP cannot backpressure a remote sender: police excess input
+                // locally, without sleeping in the shared QUIC connection loop.
+                if n>super::rate::BURST {continue;}
+                let Ok(grant)=app.rate.try_reserve(super::rate::Direction::Upload,n,Instant::now()) else {continue;};grant.commit(n);
                 let header=match quiche::Header::from_slice(&mut buffer[..n],quiche::MAX_CONN_ID_LEN){Ok(h)=>h,Err(_)=>continue};
                 let cid=header.dcid.to_vec();
                 if !clients.contains_key(&cid) {
                     if draining.is_some() || n<1200 || header.ty!=quiche::Type::Initial {continue;}
                     let mut out=[0;1350];
                     if !quiche::version_is_supported(header.version) {
-                        if let Ok(n)=quiche::negotiate_version(&header.scid,&header.dcid,&mut out){let _=socket.try_send_to(&out[..n],from);}continue;
+                        if let Ok(n)=quiche::negotiate_version(&header.scid,&header.dcid,&mut out){let _=send_stateless(&socket,&app.rate,&out[..n],from);}continue;
                     }
                     let token=header.token.as_deref().unwrap_or(&[]);
                     if token.is_empty() {
                         let mut server_id=[0;quiche::MAX_CONN_ID_LEN];boring::rand::rand_bytes(&mut server_id)?;
                         let server_id=quiche::ConnectionId::from_ref(&server_id);
                         let token=mint(&key,from,&header.dcid,&server_id);
-                        if let Ok(n)=quiche::retry(&header.scid,&header.dcid,&server_id,&token,header.version,&mut out){let _=socket.try_send_to(&out[..n],from);}continue;
+                        if let Ok(n)=quiche::retry(&header.scid,&header.dcid,&server_id,&token,header.version,&mut out){let _=send_stateless(&socket,&app.rate,&out[..n],from);}continue;
                     }
                     let Some(original)=validate(&key,from,&cid,token) else {continue;};
                     let Some(permit)=connections.acquire() else {continue;};
-                    let Ok(window)=app.resources.receive.clone().try_acquire_many_owned(app.profile.connection_window()) else {continue;};
+                    let Ok(window)=app.resources.receive.clone().try_acquire_many_owned(app.profile.h3_connection_window()) else {continue;};
                     let generation=match tls.current(){Ok(g)=>g,Err(_)=>continue};
-                    let conn={let mut config=generation.h3.lock().map_err(|_|"H3 config lock poisoned")?;quiche::accept(&header.dcid,Some(&quiche::ConnectionId::from_ref(&original)),local,from,&mut config)};
+                    let conn={let mut config=generation.h3_for(app.endpoint_index)?.lock().map_err(|_|"H3 config lock poisoned")?;quiche::accept(&header.dcid,Some(&quiche::ConnectionId::from_ref(&original)),local,from,&mut config)};
                     let Ok(conn)=conn else {continue;};
-                    clients.insert(cid.clone(),Client {conn,h3:None,exporter:None,streams:HashMap::new(),tx:None,handshake_deadline:Instant::now()+super::HEADER_TIMEOUT,pending_headers:HashMap::new(),_permit:permit,_window:window,_generation:generation});
+                    clients.insert(cid.clone(),Client {conn,h3:None,exporter:None,streams:HashMap::new(),tx:None,handshake_deadline:Instant::now()+app.handshake,pending_headers:HashMap::new(),_permit:permit,_window:window,_generation:generation});
                 }
                 let client=clients.get_mut(&cid).unwrap();
                 if client.conn.recv(&mut buffer[..n],quiche::RecvInfo {from,to:local}).is_err(){continue;}
@@ -1198,6 +1248,62 @@ fn validate(key: &[u8], from: SocketAddr, server: &[u8], token: &[u8]) -> Option
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn endpoint_rate_pacing_preserves_pending_datagram_and_other_endpoint_progress() {
+        let rate = super::super::rate::Rate::new(Some(1024)).unwrap();
+        let now = Instant::now();
+        rate.try_reserve(
+            super::super::rate::Direction::Download,
+            super::super::rate::BURST,
+            now,
+        )
+        .unwrap()
+        .commit(super::super::rate::BURST);
+        let make = || {
+            Some(Packet {
+                data: vec![0; 1024],
+                to: "127.0.0.1:443".parse().unwrap(),
+                at: now,
+            })
+        };
+        let mut pending = make();
+        let wait = transmit_with_rate(
+            &mut pending,
+            || Err(quiche::Error::Done),
+            |_| panic!("rate-limited packet reached socket"),
+            || now,
+            Some(&rate),
+        )
+        .unwrap();
+        assert_eq!(wait, TransmitWait::Pacing(now + Duration::from_secs(1)));
+        assert!(pending.is_some());
+        let other = super::super::rate::Rate::new(Some(1024)).unwrap();
+        let mut fresh = make();
+        assert_eq!(
+            transmit_with_rate(
+                &mut fresh,
+                || Err(quiche::Error::Done),
+                |p| Ok(p.data.len()),
+                || now,
+                Some(&other)
+            )
+            .unwrap(),
+            TransmitWait::Idle
+        );
+        assert!(fresh.is_none());
+        assert_eq!(
+            transmit_with_rate(
+                &mut pending,
+                || Err(quiche::Error::Done),
+                |p| Ok(p.data.len()),
+                || now + Duration::from_secs(1),
+                Some(&rate)
+            )
+            .unwrap(),
+            TransmitWait::Idle
+        );
+        assert!(pending.is_none());
+    }
     use super::*;
     #[cfg(target_os = "linux")]
     #[tokio::test]

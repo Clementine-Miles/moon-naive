@@ -13,8 +13,13 @@ pub(super) struct Generation {
     ech_stamp: Option<[u8; 32]>,
     pub h2: SslAcceptor,
     pub h3: Mutex<quiche::Config>,
+    endpoints: Vec<EndpointTls>,
     pub not_after: u64,
     outer: Option<crate::acme::certificate::Lifetime>,
+}
+struct EndpointTls {
+    h2: SslAcceptor,
+    h3: Mutex<quiche::Config>,
 }
 #[derive(Clone)]
 pub(super) struct Slot(
@@ -181,13 +186,51 @@ fn load(config: &Config) -> Result<Generation> {
     }
     let certs = X509::stack_from_pem(&bundle.material().chain_pem)?;
     let key = PKey::private_key_from_pem(&bundle.material().key_pem)?;
+    // Read ECH and certificate material once, then construct every endpoint
+    // context before publishing this immutable generation. A failure leaves the
+    // previous complete generation installed across all listening ports.
+    let ech = EchMaterial::read(config, false)?;
+    let mut endpoints = config
+        .effective_listeners()
+        .iter()
+        .map(|endpoint| endpoint_tls(config, &certs, &key, ech.as_ref(), endpoint))
+        .collect::<Result<Vec<_>>>()?;
+    let primary = endpoints.remove(0);
+    if ech_stamp(config)? != stamp {
+        return Err("ECH files changed during reload".into());
+    }
+    Ok(Generation {
+        id: stored.generation,
+        ech_stamp: stamp,
+        h2: primary.h2,
+        h3: primary.h3,
+        endpoints,
+        not_after: bundle.lifetime().not_after,
+        outer: ech.as_ref().map(|ech| ech.lifetime),
+    })
+}
+fn endpoint_tls(
+    config: &Config,
+    certs: &[X509],
+    key: &PKey<boring::pkey::Private>,
+    ech: Option<&EchMaterial>,
+    endpoint: &moon_naive_core::config::Endpoint,
+) -> Result<EndpointTls> {
+    let profile = &TransportProfile::for_endpoint(config, endpoint)?;
+    let h1_enabled = endpoint.listener.h1;
+    let h2_enabled = endpoint.listener.h2;
+    let early = endpoint
+        .limits
+        .as_ref()
+        .unwrap_or(&config.limits)
+        .max_early_data_bytes;
     // boring's legacy v4 helper explicitly disables TLS 1.3. The v5 policy
     // preserves TLS 1.2 compatibility while allowing modern H2 handshakes.
     let mut h2 = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())?;
     h2.set_min_proto_version(Some(SslVersion::TLS1_2))?;
     h2.set_max_proto_version(Some(SslVersion::TLS1_3))?;
     h2.set_certificate(&certs[0])?;
-    h2.set_private_key(&key)?;
+    h2.set_private_key(key)?;
     for cert in &certs[1..] {
         if config.ech.is_none() {
             h2.add_extra_chain_cert(cert.clone())?;
@@ -196,57 +239,65 @@ fn load(config: &Config) -> Result<Generation> {
     h2.check_private_key()?;
     // Build the latest inner even when outer is expired. Admission below gates
     // all new handshakes until the complete configured ECH identity is valid.
-    let ech = EchMaterial::read(config, false)?;
-    if let Some(ech) = &ech {
-        ech.install(&mut h2, &certs, &key)?;
+    if let Some(ech) = ech {
+        ech.install(&mut h2, certs, key)?;
     }
-    let h1_enabled = config.listener.h1;
     h2.set_alpn_select_callback(move |_, offered| {
-        let protocols: &[u8] = if h1_enabled {
-            b"\x02h2\x08http/1.1"
-        } else {
-            b"\x02h2"
+        let protocols: &[u8] = match (h1_enabled, h2_enabled) {
+            (true, true) => b"\x02h2\x08http/1.1",
+            (true, false) => b"\x08http/1.1",
+            (false, true) => b"\x02h2",
+            (false, false) => b"",
         };
         select_next_proto(protocols, offered).ok_or(AlpnError::ALERT_FATAL)
     });
 
     let mut h3 = SslContextBuilder::new(SslMethod::tls())?;
     h3.set_certificate(&certs[0])?;
-    h3.set_private_key(&key)?;
+    h3.set_private_key(key)?;
     for cert in &certs[1..] {
         if config.ech.is_none() {
             h3.add_extra_chain_cert(cert.clone())?;
         }
     }
     h3.check_private_key()?;
-    if let Some(ech) = &ech {
-        ech.install(&mut h3, &certs, &key)?;
+    if let Some(ech) = ech {
+        ech.install(&mut h3, certs, key)?;
     }
-    let mut h3 = h3_settings(h3, &TransportProfile::from_config(config)?)?;
-    let initial = config
-        .limits
-        .max_early_data_bytes
-        .min(TransportProfile::from_config(config)?.h3_stream_window() as usize)
-        as u64;
+    let mut h3 = h3_settings(h3, profile)?;
+    let initial = early.min(profile.h3_stream_window() as usize) as u64;
     h3.set_initial_max_stream_data_bidi_local(initial);
     h3.set_initial_max_stream_data_bidi_remote(initial);
     h3.set_max_recv_udp_payload_size(1350);
     h3.set_max_send_udp_payload_size(1350);
     // One server CID: disable migration until additional CID routing is implemented.
     h3.set_disable_active_migration(true);
-    if ech_stamp(config)? != stamp {
-        return Err("ECH files changed during reload".into());
-    }
-    Ok(Generation {
-        id: stored.generation,
-        ech_stamp: stamp,
+    Ok(EndpointTls {
         h2: h2.build(),
         h3: Mutex::new(h3),
-        not_after: bundle.lifetime().not_after,
-        outer: ech.as_ref().map(|ech| ech.lifetime),
     })
 }
 impl Generation {
+    pub(super) fn h2_for(&self, index: usize) -> Result<&SslAcceptor> {
+        if index == 0 {
+            return Ok(&self.h2);
+        }
+        Ok(&self
+            .endpoints
+            .get(index - 1)
+            .ok_or("TLS endpoint missing")?
+            .h2)
+    }
+    pub(super) fn h3_for(&self, index: usize) -> Result<&Mutex<quiche::Config>> {
+        if index == 0 {
+            return Ok(&self.h3);
+        }
+        Ok(&self
+            .endpoints
+            .get(index - 1)
+            .ok_or("TLS endpoint missing")?
+            .h3)
+    }
     fn valid_at(&self, now: u64) -> Result<()> {
         if now >= self.not_after {
             return Err("inner TLS identity expired".into());
@@ -586,13 +637,13 @@ fn h3_settings(
     });
     config.enable_pacing(true);
     config.set_max_idle_timeout(profile.idle_timeout_ms());
-    config.set_initial_max_data(u64::from(profile.connection_window()));
+    config.set_initial_max_data(u64::from(profile.h3_connection_window()));
     config.set_initial_max_stream_data_bidi_local(u64::from(profile.h3_stream_window()));
     config.set_initial_max_stream_data_bidi_remote(u64::from(profile.h3_stream_window()));
     config.set_initial_max_stream_data_uni(64 * 1024);
     config.set_initial_max_streams_bidi(u64::from(profile.max_streams()));
     config.set_initial_max_streams_uni(16);
-    config.set_max_connection_window(u64::from(profile.connection_window()));
+    config.set_max_connection_window(u64::from(profile.h3_connection_window()));
     config.set_max_stream_window(u64::from(profile.h3_stream_window()));
     // Stalled bidi DATA cannot consume the control reserve. QPACK dynamic tables
     // remain disabled in the H3 driver. No enable_early_data():
@@ -603,6 +654,71 @@ fn h3_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn endpoint_alpn_is_independent_with_one_certificate() {
+        use boring::x509::{
+            X509NameBuilder,
+            extension::{BasicConstraints, SubjectAlternativeName},
+        };
+        use boring::{asn1::Asn1Time, bn::BigNum, hash::MessageDigest, ssl::SslConnector};
+        let config = Config::parse(include_str!("../../config.example.toml")).unwrap();
+        let key = crate::acme::crypto::p256().unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", &config.domain).unwrap();
+        let name = name.build();
+        let mut cert = X509::builder().unwrap();
+        cert.set_version(2).unwrap();
+        cert.set_serial_number(&BigNum::from_u32(1).unwrap().to_asn1_integer().unwrap())
+            .unwrap();
+        cert.set_subject_name(&name).unwrap();
+        cert.set_issuer_name(&name).unwrap();
+        cert.set_pubkey(&key).unwrap();
+        cert.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        cert.set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        cert.append_extension(&BasicConstraints::new().critical().ca().build().unwrap())
+            .unwrap();
+        let names = SubjectAlternativeName::new()
+            .dns(&config.domain)
+            .build(&cert.x509v3_context(None, None))
+            .unwrap();
+        cert.append_extension(&names).unwrap();
+        cert.sign(&key, MessageDigest::sha256()).unwrap();
+        let cert = cert.build();
+        let mut endpoint = config.effective_listeners().remove(0);
+        for (h1, h2, expected) in [
+            (true, false, b"http/1.1".as_slice()),
+            (false, true, b"h2".as_slice()),
+        ] {
+            endpoint.listener.h1 = h1;
+            endpoint.listener.h2 = h2;
+            let tls =
+                endpoint_tls(&config, std::slice::from_ref(&cert), &key, None, &endpoint).unwrap();
+            let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+            connector.cert_store_mut().add_cert(cert.clone()).unwrap();
+            connector.set_alpn_protos(b"\x02h2\x08http/1.1").unwrap();
+            let connector = connector.build();
+            let (server, client) = tokio::io::duplex(16 * 1024);
+            let (server, client) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(
+                    tokio_boring::accept(&tls.h2, server),
+                    tokio_boring::connect(connector.configure().unwrap(), &config.domain, client)
+                )
+            })
+            .await
+            .unwrap();
+            let server = server.unwrap();
+            let client = client.unwrap();
+            assert_eq!(server.ssl().selected_alpn_protocol(), Some(expected));
+            assert_eq!(client.ssl().selected_alpn_protocol(), Some(expected));
+            assert_eq!(
+                server.ssl().certificate().unwrap().to_der().unwrap(),
+                cert.to_der().unwrap()
+            );
+        }
+    }
 
     /// Exercise the actual boring/quiche ABI and link, not a dependency-tree
     /// assertion. This does not open a listener or test a QUIC handshake.

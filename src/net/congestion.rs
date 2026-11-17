@@ -8,15 +8,39 @@ pub(super) fn listen(
     address: std::net::SocketAddr,
     algorithm: TcpCongestion,
 ) -> Result<tokio::net::TcpListener> {
-    let socket = if address.is_ipv4() {
-        tokio::net::TcpSocket::new_v4()?
-    } else {
-        tokio::net::TcpSocket::new_v6()?
-    };
-    socket.set_reuseaddr(true)?;
-    apply_connecting(&socket, algorithm)?;
-    socket.bind(address)?;
-    Ok(socket.listen(1024)?)
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(address),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    // Never let an IPv6 wildcard silently claim the IPv4 listener. Explicit
+    // address-family ownership makes startup portable and avoids bind-order
+    // dependence when one process hosts both families on the same port.
+    if address.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    socket.set_reuse_address(true)?;
+    apply_socket(&socket2::SockRef::from(&socket), algorithm)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&address.into())?;
+    socket.listen(1024)?;
+    Ok(tokio::net::TcpListener::from_std(socket.into())?)
+}
+
+/// UDP follows the same explicit-family ownership as TCP. Do not enable
+/// SO_REUSEPORT: two endpoints must never accidentally split QUIC datagrams.
+pub(super) fn listen_udp(address: std::net::SocketAddr) -> Result<tokio::net::UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(address),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    if address.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    socket.set_nonblocking(true)?;
+    socket.bind(&address.into())?;
+    Ok(tokio::net::UdpSocket::from_std(socket.into())?)
 }
 
 pub(super) fn effective(algorithm: TcpCongestion) -> Result<String> {
@@ -155,6 +179,34 @@ pub(super) fn kernel_report() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn explicit_ipv6_tcp_does_not_claim_ipv4_port() {
+        let v6 = listen("[::]:0".parse().unwrap(), TcpCongestion::System).unwrap();
+        let port = v6.local_addr().unwrap().port();
+        let v4 = listen(([0, 0, 0, 0], port).into(), TcpCongestion::System).unwrap();
+        assert!(socket2::SockRef::from(&v6).only_v6().unwrap());
+        let _client = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        assert!(v4.accept().await.unwrap().1.is_ipv4());
+    }
+    #[tokio::test]
+    async fn explicit_ipv6_udp_does_not_claim_ipv4_port_and_duplicates_fail() {
+        let v6 = listen_udp("[::]:0".parse().unwrap()).unwrap();
+        let port = v6.local_addr().unwrap().port();
+        let v4 = listen_udp(([0, 0, 0, 0], port).into()).unwrap();
+        assert!(socket2::SockRef::from(&v6).only_v6().unwrap());
+        assert!(listen_udp(([0, 0, 0, 0], port).into()).is_err());
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(b"v4", (std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        let mut bytes = [0; 2];
+        let (len, from) = v4.recv_from(&mut bytes).await.unwrap();
+        assert_eq!(&bytes[..len], b"v4");
+        assert!(from.is_ipv4());
+    }
     #[test]
     fn kernel_versions_are_references_not_vendor_patch_attestations() {
         for (before, after, reference) in [

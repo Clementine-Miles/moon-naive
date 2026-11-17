@@ -27,21 +27,20 @@ use std::time::SystemTime;
 
 const DEFAULT_MAX_CACHE_LOCK_RETRIES: usize = 2;
 
-impl<SV, C, DS> HttpProxy<SV, C, DS>
+impl<SV, C> HttpProxy<SV, C>
 where
     C: custom::Connector,
-    DS: DownstreamSession,
 {
     // return bool: server_session can be reused, and error if any
     pub(crate) async fn proxy_cache(
         self: &Arc<Self>,
-        session: &mut Session<DS>,
-        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+        session: &mut Session,
+        ctx: &mut SV::CTX,
     ) -> Option<(bool, Option<Box<Error>>)>
     // None: continue to proxy, Some: return
     where
-        SV: ProxyHttp<DS> + Send + Sync + 'static,
-        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+        SV: ProxyHttp + Send + Sync + 'static,
+        SV::CTX: Send + Sync,
     {
         // Cache logic request phase
         if let Err(e) = self.inner.request_cache_filter(session, ctx) {
@@ -292,12 +291,12 @@ where
     // return bool: server_session can be reused, and error if any
     pub(crate) async fn proxy_cache_hit(
         &self,
-        session: &mut Session<DS>,
-        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+        session: &mut Session,
+        ctx: &mut SV::CTX,
     ) -> (bool, Option<Box<Error>>)
     where
-        SV: ProxyHttp<DS> + Send + Sync,
-        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
     {
         use range_filter::*;
 
@@ -471,7 +470,6 @@ where
                         match self
                             .inner
                             .response_body_filter(session, &mut body, end, ctx)
-                            .await
                         {
                             Ok(Some(duration)) => {
                                 trace!("delaying response for {duration:?}");
@@ -536,11 +534,11 @@ where
     pub(crate) fn downstream_response_conditional_filter(
         &self,
         use_cache: &mut ServeFromCache,
-        session: &Session<DS>,
+        session: &Session,
         resp: &mut ResponseHeader,
-        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+        ctx: &mut SV::CTX,
     ) where
-        SV: ProxyHttp<DS>,
+        SV: ProxyHttp,
     {
         // TODO: range
         let req = session.req_header();
@@ -571,12 +569,9 @@ where
 
     // TODO: cache upstream header filter to add/remove headers
 
-    async fn finish_miss_handler_best_effort(
-        &self,
-        session: &mut Session<DS>,
-        ctx: &<SV as ProxyHttp<DS>>::CTX,
-    ) where
-        SV: ProxyHttp<DS>,
+    async fn finish_miss_handler_best_effort(&self, session: &mut Session, ctx: &SV::CTX)
+    where
+        SV: ProxyHttp,
     {
         if let Err(e) = session.cache.finish_miss_handler().await {
             warn!(
@@ -589,14 +584,14 @@ where
 
     pub(crate) async fn cache_http_task(
         &self,
-        session: &mut Session<DS>,
+        session: &mut Session,
         task: &HttpTask,
-        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+        ctx: &mut SV::CTX,
         serve_from_cache: &mut ServeFromCache,
     ) -> Result<()>
     where
-        SV: ProxyHttp<DS> + Send + Sync,
-        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
     {
         if !session.cache.enabled() && !session.cache.bypassing() {
             return Ok(());
@@ -778,13 +773,13 @@ where
     // Return true if local cache should be used, false otherwise
     pub(crate) async fn revalidate_or_stale(
         &self,
-        session: &mut Session<DS>,
+        session: &mut Session,
         task: &mut HttpTask,
-        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+        ctx: &mut SV::CTX,
     ) -> bool
     where
-        SV: ProxyHttp<DS> + Send + Sync,
-        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
     {
         if !session.cache.enabled() {
             return false;
@@ -913,13 +908,13 @@ where
     // bool: can the downstream connection be reused
     pub(crate) async fn handle_stale_if_error(
         &self,
-        session: &mut Session<DS>,
-        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+        session: &mut Session,
+        ctx: &mut SV::CTX,
         error: &Error,
     ) -> Option<(bool, Option<Box<Error>>)>
     where
-        SV: ProxyHttp<DS> + Send + Sync,
-        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
     {
         // the caller might already checked this as an optimization
         if !session.cache.can_serve_stale_error() {
@@ -955,12 +950,12 @@ where
     // helper function to check when to continue to retry lock (true) or give up (false)
     fn handle_lock_wait_outcome(
         &self,
-        session: &mut Session<DS>,
-        ctx: &<SV as ProxyHttp<DS>>::CTX,
+        session: &mut Session,
+        ctx: &SV::CTX,
         outcome: LockWaitOutcome,
     ) -> bool
     where
-        SV: ProxyHttp<DS>,
+        SV: ProxyHttp,
     {
         debug!("cache unlocked {outcome:?}");
         match outcome {
@@ -1008,12 +1003,12 @@ where
 
     fn cache_lock_retry_limit_exceeded(
         &self,
-        session: &mut Session<DS>,
-        ctx: &<SV as ProxyHttp<DS>>::CTX,
+        session: &mut Session,
+        ctx: &SV::CTX,
         cache_lock_retries: &mut usize,
     ) -> bool
     where
-        SV: ProxyHttp<DS>,
+        SV: ProxyHttp,
     {
         *cache_lock_retries += 1;
         let max_retries = session

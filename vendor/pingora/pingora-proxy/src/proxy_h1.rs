@@ -25,21 +25,20 @@ use pingora_core::protocols::http::{
     v1::common::is_upgrade_req as is_h1_upgrade_req,
 };
 
-impl<SV, C, DS> HttpProxy<SV, C, DS>
+impl<SV, C> HttpProxy<SV, C>
 where
     C: custom::Connector,
-    DS: DownstreamSession,
 {
     pub(crate) async fn proxy_1to1(
         &self,
-        session: &mut Session<DS>,
+        session: &mut Session,
         client_session: &mut HttpSessionV1,
         peer: &HttpPeer,
-        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+        ctx: &mut SV::CTX,
     ) -> (bool, bool, Option<Box<Error>>)
     where
-        SV: ProxyHttp<DS> + Send + Sync,
-        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
     {
         client_session.read_timeout = peer.options.read_timeout;
         client_session.write_timeout = peer.options.write_timeout;
@@ -201,16 +200,16 @@ where
 
     pub(crate) async fn proxy_to_h1_upstream(
         &self,
-        session: &mut Session<DS>,
+        session: &mut Session,
         client_session: &mut HttpSessionV1,
         reused: bool,
         peer: &HttpPeer,
-        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+        ctx: &mut SV::CTX,
     ) -> (bool, bool, Option<Box<Error>>)
     // (reuse_server, reuse_client, error)
     where
-        SV: ProxyHttp<DS> + Send + Sync,
-        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
     {
         #[cfg(windows)]
         let raw = client_session.id() as std::os::windows::io::RawSocket;
@@ -261,8 +260,8 @@ where
         pipe_state: Arc<AtomicU8>,
     ) -> Result<bool>
     where
-        SV: ProxyHttp<DS> + Send + Sync,
-        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
     {
         let mut request_done = false;
         let mut response_done = false;
@@ -367,8 +366,8 @@ where
     #[allow(clippy::too_many_arguments)]
     async fn process_upstream_tasks(
         &self,
-        session: &mut Session<DS>,
-        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+        session: &mut Session,
+        ctx: &mut SV::CTX,
         initial_task: HttpTask,
         rx: &mut mpsc::Receiver<HttpTask>,
         serve_from_cache: &mut ServeFromCache,
@@ -376,8 +375,8 @@ where
         response_state: &mut ResponseStateMachine,
     ) -> Result<Option<bool>>
     where
-        SV: ProxyHttp<DS> + Send + Sync,
-        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
     {
         if serve_from_cache.should_discard_upstream() {
             // Serving the cached response and discarding the upstream one; nothing
@@ -448,10 +447,10 @@ where
     #[allow(clippy::too_many_arguments)]
     async fn proxy_handle_downstream(
         &self,
-        session: &mut Session<DS>,
+        session: &mut Session,
         tx: mpsc::Sender<HttpTask>,
         mut rx: mpsc::Receiver<HttpTask>,
-        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+        ctx: &mut SV::CTX,
         downstream_custom_message_writer: &mut Option<Box<dyn CustomMessageWrite>>,
         downstream_custom_message_reader: &mut Option<
             Box<dyn futures::Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>,
@@ -459,8 +458,8 @@ where
         pipe_state: Arc<AtomicU8>,
     ) -> Result<bool>
     where
-        SV: ProxyHttp<DS> + Send + Sync,
-        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
     {
         // setup custom message forwarding, if downstream supports it
         let (
@@ -854,16 +853,16 @@ where
 
     async fn h1_response_filter(
         &self,
-        session: &mut Session<DS>,
+        session: &mut Session,
         mut task: HttpTask,
-        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+        ctx: &mut SV::CTX,
         serve_from_cache: &mut ServeFromCache,
         range_body_filter: &mut RangeBodyFilter,
         from_cache: bool, // are the task from cache already
     ) -> Result<HttpTask>
     where
-        SV: ProxyHttp<DS> + Send + Sync,
-        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
     {
         // skip caching if already served from cache
         if !from_cache {
@@ -974,8 +973,7 @@ where
                 let mut data = range_body_filter.filter_body(data);
                 if let Some(duration) = self
                     .inner
-                    .response_body_filter(session, &mut data, end, ctx)
-                    .await?
+                    .response_body_filter(session, &mut data, end, ctx)?
                 {
                     trace!("delaying downstream response for {:?}", duration);
                     time::sleep(duration).await;
@@ -993,8 +991,7 @@ where
                 // range doesn't apply to upgraded body
                 if let Some(duration) = self
                     .inner
-                    .response_body_filter(session, &mut data, end, ctx)
-                    .await?
+                    .response_body_filter(session, &mut data, end, ctx)?
                 {
                     trace!("delaying downstream upgraded response for {:?}", duration);
                     time::sleep(duration).await;
@@ -1022,15 +1019,15 @@ where
     // TODO:: use this function to replace send_body_to2
     async fn send_body_to_pipe(
         &self,
-        session: &mut Session<DS>,
+        session: &mut Session,
         mut data: Option<Bytes>,
         end_of_body: bool,
         tx: mpsc::Permit<'_, HttpTask>,
-        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+        ctx: &mut SV::CTX,
     ) -> Result<bool>
     where
-        SV: ProxyHttp<DS> + Send + Sync,
-        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
     {
         // None: end of body
         // this var is to signal if downstream finish sending the body, which shouldn't be

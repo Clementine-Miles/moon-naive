@@ -1,7 +1,9 @@
 use super::*;
 use tokio::net::TcpStream;
 mod acme_live;
+mod differential;
 mod evolution;
+mod multi_device;
 mod website;
 use crate::acme::persist::DiskStore;
 use boring::{
@@ -215,8 +217,9 @@ pub(super) async fn network(f: &Fixture, target: Option<std::net::SocketAddr>) -
         redirect: None,
         app: Arc::new(app),
         tls: tls::Slot::load(&f.config).unwrap(),
-        tcp: TcpListener::bind("127.0.0.1:0").await.unwrap(),
-        udp: UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        tcp: Some(TcpListener::bind("127.0.0.1:0").await.unwrap()),
+        udp: Some(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+        additional: Vec::new(),
         connections: Budget::new(8).unwrap(),
         config: f.config.clone(),
         stats,
@@ -1922,6 +1925,8 @@ async fn ech_accepts_inner_name_and_preserves_plain_h2() {
         redirect_listener,
         f.config.clone(),
         Budget::new(2).unwrap(),
+        f.config.listener.tcp.port(),
+        super::rate::Rate::new(None).unwrap(),
         stop.subscribe(),
     ));
     for (host, status) in [

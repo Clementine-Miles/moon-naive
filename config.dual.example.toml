@@ -1,0 +1,102 @@
+# Complete two-endpoint deployment. Replace every credential/domain placeholder,
+# accept the CA terms explicitly, and install as a service-owned 0600 file.
+# See docs/PROJECT.md. This shares one certificate manager and one user database.
+domain = "proxy.example.dev"
+state_dir = "/var/lib/moon-naive"
+
+[proxy]
+# Optional administrator-owned private TOML (see acl.example.toml):
+# acl_file = "/etc/moon-naive/acl.toml"
+
+[[proxy.users]]
+username = "REPLACE_WITH_USERNAME"
+password = "REPLACE_WITH_A_LONG_RANDOM_PASSWORD"
+
+[website]
+origin = "http://127.0.0.1:8080"
+
+[acme]
+issuer = "google"
+environment = "production"
+contact = "operator@example.dev"
+dns_zone = "example.dev"
+accept_terms = false
+
+[acme.dns_credentials]
+apikey = "pk1_REPLACE_ME"
+secretapikey = "sk1_REPLACE_ME"
+
+[acme.eab]
+key_id = "REPLACE_WITH_GTS_EAB_KEY_ID"
+b64_mac_key = "dGVzdC10ZXN0LXRlc3QtdGVzdA"
+
+# Process-wide safety ceilings; endpoint budgets cannot bypass these.
+[limits]
+max_connections = 128
+max_streams = 100
+max_pending_requests = 100
+max_tunnels_per_user = 100
+max_total_receive_bytes = 67108864
+max_total_buffer_bytes = 67108864
+
+[[listeners]]
+name = "main"
+tcp = "0.0.0.0:443"
+udp = "0.0.0.0:443"
+h1 = true
+h2 = true
+h3 = true
+handshake_timeout_secs = 10
+# public_addresses = ["YOUR_PUBLIC_OR_NAT_IP"] # every externally routed self IP
+# bandwidth_bytes_per_sec = 8388608 # optional byte-rate policy, not flow control
+
+[listeners.limits]
+max_connections = 64
+max_streams = 50
+max_pending_requests = 50
+max_tunnels_per_user = 50
+max_early_data_bytes = 65536
+max_buffer_bytes_per_stream = 262144
+max_total_receive_bytes = 33554432
+max_total_buffer_bytes = 33554432
+connect_timeout_secs = 15
+idle_timeout_secs = 600
+graceful_timeout_secs = 300
+
+[listeners.flow]
+h2_stream_window = 65536
+h2_connection_window = 524288
+h3_stream_window = 16384
+h3_connection_window = 1048576
+
+[[listeners]]
+name = "secondary"
+tcp = "0.0.0.0:8443"
+udp = "0.0.0.0:8443"
+h1 = true
+h2 = true
+h3 = true
+handshake_timeout_secs = 10
+
+[listeners.limits]
+max_connections = 64
+max_streams = 50
+max_pending_requests = 50
+max_tunnels_per_user = 50
+max_early_data_bytes = 32768
+max_buffer_bytes_per_stream = 131072
+max_total_receive_bytes = 33554432
+max_total_buffer_bytes = 33554432
+connect_timeout_secs = 15
+idle_timeout_secs = 300
+graceful_timeout_secs = 300
+
+[listeners.flow]
+h2_stream_window = 32768
+h2_connection_window = 262144
+h3_stream_window = 8192
+h3_connection_window = 524288
+
+# For IPv6, use "[::]:443" / "[::]:8443"; each IPv6 socket is v6-only.
+# Add separate, uniquely named IPv4 endpoints for dual-family service.
+# Open BOTH TCP and UDP for each enabled public port; verify routing/firewalls.

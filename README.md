@@ -1,10 +1,10 @@
 # moon-naive
 
 **mona 0.7.0**：面向 Linux x86_64 的 Rust 服务端，使用 Pingora、BoringSSL 和 quiche，
-提供真实网站反代、认证 H2/H3 CONNECT 与普通 HTTP(S) 正向代理，内置 DNS-01 证书续期。
+提供多端口网站反代、认证 H2/H3 CONNECT 与普通 HTTP(S) 正向代理，内置 DNS-01 证书续期与文件 ACL。
 仅支持 [moon-naive 修订 4](docs/PROTOCOL.md)，不兼容官方 NaiveProxy；生产客户端尚未完成。
 
-需要 Rust 1.89+、C/C++、make、CMake、libclang、Perl、pkg-config；生产运行无需 Go/Python。
+需要 Rust 1.100+、C/C++、make、CMake、libclang、Perl、pkg-config；生产运行无需 Go/Python。
 
 ```sh
 cargo build --release --locked -p moon-naive
@@ -15,6 +15,8 @@ cargo build --release --locked -p moon-naive
 ```
 
 [项目手册](docs/PROJECT.md) 统一说明配置、组件与认证路由、证书恢复、部署、实验及许可。
-唯一配置模板是 [config.example.toml](config.example.toml)；state_dir 必须持久保存。
+单端口配置见 [config.example.toml](config.example.toml)，双端口见
+[config.dual.example.toml](config.dual.example.toml)，目的地策略见 [acl.example.toml](acl.example.toml)；
+state_dir 必须持久保存。端口共享全局安全额度，保留独立传输策略。
 开发入口：`cargo xtask verify`、`cargo xtask vectors --check`、`cargo xtask lab`。
 [验证与待办](docs/PROJECT.md#维护与验证记录) 区分已执行测试和未验收能力。许可证：[Apache-2.0](LICENSE)。

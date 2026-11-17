@@ -15,6 +15,9 @@ pub struct Config {
     pub state_dir: PathBuf,
     #[serde(default)]
     pub listener: Listener,
+    /// When nonempty replaces the legacy listener; limits remain global ceilings.
+    #[serde(default)]
+    pub listeners: Vec<Endpoint>,
     #[serde(default)]
     pub transport: Transport,
     #[serde(default)]
@@ -104,7 +107,7 @@ impl TcpCongestion {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Listener {
     /// Public/NAT frontend addresses not discoverable by binding a local socket.
@@ -132,11 +135,39 @@ impl Default for Listener {
         }
     }
 }
+/// Per-endpoint transport policy. Omitted limits inherit the global values;
+/// an explicit limits table uses the same bounded defaults as [limits].
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct Endpoint {
+    pub name: String,
+    #[serde(flatten)]
+    pub listener: Listener,
+    #[serde(default)]
+    pub limits: Option<Limits>,
+    #[serde(default)]
+    pub flow: FlowControl,
+    #[serde(default)]
+    pub bandwidth_bytes_per_sec: Option<u64>,
+    #[serde(default = "handshake_timeout")]
+    pub handshake_timeout_secs: u64,
+}
+fn handshake_timeout() -> u64 {
+    10
+}
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(default, deny_unknown_fields)]
+pub struct FlowControl {
+    pub h2_stream_window: Option<u32>,
+    pub h2_connection_window: Option<u32>,
+    pub h3_stream_window: Option<u32>,
+    pub h3_connection_window: Option<u32>,
+}
 fn https_listener() -> SocketAddr {
     SocketAddr::from(([0, 0, 0, 0], 443))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
     pub max_streams: usize,
@@ -297,6 +328,29 @@ pub enum Challenge {
 }
 
 impl Config {
+    pub fn effective_listeners(&self) -> Vec<Endpoint> {
+        if self.listeners.is_empty() {
+            vec![Endpoint {
+                name: "default".into(),
+                listener: self.listener.clone(),
+                limits: Some(self.limits.clone()),
+                flow: FlowControl::default(),
+                bandwidth_bytes_per_sec: None,
+                handshake_timeout_secs: 10,
+            }]
+        } else {
+            self.listeners
+                .iter()
+                .cloned()
+                .map(|mut endpoint| {
+                    if endpoint.limits.is_none() {
+                        endpoint.limits = Some(self.limits.clone());
+                    }
+                    endpoint
+                })
+                .collect()
+        }
+    }
     /// Return the configured canonical website name, never an arbitrary Host.
     pub fn site_name(&self, host: &str) -> Option<&str> {
         if host.eq_ignore_ascii_case(&self.domain) {
@@ -337,38 +391,67 @@ impl Config {
         if !crate::policy::valid_dns_name(&self.domain) || !self.domain.contains('.') {
             return Err("domain must be an ASCII DNS name (use punycode for IDNs)");
         }
-        if !self.listener.h2 || !self.listener.h3 {
-            return Err("both h2 and h3 are required");
+        if self.listeners.len() > 16 {
+            return Err("at most 16 listening endpoints are supported");
         }
-        if self.listener.tcp.port() == 0 || self.listener.udp.port() == 0 {
-            return Err("listener port cannot be zero");
+        let endpoints = self.effective_listeners();
+        let mut names = std::collections::HashSet::new();
+        for endpoint in &endpoints {
+            if endpoint.name.is_empty()
+                || endpoint.name.len() > 64
+                || !endpoint
+                    .name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+                || !names.insert(&endpoint.name)
+            {
+                return Err("listener names must be unique bounded ASCII identifiers");
+            }
+            let listener = &endpoint.listener;
+            if listener.public_addresses.len() > 256 {
+                return Err("at most 256 public addresses per listener");
+            }
+            if !(listener.h1 || listener.h2 || listener.h3)
+                || ((listener.h1 || listener.h2) && listener.tcp.port() == 0)
+                || (listener.h3 && listener.udp.port() == 0)
+            {
+                return Err("listener needs an enabled protocol and nonzero enabled ports");
+            }
+            if endpoint.handshake_timeout_secs == 0
+                || endpoint.handshake_timeout_secs > 300
+                || endpoint
+                    .bandwidth_bytes_per_sec
+                    .is_some_and(|n| !(1024..=1_000_000_000_000).contains(&n))
+            {
+                return Err("invalid listener handshake timeout or bandwidth limit");
+            }
+            if listener.http_redirect.is_some_and(|a| {
+                a.port() == 0 || a == listener.tcp || !(listener.h1 || listener.h2)
+            }) {
+                return Err("invalid HTTP redirect listener");
+            }
+            validate_limits(endpoint.limits.as_ref().expect("effective limits"))?;
+            TransportProfile::for_endpoint(self, endpoint)?;
         }
-        let l = &self.limits;
-        if l.max_streams == 0
-            || l.max_streams > 1024
-            || u32::try_from(l.max_streams).is_err()
-            || l.max_connections == 0
-            || l.max_connections > 4096
-            || l.max_pending_requests == 0
-            || l.max_pending_requests > 4096
-            || l.max_tunnels_per_user == 0
-            || l.max_tunnels_per_user > 4096
-            || l.max_early_data_bytes == 0
-            || l.max_early_data_bytes > 1024 * 1024
-            || l.max_buffer_bytes_per_stream < l.max_early_data_bytes
-            || l.max_buffer_bytes_per_stream > 4 * 1024 * 1024
-            || l.max_buffer_bytes_per_stream < 16 * 1024
-            || l.max_total_receive_bytes < 65_535
-            || l.max_total_receive_bytes > 1024 * 1024 * 1024
-            || l.max_total_buffer_bytes < 2 * 16 * 1024
-            || l.max_total_buffer_bytes > 1024 * 1024 * 1024
-            || l.connect_timeout_secs == 0
-            || l.idle_timeout_secs == 0
-            || l.idle_timeout_secs.checked_mul(1000).is_none()
-            || l.graceful_timeout_secs == 0
-        {
-            return Err("invalid or unbounded resource limits");
+        // Exact duplicate and wildcard overlap are configuration errors. IPv6
+        // sockets are explicitly v6-only, so v4/v6 equal ports may coexist.
+        for (i, a) in endpoints.iter().enumerate() {
+            for b in &endpoints[i + 1..] {
+                let overlap = |x: SocketAddr, y: SocketAddr| {
+                    x.port() == y.port()
+                        && x.is_ipv4() == y.is_ipv4()
+                        && (x.ip() == y.ip() || x.ip().is_unspecified() || y.ip().is_unspecified())
+                };
+                if ((a.listener.h1 || a.listener.h2)
+                    && (b.listener.h1 || b.listener.h2)
+                    && overlap(a.listener.tcp, b.listener.tcp))
+                    || (a.listener.h3 && b.listener.h3 && overlap(a.listener.udp, b.listener.udp))
+                {
+                    return Err("overlapping listening endpoints");
+                }
+            }
         }
+        validate_limits(&self.limits)?;
         let a = &self.acme;
         if !a.enabled
             || a.dns_provider.is_empty()
@@ -456,10 +539,16 @@ impl Config {
             }
         }
         self.proxy.validate()?;
-        if self
-            .listener
-            .http_redirect
-            .is_some_and(|a| a.port() == 0 || a == self.listener.tcp)
+        if self.proxy.acl_file.as_ref().is_some_and(|p| {
+            !p.is_absolute() || p.components().any(|c| c == std::path::Component::ParentDir)
+        }) {
+            return Err("ACL path must be absolute without parent traversal");
+        }
+        if self.listeners.is_empty()
+            && self
+                .listener
+                .http_redirect
+                .is_some_and(|a| a.port() == 0 || a == self.listener.tcp)
         {
             return Err("invalid HTTP redirect listener");
         }
@@ -606,8 +695,6 @@ mod tests {
     #[test]
     fn rejects_unknown_keys_retired_toggles_and_unbounded_settings() {
         for extra in [
-            "[listener]\nh2=false",
-            "[listener]\nh3=false",
             "[listener]\nfast_open=false",
             "[listener]\nzero_rtt=true",
             "[limits]\nmax_streams=0",
@@ -641,6 +728,8 @@ mod tests {
 #[derive(Debug, Default, Deserialize, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct Proxy {
+    #[serde(default)]
+    pub acl_file: Option<PathBuf>,
     pub users: Vec<User>,
     pub upstream: Option<ProxyUpstream>,
     pub forward: Forward,
@@ -813,36 +902,61 @@ pub struct TransportProfile {
     stream_window: u32,
     connection_window: u32,
     quic_congestion: QuicCongestion,
+    h3_connection_window: u32,
+    h3_stream_window: u32,
 }
 
 impl TransportProfile {
     pub fn from_config(config: &Config) -> Result<Self, &'static str> {
         config.validate()?;
-        let limits = &config.limits;
-        let idle_timeout_ms = limits
-            .idle_timeout_secs
-            .checked_mul(1000)
-            .ok_or("idle timeout overflows milliseconds")?;
-        let max_streams =
-            u32::try_from(limits.max_streams).map_err(|_| "max_streams exceeds transport range")?;
-        let stream_window = u32::try_from(limits.max_buffer_bytes_per_stream)
-            .map_err(|_| "stream window exceeds transport range")?;
-        // Keep connection-level flow control bounded even at high stream counts.
-        // These are wire credits, not a substitute for application memory permits.
-        // Reserve the entire non-revocable rolling credit for the connection's
-        // lifetime, including after authenticated streams finish. Divide the
-        // configured budget across connection slots instead of reserving 16 MiB
-        // unconditionally. H2's initial connection credit cannot be reduced.
+        let endpoint = config.effective_listeners().remove(0);
+        Self::for_endpoint(config, &endpoint)
+    }
+    pub fn for_endpoint(config: &Config, endpoint: &Endpoint) -> Result<Self, &'static str> {
+        let limits = endpoint.limits.as_ref().unwrap_or(&config.limits);
+        validate_limits(limits)?;
+        let max_streams = limits.max_streams as u32;
+        let stream_window = endpoint
+            .flow
+            .h2_stream_window
+            .unwrap_or(limits.max_buffer_bytes_per_stream as u32);
         let fair_share = (limits.max_total_receive_bytes / limits.max_connections)
             .clamp(65_535, 16 * 1024 * 1024);
-        let connection_window = (u64::from(stream_window) * u64::from(max_streams))
-            .clamp(65_535, fair_share as u64) as u32;
+        let connection_window = endpoint.flow.h2_connection_window.unwrap_or(
+            (u64::from(stream_window) * u64::from(max_streams)).clamp(65_535, fair_share as u64)
+                as u32,
+        );
+        let h3_connection_window = endpoint
+            .flow
+            .h3_connection_window
+            .unwrap_or(connection_window);
+        let reserve = (h3_connection_window / 4).min(64 * 1024);
+        let h3_stream_window = endpoint.flow.h3_stream_window.unwrap_or(
+            stream_window.min(h3_connection_window.saturating_sub(reserve) / max_streams),
+        );
+        if stream_window == 0
+            || stream_window as usize > limits.max_buffer_bytes_per_stream
+            || !(65_535..=16 * 1024 * 1024).contains(&connection_window)
+            || connection_window as usize > limits.max_total_receive_bytes
+            || connection_window as usize > config.limits.max_total_receive_bytes
+            || !(65_535..=16 * 1024 * 1024).contains(&h3_connection_window)
+            || h3_connection_window as usize > limits.max_total_receive_bytes
+            || h3_connection_window as usize > config.limits.max_total_receive_bytes
+            || h3_stream_window == 0
+            || h3_stream_window as usize > limits.max_buffer_bytes_per_stream
+            || u64::from(h3_stream_window) * u64::from(max_streams) + u64::from(reserve)
+                > u64::from(h3_connection_window)
+        {
+            return Err("flow-control windows exceed endpoint receive or stream budgets");
+        }
         Ok(Self {
-            idle_timeout_ms,
+            idle_timeout_ms: limits.idle_timeout_secs * 1000,
             max_streams,
             stream_window,
             connection_window,
             quic_congestion: config.transport.quic_congestion,
+            h3_connection_window,
+            h3_stream_window,
         })
     }
     pub fn idle_timeout_ms(&self) -> u64 {
@@ -857,11 +971,13 @@ impl TransportProfile {
     /// Bound aggregate stalled request DATA so control/QPACK can still progress.
     /// These are transport credits; application authentication never owns them.
     pub fn h3_control_reserve(&self) -> u32 {
-        (self.connection_window / 4).min(64 * 1024)
+        (self.h3_connection_window / 4).min(64 * 1024)
     }
     pub fn h3_stream_window(&self) -> u32 {
-        self.stream_window
-            .min((self.connection_window - self.h3_control_reserve()) / self.max_streams)
+        self.h3_stream_window
+    }
+    pub fn h3_connection_window(&self) -> u32 {
+        self.h3_connection_window
     }
     pub fn connection_window(&self) -> u32 {
         self.connection_window
@@ -916,5 +1032,83 @@ mod profile_tests {
         config.limits.idle_timeout_secs = 600;
         config.limits.max_streams = usize::MAX;
         assert!(TransportProfile::from_config(&config).is_err());
+    }
+}
+
+fn validate_limits(l: &Limits) -> Result<(), &'static str> {
+    if l.max_streams == 0
+        || l.max_streams > 1024
+        || u32::try_from(l.max_streams).is_err()
+        || l.max_connections == 0
+        || l.max_connections > 4096
+        || l.max_pending_requests == 0
+        || l.max_pending_requests > 4096
+        || l.max_tunnels_per_user == 0
+        || l.max_tunnels_per_user > 4096
+        || l.max_early_data_bytes == 0
+        || l.max_early_data_bytes > 1024 * 1024
+        || l.max_buffer_bytes_per_stream < l.max_early_data_bytes
+        || l.max_buffer_bytes_per_stream > 4 * 1024 * 1024
+        || l.max_buffer_bytes_per_stream < 16 * 1024
+        || l.max_total_receive_bytes < 65_535
+        || l.max_total_receive_bytes > 1024 * 1024 * 1024
+        || l.max_total_buffer_bytes < 2 * 16 * 1024
+        || l.max_total_buffer_bytes > 1024 * 1024 * 1024
+        || l.connect_timeout_secs == 0
+        || l.idle_timeout_secs == 0
+        || l.idle_timeout_secs.checked_mul(1000).is_none()
+        || l.graceful_timeout_secs == 0
+    {
+        return Err("invalid or unbounded resource limits");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+    const SAMPLE: &str = include_str!("../../config.example.toml");
+    #[test]
+    fn legacy_and_explicit_protocol_subsets_validate_without_enabling_disabled_sockets() {
+        let legacy = Config::parse(&format!("{SAMPLE}\n[listener]\nh2=false\nh3=false\n")).unwrap();
+        assert!(legacy.effective_listeners()[0].listener.h1);
+        let endpoints=Config::parse(&format!("{SAMPLE}\n[[listeners]]\nname='web'\ntcp='127.0.0.1:8443'\nh2=false\nh3=false\n[[listeners]]\nname='quic'\nudp='[::1]:9443'\nh1=false\nh2=false\n")).unwrap();
+        assert_eq!(endpoints.effective_listeners().len(), 2);
+        assert!(!endpoints.effective_listeners()[0].listener.h3);
+        assert!(!endpoints.effective_listeners()[1].listener.h2);
+        assert!(
+            Config::parse(&format!(
+                "{SAMPLE}\n[listener]\nh1=false\nh2=false\nh3=false\n"
+            ))
+            .is_err()
+        );
+    }
+    #[test]
+    fn duplicate_names_overlapping_binds_and_bad_policy_fail_offline() {
+        for suffix in [
+            "[[listeners]]\nname='one'\n[[listeners]]\nname='one'\ntcp='127.0.0.1:9443'\nudp='127.0.0.1:9443'",
+            "[[listeners]]\nname='one'\n[[listeners]]\nname='two'\ntcp='127.0.0.1:443'\nudp='127.0.0.1:9443'",
+            "[[listeners]]\nname='one'\nunknown=1",
+            "[[listeners]]\nname='one'\nhandshake_timeout_secs=0",
+            "[[listeners]]\nname='one'\nbandwidth_bytes_per_sec=1",
+            "[[listeners]]\nname='one'\nh1=false\nh2=false\nhttp_redirect='127.0.0.1:8080'",
+        ] {
+            assert!(
+                Config::parse(&format!("{SAMPLE}\n{suffix}\n")).is_err(),
+                "{suffix}"
+            );
+        }
+    }
+    #[test]
+    fn receive_windows_cannot_exceed_endpoint_or_global_budget() {
+        let mut config = Config::parse(SAMPLE).unwrap();
+        let mut endpoint: Endpoint = toml::from_str(
+            "name='one'\n[flow]\nh2_connection_window=131072\nh3_connection_window=131072\n",
+        )
+        .unwrap();
+        endpoint.limits = Some(config.limits.clone());
+        config.limits.max_total_receive_bytes = 65535;
+        config.listeners = vec![endpoint];
+        assert!(config.validate().is_err());
     }
 }

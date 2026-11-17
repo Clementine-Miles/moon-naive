@@ -3,7 +3,8 @@
 0.7.0，Linux x86_64 服务端。canonical 协议名 **moon-naive**，简称 **mona**；
 只实现修订 4，不兼容官方 NaiveProxy。生产客户端留待后续，导入的 Chromium/Android
 客户端仍属实验。协议字段与 framing 的唯一权威是 [协议规范](PROTOCOL.md)，
-配置字段与默认值以 [config.example.toml](../config.example.toml) 和配置校验为准。
+配置字段与默认值以 [单端口示例](../config.example.toml)、
+[双端口示例](../config.dual.example.toml) 和配置校验为准。
 
 - [运行与配置](#运行与配置)
 - [组件与路由](#组件与路由)
@@ -14,7 +15,7 @@
 
 ## 运行与配置
 
-构建需要 Rust 1.89+（验证使用 1.94）、C/C++、make、CMake、libclang、Perl、
+构建需要 Rust 1.100+（验证使用 1.100）、C/C++、make、CMake、libclang、Perl、
 pkg-config、Git 和系统 CA。BoringSSL 使用原生工具链；普通构建不需要 Go 或 Python 实验依赖。
 
 ```sh
@@ -34,6 +35,58 @@ moon-naive serve /etc/moon-naive/config.toml
 域名 A/AAAA 必须指向实际可达地址；不可达 IPv6 不应发布 AAAA。源站不要指回本站，
 NAT/无法从接口推导的本机公网地址应显式配置以防自反代。DNS-01 无需开放 80；程序
 只管理挑战 TXT，不替操作者管理 A/AAAA、NS 或 CAA。
+
+### 多端口与资源边界
+
+旧 schema 1/2 的 `[listener]`、`[limits]` 配置继续有效，默认仍为 TCP/UDP 443。
+显式多端口使用 `[[listeners]]` 数组，也可只定义一项。数组存在时完全替代旧 `[listener]`
+（包括旧表的 public_addresses）；迁移时把需要的字段移到端点，不要保留相互冲突的两套配置。
+每项有唯一 ASCII `name`，最多 16 项，分别指定 `tcp`、`udp`、`h1`、`h2`、`h3`。
+禁用某协议就不绑定对应传输；H1 仅提供网站，不接受通用代理认证。
+IPv6 写作 `"[::]:443"`，IPv6 socket 明确 v6-only；要同时服务 IPv4/IPv6，添加两个
+不同名称、不同地址族的端点。确切重复、同族 wildcard 重叠及实际占用的端口不能启动。
+所有 socket 绑定成功后才进入服务；部分失败不会留下可用但配置不完整的监听器。
+
+完整可解析示例分别见上面两个文件。双端口示例保留 443，另开 8443，同一进程管理一份
+用户、ACME/DNS 状态和证书，复用网站及下一跳连接池。没有跨端口负载均衡，也不按来源
+IP 限制一个用户的设备数。为降低风险，先运行 `check-config` 和 `check`，再重启切换；
+监听地址、ACL、额度变更均需要重启，证书/ECH 热加载机制继续工作。
+
+| 配置 | 含义 |
+| --- | --- |
+| 顶层 `[limits]` | 全进程连接、H2/H3 流/待处理请求、隧道、用户及字节安全上限 |
+| `[listeners.limits]` | 端点本地额度及 connect/idle/graceful timeout；仍受全局限制 |
+| `listeners.handshake_timeout_secs` | 入站握手期限，默认 10 秒 |
+| `[listeners.flow]` | 独立 `h2_stream_window`、`h2_connection_window`、`h3_stream_window`、`h3_connection_window`，单位字节 |
+| `listeners.public_addresses` | 本端口使用的公网/NAT 地址；所有端点地址共同进入强制自连接拒绝集合 |
+
+省略整个端点 limits 表时继承顶层值；出现该表时，未写字段使用 `Limits` 的标准默认值，
+而不是逐字段合并顶层。建议按完整双端口示例显式填写重要额度。省略窗口字段时按端点额度
+计算有界默认值。H2 连接窗口不能小于 65535；H3 为控制/QPACK 留出预算，要求流窗口与
+最大流数量的乘积加保留额不超过连接窗口。提高窗口会占用不可提前归还的接收信用，
+不是“提速开关”。应用缓冲池与传输信用分开计账；多个端口不能分别花掉同一份全局预算。
+一个端口本地饱和不消耗其他端口的本地额度，但全局安全上限仍可能使所有端口拒绝新任务。
+普通转发缓存仍按用户和 origin 在全局最多保留 128 个闲置源站条目，每条最多持有
+16 个端点视图；视图复用底层连接池但使用端口自己的缓冲和超时。全局淘汰会同时
+释放闲置视图，已进行的请求持有自己的池租约，结束后归还，不因淘汰中断。
+`max_streams` 和待处理请求额度用于多路复用的 H2/H3；H1 不提供流多路复用，
+每个连接同时至多一个网站请求，受全局/端点 `max_connections` 约束，不额外宣称
+H1 有相同的流/排队额度。按网站并发需求同时配置连接数，不只修改 max_streams。
+
+可选 `listeners.bandwidth_bytes_per_sec` 是端点级实际字节速率，不是窗口：上传和下载
+各有一个桶，由该端点所有 TCP/UDP 会话共享，最多 16 KiB 初始/空闲突发；省略则不限速。
+范围 1024..1000000000000 字节/秒。TCP 在 TLS 外层调度，握手和网站流量也计入；
+QUIC 发送使用有界定时调度，入站超额数据报丢弃，由传输重传/背压恢复，不在 UDP
+驱动内部睡眠。极低速率会延长握手及触发空闲期限，应与超时一起配置和测量。
+这不是按 IP 的设备限制，也不承诺端口内部每个连接的公平份额。
+
+每个端口的 Alt-Svc 必须指向该端口启用的 UDP/H3 端点；禁用 H3 时不广告它。
+服务只能检查本地配置，无法证明公网防火墙、NAT 或运营商 UDP 路径可达。按每个端点实际
+开放 TCP/UDP，不要把未映射的内部 UDP 端口暴露到公网广告中。QUIC active migration
+保持禁用；不以实验性 CID 路由或迁移功能掩盖实现差异。
+
+SIGTERM 停止所有端点接收新连接/流，按配置排空后释放资源；服务管理器停止期限应覆盖
+最大的 graceful timeout 与控制面清理时间。部署单元仍是一个服务，无需数据库或控制面服务。
 
 ### 网站、正向代理与下一跳
 
@@ -56,8 +109,53 @@ NAT/无法从接口推导的本机公网地址应显式配置以防自反代。D
   HTTP/HTTPS/SOCKS5 下一跳保留各自认证/TLS 校验，失败不静默回退直连；
   不通过远端 DNS 绕过本地目标检查。
 
-完整字段和默认值直接修改唯一配置示例；下方仅保留可执行的局部路由示例。
+完整字段和默认值直接参照配置示例；下方仅保留可执行的局部路由示例。
 `moon-naive check-transport CONFIG` 可查看实际传输窗口与参数。
+
+### 文件目的地 ACL
+
+在主配置添加：
+
+```toml
+[proxy]
+acl_file = "/etc/moon-naive/acl.toml"
+```
+
+若已有 `[proxy]`，把字段加入原表，不要重复建表。文件必须为服务用户可读的私有 regular
+file（0600），使用现有安全文件读取路径；拒绝最终组件符号链接、非私有权限、FIFO、
+超大或无效内容。路径必须绝对且不含 `..`。上限 256 KiB、4096 条规则，每条最多 128
+个端口范围；错误会阻止启动，不会回退为放行。父目录必须由可信管理员控制。
+`check-config` 只解析主配置，不读取外部 ACL；`check` 会加载并验证全部外部策略。
+
+[acl.example.toml](../acl.example.toml) 是完整文件示例。格式为 `default = "allow"` 或
+`"deny"` 和有序 `[[rules]]`，配置文件省略 default 时为 deny。每条规则有必需的
+`action = "allow"`/`"deny"`，以及零个或一个选择器：
+
+| 选择器 | 匹配 |
+| --- | --- |
+| `domain = "example.org"` | 精确 ASCII DNS 名，大小写无关 |
+| `suffix = "example.org"` | 域本身和标签边界内的子域，不匹配 notexample.org |
+| `ip = "1.1.1.1"` | 具体 IPv4/IPv6 地址 |
+| `cidr = "2606:4700::/32"` | 规范网络地址；拒绝带 host bits 的 CIDR |
+| 无选择器 | 任何目标，可只限定端口 |
+
+`ports = ["443", "8000-8080"]` 为可选的闭区间并集；省略或空数组匹配所有非零目标端口。
+不支持通配符、Unicode 域名、尾随点或脚本；IDN 先转 punycode。IPv4-mapped IPv6
+按 IPv4 规范化；mapped CIDR 前缀必须至少为 96。未知字段、反向范围、零端口均无效。
+
+规则按文件顺序，第一个匹配“原始目标名 + 目标端口 + 本次具体 IP 候选”的规则决定结果，
+未命中才用 default。按 CIDR 拒绝的规则应放在宽泛域名放行之前。DNS 前可确定的拒绝会
+提前执行；涉及先前 IP 规则时延迟到解析候选后判定，避免改变 first-match 语义。
+每次解析出的每个候选都再次检查；只能拨经验证的具体地址，下一跳 HTTP/HTTPS/SOCKS5
+不能要求远端重新解析原域名来绕过检查。缓存的普通转发池也保留原目标身份及检查路径。
+被配置的外部下一跳仍是管理信任边界：本地只能验证交给它的具体地址，不能证明其内部
+路由、NAT 或转发实现遵守该地址；部署网络仍须限制敏感服务的可达性。
+
+ACL 对认证 CONNECT 和普通 HTTP(S) 正向转发一致生效；所有端口共享同一不可变策略。
+未认证流量仍不能访问任意目标。固定配置的网站源站使用独立的管理信任策略，不受代理
+目的地 ACL 控制。强制的私网、特殊用途、本机接口、所有 listener 和显式公网/NAT 自地址
+拒绝先于任何 allow，ACL 不能提供私网例外。未配置 ACL 时保留原有的公共目标 IP 策略，
+并不等于关闭强制检查。当前不热加载 ACL；原子替换文件后重启，失败启动不激活残缺策略。
 
 ### 网站路由示例
 
@@ -103,7 +201,7 @@ Cloudflare 使用有该 zone TXT 管理权限的 token。委派/CNAME 不支持�
 
 ## 组件与路由
 
-### 当前组件与所有权（2026-11-12）
+### 当前组件与所有权（2026-11-17）
 
 生产交付是一个 Rust `moon-naive` 服务进程。数据面使用 Tokio 多线程异步运行时；
 ACME/DNS 控制面在同进程的独立 OS 线程和单线程 Tokio runtime 上运行，避免控制面
@@ -111,18 +209,18 @@ ACME/DNS 控制面在同进程的独立 OS 线程和单线程 Tokio runtime 上�
 
 | 组件 | 实际职责与边界 |
 | --- | --- |
-| `core/src` | 配置、每流认证、能力协商、记录编解码、入口分派、目标地址策略；纯 Rust 协议逻辑，不负责拨号或证书 IO |
+| `core/src` | 配置、纯规则 ACL、每流认证、能力协商、记录编解码、入口分派、目标地址策略；纯 Rust 协议逻辑，不负责拨号或证书 IO |
 | `src/net/h2.rs` | TCP/TLS 接入，Pingora H2 session 适配；未协商 H2 时按配置提供 H1 网站入口 |
 | `src/net/h3.rs` | UDP/QUIC/H3 接入、quiche 驱动、流状态和传输信用；H3 自带 TLS 1.3 |
-| `src/net/mod.rs` | 共享 App、认证后路由决策与准入；并非另一个公网代理服务 |
+| `src/net/mod.rs` | 端点 App 视图、共享认证与上游状态、事务式绑定/关闭和认证后准入 |
 | `src/net/site` | Pingora 网站/普通正向代理、固定源站池、头部清理、流式响应、压缩与 WebSocket；H3 网站/正向请求通过有界内存 H2 bridge 复用 Pingora，不另开公网 H2 端口 |
 | `src/net/tunnel.rs` | mona CONNECT 的双向字节流、填充记录、背压、半关闭与空闲期限；普通网站和 WebSocket 不用该记录格式 |
 | `src/net/egress.rs`、`src/resolve.rs` | 有界解析和拨号、具体 IP 候选检查、本机接口检查、HTTP/HTTPS/SOCKS5 下一跳；配置下一跳失败不会静默改为直连 |
-| `resources.rs`、`forward_cache.rs` | 全局/用户/连接与缓冲额度；按用户和 origin 隔离的 128 项 LRU、惰性 300 秒 TTL 和单次初始化，初始化不持有全局缓存锁 |
+| `resources.rs`、`forward_cache.rs` | 全局/端点/用户/连接及字节分层额度；按用户和 origin 共享上游池，端点保留独立缓冲/超时视图，缓存有界，初始化不持有全局缓存锁 |
 | `src/net/tls.rs`、`src/trust.rs` | BoringSSL TLS/ECH、信任根、不可变 TLS generation；旧连接保留旧代，新代验证后原子替换 |
 | `src/acme` | instant-acme 的 JWS/nonce/EAB/订单协议，加 Rust DNS provider、持久 journal、证书安装和私有健康诊断；发布证书、网络加载和写状态文件是不同事实 |
 | `src/runtime.rs`、`src/cli.rs` | 启动、readiness、控制线程、SIGTERM 排空、本地配置/证书运维命令 |
-| `tools/xtask` | Rust 验证、依赖/源码审计和按提交打包；Rust 独立生成向量并编排实验；Python 仅用于抓包密码验证 |
+| `tools/xtask` | Rust 验证、依赖/源码审计、打包、独立向量、Caddy 跨栈差异报告及实验编排；Python 仅用于抓包密码验证 |
 | `client/naiveproxy` | 导入的 C++/Chromium 与 Kotlin Android 实验客户端，不进入服务端 Cargo 构建；不是已验收的生产客户端 |
 
 ### 未认证与已认证流量怎样走
@@ -173,7 +271,8 @@ Python 仅保留独立抓包/密码分析和导入实验客户端的准备脚本
 `rustls-pki-types` 用于证书/密钥数据类型，不等于启用 Rustls TLS 后端；native audit 验证所选后端。
 
 **生产运行、普通 Cargo 构建、默认 `cargo test --workspace` 和现有默认 CI 都不依赖 Go。**
-唯一有意保留的 Go 相关部分是可选的真实 ACME 实验：仓库外 Pebble/challtestsrv 测试 CA 和
+Go 相关的独立参考程序只用于可选实验：仓库外 Pebble/challtestsrv 测试 CA，以及下面的固定版 Caddy HTTPS 参考服务器。
+真实 ACME 实验使用 Pebble/challtestsrv 和
 仓库内 129 行 `tools/pebble.patch`，Rust 的 cfg(test) 夹具调用这些外部测试进程。
 它们不会链接进或随服务端启动，不是生产 sidecar。构建该 CA 及记录其 Go 构建信息需要 Go。
 完整 `cargo xtask lab` 默认包括 Pebble；不使用 Go 时选择普通 workspace 测试或
@@ -276,6 +375,52 @@ Pebble 固定 `d52948ce25e7c1576bcd18ff0e20a1c24ec7c44b`，在外部 checkout �
 Go 源码和二进制不放入产品仓库。已有测试二进制可直接提供；无 Go 时基线记录构建信息不可用，
 仍保留二进制摘要，不跳过协议/密码验证。实验不需要公网 DNS 凭据或生产签发。
 
+### 独立 HTTPS 差异实验
+
+`cargo xtask differential` 比较 Moon 与普通 Caddy 网站；参考栈为 Go TLS/HTTP/QUIC，
+不使用 Moon 作为自己的唯一判定器，不需要 Docker。两者使用相同临时证书链和固定 loopback
+网站源站，关闭 Caddy admin 和自动公网证书。默认 CI 只执行纯本地回归与报告器测试；
+独立参考矩阵通过手动 CI 的 `differential` 输入或下面命令运行，不需要生产凭据、公共 DNS
+或受信公网证书。测试客户端不是生产客户端的实现。
+
+```sh
+cargo xtask differential-fetch /tmp/moon-caddy-reference-UNIQUE
+cargo xtask differential \
+  --caddy /tmp/moon-caddy-reference-UNIQUE/caddy \
+  --run /tmp/moon-https-differential-UNIQUE
+```
+
+参考固定为 Caddy v2.10.2 的官方 Linux x86_64 二进制；fetch 检查固定 archive SHA-512 和
+executable SHA-256，运行时再次检查二进制与版本。报告目录必须全新、绝对路径且在源码树外。
+其他平台不能悄悄替换为不同构建的参考程序。`result.json` 和 `summary.md` 记录参考版本、
+摘要、可公开配置 identity、环境、协议、case、重复次数、响应形状和可观察的传输结果。
+来源目录内只有实验结束且门槛通过后才生成成功结果；执行失败与未测项目不能记作通过。
+
+H1/H2/H3 分别运行。普通网站、缺失/错误/重复认证、CONNECT 与无效请求的状态、
+响应头、body 长度/摘要、复用、流/连接结束行为均作为独立观测；有效认证 CONNECT
+和错误连接/stream 绑定也独立检查，未认证 case 必须零代理拨号。H2 原始帧检查
+SETTINGS、ACK 和非法帧错误；H3 记录 SETTINGS 和 QUIC transport parameters，
+包括 active migration 保持禁用。畸形 pseudo-header 的 transport rejection 与有效
+HTTP 请求认证失败后的普通网站路由分开记录。不能仅凭相同状态码断言行为相同。
+
+每个差异包含类别、严重性、预期/需审查分类、重复观察及证据。证书/TLS/压缩/服务器实现
+的稳定差异仍然可能形成指纹；Date、端口和计时等动态字段按报告器明确的规则处理，不能
+把全部 header 差异概括成“正常”。少量 loopback 时间样本只作描述，不是互联网计时分布
+或不可区分性证明。已包含一次 UDP 丢包、50ms 延迟和重复包的有界客户端实验；这不是内核网络路径仿真。
+报告的 `unmeasured` 明确列出尚未覆盖的握手语料、真实网络丢包/延迟、
+NAT/CID/迁移、拥塞/重传、HPACK/QPACK 轨迹和大型重置风暴等昂贵实验。
+
+可选 `--tcpdump /path/to/tcpdump --tshark /path/to/tshark` 捕获并离线检查 loopback
+加密传输，需操作者提供已获准的抓包能力。不会写 TLS key log、私钥、用户密码或认证
+proof；不解密应用流量。临时私钥仅存在测试临时目录，结束后删除。CI 只上传安全 JSON
+和 Markdown，不上传原始抓包。任何观察都不构成“代理不可检测”的保证。
+
+2026-11-17 的 [可读报告](reports/https-differential-2026-11-17.md) 与
+[结构化代表性证据](reports/https-differential-2026-11-17.json) 记录最终代码的实际运行：
+510 次观测，H1/H2/H3/TLS 分别 10/33/34/8 个独立 case，每端重复三次，
+无效观测、仅客户端拒绝和探针超时均为零。396 项字段差异并不是 396 个独立缺陷；
+稳定实现差异仍需审查。报告不是网络环境泛化或生产部署验收。
+
 性能显式运行：
 
 ```sh
@@ -302,8 +447,8 @@ dist/check-elf 当前要求 x86_64-linux-musl 静态包；普通 glibc 构建不
 检查归档内容和 SHA256SUMS；摘要证明快照完整性，不证明运行正确性或独立真实性。
 发布、生产部署、CA/DNS 变更与 merge 需对应授权。
 
-依赖 pin：Pingora `4487f7b2`、quiche `925b2258`、instant-acme `4a9b80fd`；BoringSSL
-binding boring/boring-sys 5.2.0。精确 rev 在 Cargo.toml/lock；生产 feature 禁用额外 TLS 后端。
+依赖 pin：Pingora `f86ffda5`、quiche `7ccccc7b`、instant-acme `1909bed8`；BoringSSL
+binding boring/boring-sys 5.5.0。精确 rev 在 Cargo.toml/lock；生产 feature 禁用额外 TLS 后端。
 定制行为与出处见 [Pingora 补丁记录](../vendor/pingora/MOON-NAIVE-PATCHES.md) 和
 [instant-acme 补丁记录](../vendor/instant-acme/MOON-PATCH.md)，修改 vendor 时更新其摘要。
 
@@ -315,6 +460,26 @@ musl v1.2.5 COPYRIGHT 来自 tagged ifduyue/musl mirror；GCC 14/libstdc++ 与 r
 其 Apache-2.0 使用根 LICENSE。例外不改变本项目许可证。
 
 ## 维护与验证记录
+
+### 2026-11-17：多端口、文件 ACL 与独立 HTTPS 观测
+
+保留 schema 1/2 单端口与修订 4；新增显式端点数组、独立 H2/H3 窗口、分层资源和
+字节预算、每向线速桶、事务绑定/关闭、端口 Alt-Svc/重定向。共享认证、证书/ECH
+原子 generation 与上游池；全局 origin LRU 淘汰同时释放闲置端点视图，活动请求继续持有租约。
+文件 ACL 通过私有读取完整验证，既检查原目标，也检查交给直连/下一跳的具体候选；
+不可放开强制私网/自连接限制。没有更改生产客户端、认证字段或独立协议向量。
+
+本次基于已发布环境中尚未提交的 Rust 1.100 / native 依赖更新继续开发；这些基线改动
+一并保留，未重新升级依赖。最终实际执行：fmt、workspace Clippy 警告拒绝、locked GNU
+release、向量、native audit、lab oracles、vendor 两项重试回归。默认 workspace
+288 项通过、零失败、17 项 ignored；独立 Caddy 矩阵另行执行，510 次观测通过其有效性和
+零未认证代理拨号门槛。单/双端口配置解析及双端口传输诊断也实际执行。
+
+新回归捕获并修复了跨端口 QUIC 通知错投导致的停滞，以及端点视图延长闲置上游池寿命
+造成的全局缓存上限失效。多设备测试覆盖并发、端口饱和隔离、全局额度、半关闭、取消、
+证书轮换、标记伪造和部分绑定失败回滚。完整参考报告的代表性证据见上面的链接；
+原始 pcap、内核路径丢包/NAT/CID 实验、大型 fuzz/性能矩阵与生产网络验收没有执行。
+
 
 历史审阅与失败尝试保留在 Git 中，不作为当前成功证据。d0f6a082 之后的主要合并：
 eab→account、state/store→persist、outbound→egress、site forward→upstream、

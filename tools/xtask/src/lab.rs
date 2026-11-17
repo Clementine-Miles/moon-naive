@@ -437,10 +437,8 @@ fn baseline(dir: &Path, env: &BTreeMap<String, String>) -> Result<()> {
         value[name] = probe(&args, env)?;
     }
     for name in ["Cargo.lock", "vendor/instant-acme/Cargo.lock"] {
-        value["lockfiles_sha256"][name] = json!(format!(
-            "{:x}",
-            Sha256::digest(fs::read(root().join(name))?)
-        ));
+        value["lockfiles_sha256"][name] =
+            json!(super::hex(Sha256::digest(fs::read(root().join(name))?)));
     }
     for folder in ["src", "core", "tools/xtask/src"] {
         for p in files(&root().join(folder))?
@@ -448,13 +446,12 @@ fn baseline(dir: &Path, env: &BTreeMap<String, String>) -> Result<()> {
             .filter(|p| p.extension().is_some_and(|e| e == "rs"))
         {
             value["source_sha256"][p.strip_prefix(root())?.to_string_lossy().as_ref()] =
-                json!(format!("{:x}", Sha256::digest(fs::read(&p)?)));
+                json!(super::hex(Sha256::digest(fs::read(&p)?)));
         }
     }
-    value["source_sha256"]["tools/analyze.py"] = json!(format!(
-        "{:x}",
-        Sha256::digest(fs::read(root().join("tools/analyze.py"))?)
-    ));
+    value["source_sha256"]["tools/analyze.py"] = json!(super::hex(Sha256::digest(fs::read(
+        root().join("tools/analyze.py")
+    )?)));
     for name in [
         "PEBBLE_BIN",
         "CHALLTESTSRV_BIN",
@@ -463,7 +460,7 @@ fn baseline(dir: &Path, env: &BTreeMap<String, String>) -> Result<()> {
     ] {
         if let Some(path) = env.get(name).filter(|p| Path::new(p).is_file()) {
             value["tools"][name] =
-                json!({"path":path,"sha256":format!("{:x}",Sha256::digest(fs::read(path)?))});
+                json!({"path":path,"sha256":super::hex(Sha256::digest(fs::read(path)?))});
             let args = if name.contains("TCPDUMP") {
                 vec![path.as_str(), "--version"]
             } else if name.contains("TSHARK") {

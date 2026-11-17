@@ -1,4 +1,5 @@
 mod audit;
+mod differential;
 mod lab;
 mod release;
 use std::{
@@ -12,6 +13,13 @@ use std::{
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+fn hex(bytes: impl AsRef<[u8]>) -> String {
+    bytes
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -132,10 +140,10 @@ fn audit_native() -> Result<()> {
             sys.insert(version.to_owned());
         }
     }
-    let expected = BTreeSet::from(["v5.2.0".to_owned()]);
+    let expected = BTreeSet::from(["v5.5.0".to_owned()]);
     check(
         boring == expected && sys == expected,
-        "native backends do not share boring/boring-sys 5.2.0",
+        "native backends do not share boring/boring-sys 5.5.0",
     )?;
     save_report(
         "native-graph",
@@ -190,6 +198,8 @@ fn main() -> ExitCode {
     let args: Vec<_> = env::args().skip(1).collect();
     let result = match args.as_slice() {
         [cmd, args @ ..] if cmd == "lab" => lab::run(args),
+        [cmd, args @ ..] if cmd == "differential" => differential::run(args),
+        [cmd, directory] if cmd == "differential-fetch" => differential::fetch(Path::new(directory)),
         [cmd] if cmd == "vectors" => audit::vectors(false),
         [cmd, flag] if cmd == "vectors" && flag == "--check" => audit::vectors(true),
         [cmd] if cmd == "verify" => verify(None),
@@ -199,7 +209,7 @@ fn main() -> ExitCode {
         [cmd, binary, output] if cmd == "dist" => release::dist(Path::new(binary), Path::new(output)),
         [cmd, output] if cmd == "source" => release::source(Path::new(output), "HEAD"),
         [cmd, output, revision] if cmd == "source" => release::source(Path::new(output), revision),
-        _ => Err("usage: cargo xtask vectors [--check] | lab [--only SUITE] [--run DIR] | verify [target] | audit-native | check-elf <binary> | dist <binary> <output-dir> | source <output-dir> [revision]".into()),
+        _ => Err("usage: cargo xtask differential-fetch <directory> | differential --caddy PATH --run NEW_DIR [--tcpdump PATH] [--tshark PATH] | vectors [--check] | lab [--only SUITE] [--run DIR] | verify [target] | audit-native | check-elf <binary> | dist <binary> <output-dir> | source <output-dir> [revision]".into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

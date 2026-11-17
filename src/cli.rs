@@ -79,15 +79,37 @@ pub async fn run(args: &[String]) -> Result<()> {
         [cmd, path] if cmd == "check-config" => {
             let config = config(path)?;
             println!(
-                "configuration valid (structure/policy only)\nprotocols={}\nacme_directory={}\nterms_accepted={}\nexternal_secret_files=not read\nlisteners=not opened",
-                if config.listener.h1 {
-                    "h1-website,h2,h3"
-                } else {
-                    "h2,h3"
-                },
+                "configuration valid (structure/policy only)\nlistener_count={}\nacme_directory={}\nterms_accepted={}\nexternal_secret_files=not read\nexternal_acl=not read\nlisteners=not opened",
+                config.effective_listeners().len(),
                 config.acme.directory(),
                 config.acme.accept_terms
             );
+            for endpoint in config.effective_listeners() {
+                let listener = &endpoint.listener;
+                let protocols: Vec<_> = [
+                    (listener.h1, "h1-website"),
+                    (listener.h2, "h2"),
+                    (listener.h3, "h3"),
+                ]
+                .into_iter()
+                .filter_map(|(enabled, name)| enabled.then_some(name))
+                .collect();
+                println!(
+                    "listener={} protocols={} tcp={} udp={}",
+                    endpoint.name,
+                    protocols.join(","),
+                    if listener.h1 || listener.h2 {
+                        listener.tcp.to_string()
+                    } else {
+                        "disabled".into()
+                    },
+                    if listener.h3 {
+                        listener.udp.to_string()
+                    } else {
+                        "disabled".into()
+                    },
+                );
+            }
             Ok(())
         }
         [cmd, path] if cmd == "check-transport" => {

@@ -10,6 +10,8 @@ pub(super) async fn serve(
     listener: TcpListener,
     config: Arc<Config>,
     budget: Budget,
+    https_port: u16,
+    rate: Arc<super::rate::Rate>,
     mut stop: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut tasks = tokio::task::JoinSet::new();
@@ -21,14 +23,14 @@ pub(super) async fn serve(
                 let (socket,_) = accepted?;
                 let Some(permit)=budget.acquire() else {continue};
                 super::congestion::apply(&socket,config.transport.tcp_congestion)?;
-                let config=config.clone();
+                let config=config.clone();let rate=rate.clone();
                 tasks.spawn(async move {
                     let _permit=permit;
                     let service=service_fn(move |req| {
-                        let reply=response(req,&config);
+                        let reply=response(req,&config,https_port);
                         async {Ok::<_,std::convert::Infallible>(reply)}
                     });
-                    let _=tokio::time::timeout(Duration::from_secs(30),hyper::server::conn::http1::Builder::new().keep_alive(false).max_buf_size(32768).serve_connection(hyper_util::rt::TokioIo::new(socket),service)).await;
+                    let _=tokio::time::timeout(Duration::from_secs(30),hyper::server::conn::http1::Builder::new().keep_alive(false).max_buf_size(32768).serve_connection(hyper_util::rt::TokioIo::new(super::rate::RateStream::new(socket,rate)),service)).await;
                 });
             }
         }
@@ -36,7 +38,7 @@ pub(super) async fn serve(
     tasks.abort_all();
     Ok(())
 }
-fn response(req: Request<Incoming>, config: &Config) -> Response<Full<Bytes>> {
+fn response(req: Request<Incoming>, config: &Config, https_port: u16) -> Response<Full<Bytes>> {
     let host = req
         .headers()
         .get("host")
@@ -58,10 +60,10 @@ fn response(req: Request<Incoming>, config: &Config) -> Response<Full<Bytes>> {
         .status(status)
         .header("content-type", "text/plain; charset=utf-8");
     if status == 308 {
-        let port = if config.listener.tcp.port() == 443 {
+        let port = if https_port == 443 {
             String::new()
         } else {
-            format!(":{}", config.listener.tcp.port())
+            format!(":{}", https_port)
         };
         builder = builder.header(
             "location",

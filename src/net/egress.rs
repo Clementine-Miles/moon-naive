@@ -1,5 +1,6 @@
 use super::{Config, Result, Stats};
 use base64::Engine;
+use moon_naive_core::acl::{MAX_FILE_BYTES, Policy};
 use moon_naive_core::config::{ProxyKind, ProxyUpstream};
 use moon_naive_core::policy::{Authority, allows_ip};
 use std::{
@@ -62,6 +63,7 @@ pub(super) fn is_local(ip: IpAddr, local: &[IpAddr]) -> bool {
 #[derive(Clone)]
 pub(super) struct Egress {
     timeout: Duration,
+    acl: Arc<Policy>,
     pub own: Vec<IpAddr>,
     domain: String,
     stats: Arc<Stats>,
@@ -75,13 +77,27 @@ pub(super) struct Egress {
 }
 impl Egress {
     pub fn new(config: &Config, stats: Arc<Stats>) -> super::Result<Self> {
+        let acl = match &config.proxy.acl_file {
+            Some(path) => {
+                let bytes = crate::acme::persist::read_private(path, MAX_FILE_BYTES)?;
+                Policy::parse(std::str::from_utf8(&bytes).map_err(|_| "ACL must be UTF-8")?)?
+            }
+            None => Policy::unrestricted(),
+        };
         Ok(Self {
+            acl: Arc::new(acl),
             timeout: Duration::from_secs(config.limits.connect_timeout_secs),
-            own: [
-                vec![config.listener.tcp.ip(), config.listener.udp.ip()],
-                config.listener.public_addresses.clone(),
-            ]
-            .concat(),
+            own: config
+                .effective_listeners()
+                .iter()
+                .flat_map(|endpoint| {
+                    [
+                        vec![endpoint.listener.tcp.ip(), endpoint.listener.udp.ip()],
+                        endpoint.listener.public_addresses.clone(),
+                    ]
+                    .concat()
+                })
+                .collect(),
             domain: config.domain.clone(),
             stats,
             tcp_congestion: config.transport.tcp_congestion,
@@ -99,8 +115,37 @@ impl Egress {
             test_delay: None,
         })
     }
+    /// Listener-specific connect deadline; immutable ACL and next-hop state remain shared.
+    pub(super) fn with_timeout(&self, timeout: Duration) -> Self {
+        Self {
+            timeout,
+            ..self.clone()
+        }
+    }
     pub fn is_self(&self, host: &str) -> bool {
         host.eq_ignore_ascii_case(&self.domain)
+    }
+    /// Domain/port admission happens before resolution, even when using a next hop.
+    pub(super) fn allows_request(&self, target: &Authority) -> bool {
+        !self.is_self(&target.host) && self.acl.allows_request(target)
+    }
+    /// Reused by forward peer selection and the final connector; never delegates DNS.
+    pub(super) fn allows_candidate(
+        &self,
+        target: &Authority,
+        address: SocketAddr,
+        local: &[IpAddr],
+    ) -> bool {
+        address.port() == target.port
+            && self.allows_request(target)
+            && allows_ip(address.ip(), &self.own)
+            && !is_local(address.ip(), local)
+            && self.acl.allows_candidate(target, address.ip())
+            && target
+                .host
+                .parse::<IpAddr>()
+                .ok()
+                .is_none_or(|ip| same_ip(ip, address.ip()))
     }
     pub async fn dial(&self, target: &Authority) -> Result<Stream, u16> {
         let stream = tokio::time::timeout(self.timeout, self.dial_inner(target))
@@ -112,19 +157,23 @@ impl Egress {
         Ok(stream)
     }
     async fn dial_inner(&self, target: &Authority) -> Result<Stream, u16> {
+        if !self.allows_request(target) {
+            return Err(403);
+        }
         #[cfg(test)]
         if let Some(delay) = self.test_delay {
             tokio::time::sleep(delay).await;
         }
         #[cfg(test)]
         if let Some(address) = self.test_target {
+            let logical_ip = target.host.parse().unwrap_or(address.ip());
+            if !self.acl.allows_candidate(target, logical_ip) {
+                return Err(403);
+            }
             self.stats.dials.fetch_add(1, Ordering::Relaxed);
             let socket = TcpStream::connect(address).await.map_err(|_| 502u16)?;
             socket.set_nodelay(true).map_err(|_| 502u16)?;
             return Ok(Stream::Plain(socket));
-        }
-        if target.host.eq_ignore_ascii_case(&self.domain) {
-            return Err(403);
         }
         let addresses: Vec<SocketAddr> = if let Ok(ip) = target.host.parse::<IpAddr>() {
             vec![SocketAddr::new(ip, target.port)]
@@ -146,7 +195,7 @@ impl Egress {
         let local = local_addresses().await.map_err(|_| 502u16)?;
         let addresses: Vec<_> = addresses
             .into_iter()
-            .filter(|a| allows_ip(a.ip(), &self.own) && !is_local(a.ip(), &local))
+            .filter(|address| self.allows_candidate(target, *address, &local))
             .collect();
         if addresses.is_empty() {
             return Err(403);
@@ -154,19 +203,31 @@ impl Egress {
         self.dial_addresses_inner(addresses).await
     }
     /// Already resolved concrete candidates; revalidate policy without DNS lookup.
-    pub async fn dial_candidates(&self, addresses: Vec<SocketAddr>) -> Result<Stream, u16> {
+    pub async fn dial_candidates(
+        &self,
+        target: &Authority,
+        addresses: Vec<SocketAddr>,
+    ) -> Result<Stream, u16> {
+        if !self.allows_request(target) {
+            return Err(403);
+        }
         if addresses.is_empty() || addresses.len() > 32 {
             return Err(502);
         }
         #[cfg(test)]
         if self.test_target.is_some() {
-            let target = Authority::parse(&addresses[0].to_string()).map_err(|_| 502u16)?;
-            return self.dial(&target).await;
+            if !addresses
+                .iter()
+                .any(|address| self.acl.allows_candidate(target, address.ip()))
+            {
+                return Err(403);
+            }
+            return self.dial(target).await;
         }
         let local = local_addresses().await.map_err(|_| 502u16)?;
         let addresses = addresses
             .into_iter()
-            .filter(|a| allows_ip(a.ip(), &self.own) && !is_local(a.ip(), &local))
+            .filter(|address| self.allows_candidate(target, *address, &local))
             .collect::<Vec<_>>();
         if addresses.is_empty() {
             return Err(403);
@@ -898,6 +959,183 @@ mod next_hop_tests {
             eprintln!(
                 "PERF {{\"case\":\"header_scan\",\"bytes\":{length},\"iterations\":{ITERATIONS},\"ns_per_response\":{nanos}}}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod acl_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn config(text: &str) -> (tempfile::TempDir, Config) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("acl.toml");
+        std::fs::write(&path, text).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut config = Config::parse(include_str!("../../config.example.toml")).unwrap();
+        config.proxy.acl_file = Some(path);
+        (directory, config)
+    }
+    fn egress(config: &Config) -> Egress {
+        Egress::new(config, Arc::default()).unwrap()
+    }
+    #[test]
+    fn private_acl_loading_is_bounded_and_fails_closed() {
+        let (_directory, mut config) = config("default='allow'");
+        assert!(Egress::new(&config, Arc::default()).is_ok());
+        let path = config.proxy.acl_file.clone().unwrap();
+        for contents in [
+            "default='unknown'".to_owned(),
+            "x".repeat(MAX_FILE_BYTES + 1),
+            "".into(),
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            assert!(Egress::new(&config, Arc::default()).is_err());
+        }
+        std::fs::write(&path, "default='allow'").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(Egress::new(&config, Arc::default()).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = path.with_extension("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        config.proxy.acl_file = Some(link);
+        assert!(Egress::new(&config, Arc::default()).is_err());
+    }
+    #[test]
+    fn acl_allow_cannot_override_mandatory_or_change_literal_target() {
+        let (_directory, config) = config("default='allow'");
+        let mut egress = egress(&config);
+        egress.own.push("1.1.1.1".parse().unwrap());
+        for target in [
+            "127.0.0.1:443",
+            "10.0.0.1:443",
+            "169.254.169.254:80",
+            "[::1]:443",
+            "[::ffff:127.0.0.1]:443",
+            "[64:ff9b::808:808]:443",
+            "1.1.1.1:443",
+        ] {
+            let target = Authority::parse(target).unwrap();
+            assert!(!egress.allows_candidate(
+                &target,
+                SocketAddr::new(target.host.parse().unwrap(), target.port),
+                &[]
+            ));
+        }
+        let target = Authority::parse("8.8.8.8:443").unwrap();
+        assert!(!egress.allows_candidate(&target, "8.8.4.4:443".parse().unwrap(), &[]));
+        assert!(!egress.allows_candidate(&target, "8.8.8.8:80".parse().unwrap(), &[]));
+        assert!(!egress.allows_candidate(
+            &target,
+            "8.8.8.8:443".parse().unwrap(),
+            &["::ffff:8.8.8.8".parse().unwrap()]
+        ));
+        assert!(
+            !egress.allows_request(&Authority::parse(&format!("{}:443", config.domain)).unwrap())
+        );
+    }
+    #[tokio::test]
+    async fn authority_denial_precedes_resolution_and_rechecked_candidates_precede_dial() {
+        let (_directory, config) = config(
+            "[[rules]]\naction='deny'\ndomain='blocked.example'\n[[rules]]\naction='deny'\ncidr='8.8.8.0/24'\n[[rules]]\naction='allow'\ndomain='allowed.example'\n",
+        );
+        let egress = egress(&config);
+        assert_eq!(
+            egress
+                .dial(&Authority::parse("blocked.example:443").unwrap())
+                .await
+                .unwrap_err(),
+            403
+        );
+        assert_eq!(egress.stats.resolutions.load(Ordering::Relaxed), 0);
+        let target = Authority::parse("allowed.example:443").unwrap();
+        assert!(egress.allows_candidate(&target, "1.1.1.1:443".parse().unwrap(), &[]));
+        assert!(!egress.allows_candidate(&target, "8.8.8.8:443".parse().unwrap(), &[]));
+        assert_eq!(
+            egress
+                .dial_candidates(&target, vec!["8.8.8.8:443".parse().unwrap()])
+                .await
+                .unwrap_err(),
+            403
+        );
+        assert_eq!(egress.stats.dials.load(Ordering::Relaxed), 0);
+    }
+    #[tokio::test]
+    async fn upstream_hops_receive_only_acl_checked_concrete_public_targets() {
+        for kind in [ProxyKind::Http, ProxyKind::Socks5] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.2:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (_directory, mut config) =
+                config("[[rules]]\naction='allow'\nip='1.1.1.1'\nports=['443']");
+            config.proxy.upstream = Some(ProxyUpstream {
+                kind,
+                address: address.to_string(),
+                username: None,
+                password: None,
+                tls_server_name: None,
+                ca_file: None,
+            });
+            let egress = egress(&config);
+            // A public but unlisted IP and private IP must never reach the next hop.
+            for target in [
+                "8.8.8.8:443",
+                "127.0.0.1:443",
+                "[::ffff:127.0.0.1]:443",
+                "1.1.1.1:80",
+            ] {
+                assert_eq!(
+                    egress
+                        .dial(&Authority::parse(target).unwrap())
+                        .await
+                        .unwrap_err(),
+                    403
+                );
+            }
+            assert_eq!(egress.stats.dials.load(Ordering::Relaxed), 0);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                    .await
+                    .is_err()
+            );
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                if kind == ProxyKind::Http {
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        request.push(stream.read_u8().await.unwrap());
+                        assert!(request.len() < 4096);
+                    }
+                    let request = String::from_utf8(request).unwrap();
+                    assert!(request.starts_with("CONNECT 1.1.1.1:443 HTTP/1.1\r\n"));
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\n\r\nchecked")
+                        .await
+                        .unwrap();
+                } else {
+                    let mut greeting = [0; 3];
+                    stream.read_exact(&mut greeting).await.unwrap();
+                    assert_eq!(greeting, [5, 1, 0]);
+                    stream.write_all(&[5, 0]).await.unwrap();
+                    let mut request = [0; 10];
+                    stream.read_exact(&mut request).await.unwrap();
+                    assert_eq!(request, [5, 1, 0, 1, 1, 1, 1, 1, 1, 187]);
+                    stream
+                        .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                        .await
+                        .unwrap();
+                    stream.write_all(b"checked").await.unwrap();
+                }
+            });
+            let mut stream = egress
+                .dial(&Authority::parse("1.1.1.1:443").unwrap())
+                .await
+                .unwrap();
+            let mut response = [0; 7];
+            stream.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response, b"checked");
+            server.await.unwrap();
+            assert_eq!(egress.stats.dials.load(Ordering::Relaxed), 1);
         }
     }
 }

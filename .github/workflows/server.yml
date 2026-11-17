@@ -1,5 +1,13 @@
 name: mona server
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      differential:
+        description: Run the pinned independent Caddy H1/H2/H3 comparison
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
@@ -7,7 +15,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - run: cargo xtask vectors --check
       - run: cargo test --locked -p moon-naive-core
   server:
@@ -16,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev pkg-config perl
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -29,3 +37,22 @@ jobs:
       - run: cargo test --manifest-path vendor/instant-acme/Cargo.toml --locked --no-default-features --features time,x509-parser --lib
         env:
           CARGO_TARGET_DIR: /tmp/mona-acme-validation
+  differential:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.differential }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev pkg-config perl
+      - uses: dtolnay/rust-toolchain@1.100.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask differential-fetch "${RUNNER_TEMP}/caddy-reference"
+      - run: cargo xtask differential --caddy "${RUNNER_TEMP}/caddy-reference/caddy" --run "${RUNNER_TEMP}/https-differential"
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: https-differential-report
+          path: |
+            ${{ runner.temp }}/https-differential/result.json
+            ${{ runner.temp }}/https-differential/summary.md
+          retention-days: 7

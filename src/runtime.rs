@@ -226,7 +226,7 @@ where
             result=prepared.bind()=>result?,
         };
         serving = true;
-        eprintln!("event=server_ready h2={} h3={} tls=boringssl quic=quiche",network.tcp_addr()?,network.udp_addr()?);
+        for (name,tcp,udp) in network.listener_addrs()? { eprintln!("event=server_ready listener={name} tcp={tcp:?} udp={udp:?} tls=boringssl quic=quiche"); }
         notify("READY=1\nSTATUS=Serving H2/H3; automatic certificate renewal active")?;
         let network=network.run(receive);
         tokio::pin!(network);

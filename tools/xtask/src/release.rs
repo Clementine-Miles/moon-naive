@@ -20,7 +20,7 @@ fn checksum(path: &Path) -> Result<String> {
         }
         digest.update(&buffer[..len]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(super::hex(digest.finalize()))
 }
 fn copy(source: &Path, target: &Path, executable: bool) -> Result<()> {
     if let Some(parent) = target.parent() {
@@ -207,6 +207,12 @@ pub fn dist(binary: &Path, directory: &Path) -> Result<()> {
         ),
         ("deploy/moon-naive.openrc", "deploy/moon-naive.openrc", true),
         ("config.example.toml", "config.example.toml", false),
+        (
+            "config.dual.example.toml",
+            "config.dual.example.toml",
+            false,
+        ),
+        ("acl.example.toml", "acl.example.toml", false),
     ] {
         copy(&root().join(source), &stage.join(destination), executable)?;
     }
@@ -233,7 +239,7 @@ pub fn dist(binary: &Path, directory: &Path) -> Result<()> {
         serde_json::to_vec_pretty(&serde_json::json!({
             "version":env!("CARGO_PKG_VERSION"),"target":TARGET,"static":true,
             "binary_sha256":checksum(&binary)?,"cargo_lock_sha256":checksum(&root().join("Cargo.lock"))?,
-            "boring":"5.2.0","tokio-boring":"5.0.0","sources":sources,
+            "boring":"5.5.0","tokio-boring":"5.5.0","sources":sources,
             "pingora_vendor_manifest_sha256":audit::vendor_digest()?,
             "public_network_acceptance":"pending","fingerprint_improvement":"not_measured",
         }))?,

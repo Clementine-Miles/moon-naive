@@ -1,4 +1,5 @@
-# moon-naive 唯一配置示例（schema 2；兼容旧 schema 1/2）。
+# moon-naive 单端口配置示例（schema 2；兼容旧 schema 1/2）。
+# 完整双端口示例：config.dual.example.toml；ACL 文件示例：acl.example.toml。
 # 推荐：moon-naive config init /etc/moon-naive/config.toml
 # 命令创建 0600 私有文件，拒绝覆盖；请以服务用户执行，父目录需预先存在。
 # 填好下面的基础字段后：moon-naive check /etc/moon-naive/config.toml
@@ -65,9 +66,27 @@ b64_mac_key = "dGVzdC10ZXN0LXRlc3QtdGVzdA"
 # tcp = "0.0.0.0:443"          # TLS TCP；默认监听 IPv4，按需用 [::]:443。
 # udp = "0.0.0.0:443"          # QUIC/H3；同时开放防火墙 TCP/UDP 443。
 # h1 = true                   # 仅网站/无 ALPN 回退，不开放 H1 通用代理。
-# h2 = true                   # H2/H3 必须开启，不支持禁用。
+# h2 = true                   # 启用 H2；H1 不提供通用正向代理。
 # h3 = true
 # http_redirect = "0.0.0.0:80" # 默认不开启；可选 HTTP 308 跳转，需另开放 TCP 80。
+#
+# 需要显式流控或多端口时，使用 [[listeners]] 替代 [listener]；不要同时配置。
+# 可仅定义一项，保留 443；每项有唯一 name、独立协议/额度/窗口。
+# [[listeners]]
+# name = "main"
+# tcp = "0.0.0.0:443"
+# udp = "0.0.0.0:443"
+# h1 = true
+# h2 = true
+# h3 = true
+# handshake_timeout_secs = 10
+# [listeners.flow]
+# h2_stream_window = 65536
+# h2_connection_window = 524288
+# h3_stream_window = 4096
+# h3_connection_window = 524288
+# [limits] 仍为进程全局上限；可选 [listeners.limits] 设置端点独立额度。
+# 带宽限速与流控不同；可选 listeners.bandwidth_bytes_per_sec 不改变窗口。
 #
 # VPS已支持BBR时，可取消下面三行注释。check-transport会读回实际TCP算法及窗口。
 # [transport]
@@ -134,9 +153,13 @@ b64_mac_key = "dGVzdC10ZXN0LXRlc3QtdGVzdA"
 # username = "upstream-user"  # 无认证时与 password 一起省略。
 # password = "upstream-password"
 #
-# 完整配置、GTS EAB/staging、Cloudflare/LE、旧配置迁移见 docs/CONFIGURATION.md。
+# 完整配置、GTS EAB/staging、Cloudflare/LE、旧配置迁移见 docs/PROJECT.md。
 # schema 2 主文件权限必须为 0600；服务用户需拥有文件及可写的 state_dir（0700）。
 # 新修订4客户端须单独准备；本示例不能使官方 NaïveProxy 客户端直接兼容。
+#
+# ACL：在 [proxy] 表中设置 acl_file = "/etc/moon-naive/acl.toml"。
+# 读取完整 0600 私有 TOML 后才允许启动；省略时仍执行强制 IP/自连接检查。
+# ACL 只能进一步限制已认证代理目的地，不会放开私网，也不控制固定网站源站。
 
 # Ordinary authenticated HTTP(S) forwarding; independent of [website] and CONNECT.
 # Bodies stream with backpressure; this is a cumulative unique-byte limit.

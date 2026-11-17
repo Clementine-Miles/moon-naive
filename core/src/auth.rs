@@ -2,7 +2,7 @@
 //! No bearer passwords, clock window, nonce cache, or connection-wide login.
 use crate::codec::{Mode, Offer};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 

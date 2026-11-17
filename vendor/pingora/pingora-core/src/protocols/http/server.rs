@@ -53,57 +53,31 @@ impl ReusableHttpStream {
 }
 
 /// HTTP server session object for both HTTP/1.x and HTTP/2
-pub enum Session<CS = ()>
-where
-    CS: SessionCustom,
-{
+pub enum Session {
     H1(SessionV1),
     H2(SessionV2),
     Subrequest(SessionSubrequest),
-    Custom(CS),
+    Custom(Box<dyn SessionCustom>),
 }
 
-impl Session<()> {
+impl Session {
     /// Create a new [`Session`] from an established connection for HTTP/1.x
     pub fn new_http1(stream: Stream) -> Self {
-        Self::new_http1_with_custom_session(stream)
+        Self::H1(SessionV1::new(stream))
     }
 
     /// Create a new [`Session`] from an established HTTP/2 stream
     pub fn new_http2(session: SessionV2) -> Self {
-        Self::new_http2_with_custom_session(session)
+        Self::H2(session)
     }
 
     /// Create a new [`Session`] from a subrequest session
     pub fn new_subrequest(session: SessionSubrequest) -> Self {
-        Self::new_subrequest_with_custom_session(session)
-    }
-}
-
-impl<CS> Session<CS>
-where
-    CS: SessionCustom,
-{
-    /// Create a new [`Session`] with a concrete custom-session type from an
-    /// established connection for HTTP/1.x.
-    pub fn new_http1_with_custom_session(stream: Stream) -> Self {
-        Self::H1(SessionV1::new(stream))
-    }
-
-    /// Create a new [`Session`] with a concrete custom-session type from an
-    /// established HTTP/2 stream.
-    pub fn new_http2_with_custom_session(session: SessionV2) -> Self {
-        Self::H2(session)
-    }
-
-    /// Create a new [`Session`] with a concrete custom-session type from a
-    /// subrequest session.
-    pub fn new_subrequest_with_custom_session(session: SessionSubrequest) -> Self {
         Self::Subrequest(session)
     }
 
     /// Create a new [`Session`] from a custom session
-    pub fn new_custom(session: CS) -> Self {
+    pub fn new_custom(session: Box<dyn SessionCustom>) -> Self {
         Self::Custom(session)
     }
 
@@ -778,16 +752,16 @@ where
         }
     }
 
-    pub fn as_custom(&self) -> Option<&CS> {
+    pub fn as_custom(&self) -> Option<&dyn SessionCustom> {
         match self {
             Self::H1(_) => None,
             Self::H2(_) => None,
             Self::Subrequest(_) => None,
-            Self::Custom(c) => Some(c),
+            Self::Custom(c) => Some(c.as_ref()),
         }
     }
 
-    pub fn as_custom_mut(&mut self) -> Option<&mut CS> {
+    pub fn as_custom_mut(&mut self) -> Option<&mut Box<dyn SessionCustom>> {
         match self {
             Self::H1(_) => None,
             Self::H2(_) => None,

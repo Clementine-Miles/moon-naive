@@ -1,7 +1,7 @@
 //! Fixed configuration origins; async bounded DNS, Pingora peers/pools and passive failover.
 use super::{Result, Website};
 use crate::net::egress::Egress;
-use moon_naive_core::policy::{Authority, allows_ip};
+use moon_naive_core::policy::Authority;
 use moon_naive_core::{config::Config, website::Upstream};
 use pingora_core::{
     connectors::L4Connect,
@@ -25,7 +25,7 @@ pub(super) struct Pool {
     pub config: Upstream,
     origins: Vec<Origin>,
     next: AtomicUsize,
-    frontend: SocketAddr,
+    frontends: Vec<SocketAddr>,
     node_domain: String,
     public_addresses: Vec<std::net::IpAddr>,
     tcp_congestion: moon_naive_core::config::TcpCongestion,
@@ -69,7 +69,12 @@ impl Pool {
                     .to_owned();
                 let tls = uri.scheme_str() == Some("https");
                 let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
-                if host.eq_ignore_ascii_case(&app.domain) && port == app.listener.tcp.port() {
+                if host.eq_ignore_ascii_case(&app.domain)
+                    && app
+                        .effective_listeners()
+                        .iter()
+                        .any(|endpoint| port == endpoint.listener.tcp.port())
+                {
                     return Err("website origin points at frontend".into());
                 }
                 Ok(Origin {
@@ -86,9 +91,17 @@ impl Pool {
             config: config.clone(),
             origins,
             next: AtomicUsize::new(0),
-            frontend: app.listener.tcp,
+            frontends: app
+                .effective_listeners()
+                .iter()
+                .map(|endpoint| endpoint.listener.tcp)
+                .collect(),
             node_domain: app.domain.clone(),
-            public_addresses: app.listener.public_addresses.clone(),
+            public_addresses: app
+                .effective_listeners()
+                .iter()
+                .flat_map(|endpoint| endpoint.listener.public_addresses.clone())
+                .collect(),
             tcp_congestion: app.transport.tcp_congestion,
             group: app
                 .website
@@ -195,14 +208,16 @@ impl Pool {
             .iter()
             .copied()
             .filter(|address| {
-                !(address.port() == self.frontend.port()
-                    && (super::super::egress::same_ip(address.ip(), self.frontend.ip())
-                        || super::super::egress::is_local(address.ip(), &local)
-                        || self
-                            .public_addresses
-                            .iter()
-                            .any(|ip| super::super::egress::same_ip(*ip, address.ip()))
-                        || origin.host.eq_ignore_ascii_case(&self.node_domain)))
+                !self.frontends.iter().any(|frontend| {
+                    address.port() == frontend.port()
+                        && (super::super::egress::same_ip(address.ip(), frontend.ip())
+                            || super::super::egress::is_local(address.ip(), &local)
+                            || self
+                                .public_addresses
+                                .iter()
+                                .any(|ip| super::super::egress::same_ip(*ip, address.ip()))
+                            || origin.host.eq_ignore_ascii_case(&self.node_domain))
+                })
             })
             .collect();
         let address = *addresses
@@ -347,8 +362,10 @@ impl ForwardOrigin {
     }
     pub async fn peer(&self, config: &Website) -> pingora_core::Result<Box<HttpPeer>> {
         let fail = || pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(502));
-        if self.egress.is_self(&self.authority.host) {
-            return Err(fail());
+        if !self.egress.allows_request(&self.authority) {
+            return Err(pingora_core::Error::new(
+                pingora_core::ErrorType::HTTPStatus(403),
+            ));
         }
         let addresses = tokio::time::timeout(
             Duration::from_secs(config.connect_timeout_secs),
@@ -359,7 +376,7 @@ impl ForwardOrigin {
         .map_err(|_| fail())?
         .take(33)
         .collect::<Vec<_>>();
-        if addresses.len() > 32 {
+        if addresses.is_empty() || addresses.len() > 32 {
             return Err(fail());
         }
         let local = super::super::egress::local_addresses()
@@ -367,15 +384,15 @@ impl ForwardOrigin {
             .map_err(|_| fail())?;
         let addresses: Vec<_> = addresses
             .into_iter()
-            .filter(|a| {
-                allows_ip(a.ip(), &self.egress.own)
-                    && !super::super::egress::is_local(a.ip(), &local)
-            })
+            .filter(|a| self.egress.allows_candidate(&self.authority, *a, &local))
             .collect();
-        let addr = *addresses.first().ok_or_else(fail)?;
+        let addr = *addresses
+            .first()
+            .ok_or_else(|| pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(403)))?;
         let mut peer = HttpPeer::new(addr, self.tls, self.authority.host.clone());
         peer.group_key = self.user as u64 + 1;
         peer.options.custom_l4 = Some(Arc::new(ForwardConnector {
+            authority: self.authority.clone(),
             egress: self.egress.clone(),
             addresses,
             next: std::sync::atomic::AtomicUsize::new(0),
@@ -393,6 +410,7 @@ impl ForwardOrigin {
     }
 }
 struct ForwardConnector {
+    authority: Authority,
     egress: Egress,
     addresses: Vec<std::net::SocketAddr>,
     next: std::sync::atomic::AtomicUsize,
@@ -419,7 +437,7 @@ impl L4Connect for ForwardConnector {
         addresses.rotate_left(self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % len);
         let stream: crate::net::egress::Stream = self
             .egress
-            .dial_candidates(addresses)
+            .dial_candidates(&self.authority, addresses)
             .await
             .map_err(|_| pingora_core::Error::new(pingora_core::ErrorType::ConnectError))?;
         Ok(L4::from(VirtualSocketStream::new(Box::new(stream))))
@@ -520,5 +538,78 @@ mod tests {
             .unwrap();
         let (accepted, _) = listener.accept().await.unwrap();
         drop((stream, accepted));
+    }
+}
+
+#[cfg(test)]
+mod acl_tests {
+    use super::*;
+    use moon_naive_core::config::{ProxyKind, ProxyUpstream};
+    use pingora_core::upstreams::peer::Peer;
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[tokio::test]
+    async fn forward_authority_and_final_connector_apply_the_same_acl_before_upstream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.2:0").await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let policy = directory.path().join("acl.toml");
+        std::fs::write(
+            &policy,
+            "[[rules]]\naction='deny'\ndomain='blocked.example'\n[[rules]]\naction='allow'\nip='1.1.1.1'\nports=['443']",
+        )
+        .unwrap();
+        std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut config = Config::parse(include_str!("../../../config.example.toml")).unwrap();
+        config.proxy.acl_file = Some(policy);
+        config.proxy.upstream = Some(ProxyUpstream {
+            kind: ProxyKind::Http,
+            address: listener.local_addr().unwrap().to_string(),
+            username: None,
+            password: None,
+            tls_server_name: None,
+            ca_file: None,
+        });
+        let egress = Egress::new(&config, Arc::default()).unwrap();
+        for origin in [
+            "http://8.8.8.8:443",
+            "http://1.1.1.1:80",
+            "http://127.0.0.1:443",
+            "http://blocked.example:443",
+        ] {
+            let forward = ForwardOrigin::new(origin, 0, egress.clone()).unwrap();
+            assert!(forward.peer(&config.website).await.is_err(), "{origin}");
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+        let forward = ForwardOrigin::new("http://1.1.1.1:443", 0, egress).unwrap();
+        let peer = forward.peer(&config.website).await.unwrap();
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(stream.read_u8().await.unwrap());
+                assert!(head.len() < 4096);
+            }
+            assert!(head.starts_with(b"CONNECT 1.1.1.1:443 HTTP/1.1\r\n"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\n\r\nforward")
+                .await
+                .unwrap();
+        });
+        let mut stream = peer
+            .options
+            .custom_l4
+            .as_ref()
+            .unwrap()
+            .connect(peer.address())
+            .await
+            .unwrap();
+        let mut response = [0; 7];
+        stream.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"forward");
+        upstream.await.unwrap();
     }
 }

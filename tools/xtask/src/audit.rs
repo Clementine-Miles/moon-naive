@@ -5,17 +5,17 @@ pub const SOURCES: [(&str, &str, &str); 3] = [
     (
         "pingora-core",
         "https://github.com/cloudflare/pingora.git",
-        "4487f7b2ab50f159e4a2cf4f6a6b813f61bb6e19",
+        "f86ffda5d3ae5c3baf5125682138b33b26c01b08",
     ),
     (
         "quiche",
         "https://github.com/cloudflare/quiche.git",
-        "925b225825e2188f8e58e359114150500557bf61",
+        "7ccccc7b7f4bd4ec6bc70219fdbe491024f5cb0b",
     ),
     (
         "instant-acme",
         "https://github.com/djc/instant-acme.git",
-        "4a9b80fdc22f23ab39b78dfd20ff5d4c92938e52",
+        "1909bed8eee54d7289d64b3e9ff573ac5b272676",
     ),
 ];
 pub fn metadata(target: Option<&str>) -> Result<serde_json::Value> {
@@ -173,7 +173,7 @@ fn digest_directory(directory: &Path) -> Result<String> {
             "duplicate vendor manifest path",
         )?;
         check(
-            format!("{:x}", Sha256::digest(fs::read(path)?)) == hash,
+            super::hex(Sha256::digest(fs::read(path)?)) == hash,
             "vendored source checksum mismatch",
         )?;
     }
@@ -181,14 +181,14 @@ fn digest_directory(directory: &Path) -> Result<String> {
     walk(directory, &mut actual)?;
     actual.remove(&directory.join("SHA256SUMS"));
     check(expected == actual, "vendored file inventory mismatch")?;
-    Ok(format!("{:x}", Sha256::digest(manifest)))
+    Ok(super::hex(Sha256::digest(manifest)))
 }
 
 /// Independent v4 reference serializer: never calls application/core auth or codec.
 /// Existing checked-in Python-generated known answers must remain byte-identical.
 pub fn vectors(verify: bool) -> Result<()> {
     use base64::{Engine, engine::general_purpose::STANDARD};
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     fn proof(
         domain: &[u8],
         stream: u64,

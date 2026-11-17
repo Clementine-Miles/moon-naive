@@ -15,12 +15,8 @@
 use log::debug;
 use once_cell::sync::OnceCell;
 use rand::Rng;
-#[cfg(feature = "any_tls")]
-use std::future::Future;
 use tokio::runtime::{Builder, Handle};
 use tokio::sync::oneshot::{channel, Sender};
-#[cfg(feature = "any_tls")]
-use tokio_util::task::AbortOnDropHandle;
 
 // NOTE: use dedicated current-thread runtimes until pingora-runtime can preserve
 // the lazy-after-daemonize initialization behavior below.
@@ -109,13 +105,4 @@ impl OffloadRuntime {
         &pools[shard * self.thread_per_shard + thread_in_shard].0
     }
 
-    /// Spawn work that is aborted when its awaiting task is canceled.
-    #[cfg(feature = "any_tls")]
-    pub fn spawn_abort_on_drop<F>(&self, hash: u64, future: F) -> AbortOnDropHandle<F::Output>
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        AbortOnDropHandle::new(self.get_runtime(hash).spawn(future))
-    }
 }

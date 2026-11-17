@@ -176,9 +176,11 @@ pub struct Budget {
 struct Inner {
     active: AtomicUsize,
     maximum: usize,
+    parent: Option<Budget>,
 }
 pub struct Permit {
     shared: Arc<Inner>,
+    _parent: Option<Box<Permit>>,
 }
 impl Budget {
     pub fn new(maximum: usize) -> Result<Self, &'static str> {
@@ -189,8 +191,16 @@ impl Budget {
             shared: Arc::new(Inner {
                 active: AtomicUsize::new(0),
                 maximum,
+                parent: None,
             }),
         })
+    }
+    /// Every child admission also owns a parent permit. Sibling saturation is
+    /// independent until the common ancestor reaches its safety ceiling.
+    pub fn child(&self, maximum: usize) -> Result<Self, &'static str> {
+        let mut child = Self::new(maximum)?;
+        Arc::get_mut(&mut child.shared).unwrap().parent = Some(self.clone());
+        Ok(child)
     }
     pub fn acquire(&self) -> Option<Permit> {
         // Explicit CAS keeps the declared MSRV while avoiding the newer
@@ -207,9 +217,16 @@ impl Budget {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    return Some(Permit {
+                    let mut permit = Permit {
                         shared: self.shared.clone(),
-                    });
+                        _parent: None,
+                    };
+                    if let Some(parent) = &self.shared.parent {
+                        // Failure drops the local permit too; no partially
+                        // acquired endpoint credit survives admission failure.
+                        permit._parent = Some(Box::new(parent.acquire()?));
+                    }
+                    return Some(permit);
                 }
                 Err(observed) => active = observed,
             }
@@ -227,6 +244,24 @@ impl Drop for Permit {
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+    #[test]
+    fn child_isolation_global_ceiling_and_failure_rollback() {
+        let global = Budget::new(2).unwrap();
+        let a = global.child(1).unwrap();
+        let b = global.child(2).unwrap();
+        let pa = a.acquire().unwrap();
+        assert!(a.acquire().is_none());
+        assert_eq!(global.active(), 1);
+        let pb = b.acquire().unwrap();
+        assert_eq!(global.active(), 2);
+        assert!(b.acquire().is_none());
+        assert_eq!(b.active(), 1);
+        drop(pa);
+        let second_b = b.acquire().unwrap();
+        assert_eq!(global.active(), 2);
+        drop((pb, second_b));
+        assert_eq!((global.active(), a.active(), b.active()), (0, 0, 0));
+    }
     #[test]
     fn cancellation_and_exhaustion_release_permits() {
         let b = Budget::new(1).unwrap();

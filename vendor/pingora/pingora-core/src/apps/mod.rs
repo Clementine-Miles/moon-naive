@@ -24,7 +24,6 @@ use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::protocols::http::custom::server::Session as CustomServerSession;
 use crate::protocols::http::v2::server;
 use crate::protocols::http::{ReusableHttpStream, ServerSession};
 use crate::protocols::Digest;
@@ -36,10 +35,7 @@ const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 #[async_trait]
 /// This trait defines the interface of a transport layer (TCP or TLS) application.
-pub trait ServerApp<DS = ()>
-where
-    DS: CustomServerSession,
-{
+pub trait ServerApp {
     /// Whenever a new connection is established, this function will be called with the established
     /// [`Stream`] object provided.
     ///
@@ -129,10 +125,7 @@ pub struct HttpPersistentSettings {
 }
 
 impl HttpPersistentSettings {
-    pub fn for_session<CS>(session: &ServerSession<CS>) -> Self
-    where
-        CS: CustomServerSession,
-    {
+    pub fn for_session(session: &ServerSession) -> Self {
         HttpPersistentSettings {
             keepalive_timeout: session.get_keepalive(),
             keepalive_reuses_remaining: session.get_keepalive_reuses_remaining(),
@@ -160,10 +153,7 @@ impl HttpPersistentSettings {
         self.pipelined_prefix = Some(prefix);
     }
 
-    pub fn apply_to_session<CS>(self, session: &mut ServerSession<CS>)
-    where
-        CS: CustomServerSession,
-    {
+    pub fn apply_to_session(self, session: &mut ServerSession) {
         let Self {
             keepalive_timeout,
             mut keepalive_reuses_remaining,
@@ -229,10 +219,7 @@ impl ReusedHttpStream {
 
 /// This trait defines the interface of an HTTP application.
 #[async_trait]
-pub trait HttpServerApp<DS = ()>
-where
-    DS: CustomServerSession,
-{
+pub trait HttpServerApp {
     /// Similar to the [`ServerApp`], this function is called whenever a new HTTP session is established.
     ///
     /// After successful processing, [`ServerSession::finish()`] can be
@@ -242,7 +229,7 @@ where
     /// a `None` should be returned.
     async fn process_new_http(
         self: &Arc<Self>,
-        mut session: ServerSession<DS>,
+        mut session: ServerSession,
         // TODO: make this ShutdownWatch so that all task can await on this event
         shutdown: &ShutdownWatch,
     ) -> Option<ReusedHttpStream>;
@@ -276,10 +263,9 @@ where
 }
 
 #[async_trait]
-impl<T, DS> ServerApp<DS> for T
+impl<T> ServerApp for T
 where
-    T: HttpServerApp<DS> + Send + Sync + 'static,
-    DS: CustomServerSession,
+    T: HttpServerApp + Send + Sync + 'static,
 {
     async fn process_new(
         self: &Arc<Self>,
@@ -353,11 +339,8 @@ where
                         // loop's idle timeout sees this connection as busy.
                         let _guard = guard;
                         // Note, `PersistentSettings` not currently relevant for h2
-                        app.process_new_http(
-                            ServerSession::<DS>::new_http2_with_custom_session(h2_stream),
-                            &shutdown,
-                        )
-                        .await;
+                        app.process_new_http(ServerSession::new_http2(h2_stream), &shutdown)
+                            .await;
                     });
                 },
             )
@@ -366,7 +349,7 @@ where
             return self.clone().process_custom_session(stream, shutdown).await;
         } else {
             // No ALPN or ALPN::H1 and h2c was not configured, fallback to HTTP/1.1
-            let mut session = ServerSession::<DS>::new_http1_with_custom_session(stream);
+            let mut session = ServerSession::new_http1(stream);
             if *shutdown.borrow() {
                 // stop downstream from reusing if this service is shutting down soon
                 session.set_keepalive(None);
@@ -381,7 +364,7 @@ where
 
             let mut result = self.process_new_http(session, shutdown).await;
             while let Some((stream, persistent_settings)) = result.map(|r| r.consume()) {
-                let mut session = ServerSession::<DS>::new_http1_with_custom_session(stream);
+                let mut session = ServerSession::new_http1(stream);
                 if let Some(persistent_settings) = persistent_settings {
                     persistent_settings.apply_to_session(&mut session);
                 }

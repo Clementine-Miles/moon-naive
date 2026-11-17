@@ -45,10 +45,7 @@ pub enum ProxyWarnLogContext {
 ///
 /// If any of the filters returns [Result::Err], the request will fail, and the error will be logged.
 #[cfg_attr(not(doc_async_trait), async_trait)]
-pub trait ProxyHttp<DS = ()>
-where
-    DS: DownstreamSession,
-{
+pub trait ProxyHttp {
     /// The per request object to share state across the different filters
     type CTX;
 
@@ -61,7 +58,7 @@ where
     /// be forwarded to.
     async fn upstream_peer(
         &self,
-        session: &mut Session<DS>,
+        session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>>;
 
@@ -102,7 +99,7 @@ where
     /// the proxy would exit. The proxy continues to the next phases when `Ok(false)` is returned.
     ///
     /// By default this filter does nothing and returns `Ok(false)`.
-    async fn request_filter(&self, _session: &mut Session<DS>, _ctx: &mut Self::CTX) -> Result<bool>
+    async fn request_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool>
     where
         Self::CTX: Send + Sync,
     {
@@ -118,11 +115,7 @@ where
     /// Note that because this function is executed before any module that might provide access
     /// control or rate limiting, logic should stay in request_filter() if it can in order to be
     /// protected by said modules.
-    async fn early_request_filter(
-        &self,
-        _session: &mut Session<DS>,
-        _ctx: &mut Self::CTX,
-    ) -> Result<()>
+    async fn early_request_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<()>
     where
         Self::CTX: Send + Sync,
     {
@@ -137,7 +130,7 @@ where
     ///
     /// Note that this doesn't prevent subrequests from being spawned based on the session by proxy
     /// core functionality, e.g. background cache revalidation requires spawning subrequests.
-    fn allow_spawning_subrequest(&self, _session: &Session<DS>, _ctx: &Self::CTX) -> bool
+    fn allow_spawning_subrequest(&self, _session: &Session, _ctx: &Self::CTX) -> bool
     where
         Self::CTX: Send + Sync,
     {
@@ -154,7 +147,7 @@ where
     /// who process the requests themselves.
     async fn request_body_filter(
         &self,
-        _session: &mut Session<DS>,
+        _session: &mut Session,
         _body: &mut Option<Bytes>,
         _end_of_stream: bool,
         _ctx: &mut Self::CTX,
@@ -171,7 +164,7 @@ where
     ///
     /// By default this filter does nothing which effectively disables caching.
     // Ideally only session.cache should be modified, TODO: reflect that in this interface
-    fn request_cache_filter(&self, _session: &mut Session<DS>, _ctx: &mut Self::CTX) -> Result<()>
+    fn request_cache_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<()>
     where
         Self::CTX: Send + Sync,
     {
@@ -194,12 +187,12 @@ where
     ///
     /// The default implementation panics. You **must** override this method when
     /// caching is enabled.
-    fn cache_key_callback(&self, _session: &Session<DS>, _ctx: &mut Self::CTX) -> Result<CacheKey> {
+    fn cache_key_callback(&self, _session: &Session, _ctx: &mut Self::CTX) -> Result<CacheKey> {
         unimplemented!("cache_key_callback must be implemented when caching is enabled")
     }
 
     /// This callback is invoked when a cacheable response is ready to be admitted to cache.
-    fn cache_miss(&self, session: &mut Session<DS>, _ctx: &mut Self::CTX) {
+    fn cache_miss(&self, session: &mut Session, _ctx: &mut Self::CTX) {
         session.cache.cache_miss();
     }
 
@@ -214,7 +207,7 @@ where
     /// and which kind. Returning `None` indicates no forced invalidation
     async fn cache_hit_filter(
         &self,
-        _session: &mut Session<DS>,
+        _session: &mut Session,
         _meta: &CacheMeta,
         _hit_handler: &mut HitHandler,
         _is_fresh: bool,
@@ -238,7 +231,7 @@ where
     /// caller's responsibility to disable keepalive or drain the request body if needed.
     async fn proxy_upstream_filter(
         &self,
-        _session: &mut Session<DS>,
+        _session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<bool>
     where
@@ -250,7 +243,7 @@ where
     /// Decide if the response is cacheable
     fn response_cache_filter(
         &self,
-        _session: &Session<DS>,
+        _session: &Session,
         _resp: &ResponseHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<RespCacheable> {
@@ -281,7 +274,7 @@ where
     /// be sent.
     fn cache_not_modified_filter(
         &self,
-        session: &Session<DS>,
+        session: &Session,
         resp: &ResponseHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<bool> {
@@ -305,7 +298,7 @@ where
     /// [RFC7232]: https://www.rfc-editor.org/rfc/rfc7232
     fn range_header_filter(
         &self,
-        session: &mut Session<DS>,
+        session: &mut Session,
         resp: &mut ResponseHeader,
         _ctx: &mut Self::CTX,
     ) -> range_filter::RangeType {
@@ -328,7 +321,7 @@ where
     /// `Transfer-Encoding: chunked`.
     async fn upstream_request_filter(
         &self,
-        _session: &mut Session<DS>,
+        _session: &mut Session,
         _upstream_request: &mut RequestHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<()>
@@ -360,7 +353,7 @@ where
     #[cfg(feature = "upstream_modules")]
     async fn adjust_upstream_modules(
         &self,
-        _session: &mut Session<DS>,
+        _session: &mut Session,
         _upstream_response: &ResponseHeader,
         _end_of_stream: bool,
         _ctx: &mut Self::CTX,
@@ -380,7 +373,7 @@ where
     /// cached header, not served directly to downstream).
     async fn upstream_response_filter(
         &self,
-        _session: &mut Session<DS>,
+        _session: &mut Session,
         _upstream_response: &mut ResponseHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<()>
@@ -396,7 +389,7 @@ where
     /// responses served from cache.
     async fn response_filter(
         &self,
-        _session: &mut Session<DS>,
+        _session: &mut Session,
         _upstream_response: &mut ResponseHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<()>
@@ -410,7 +403,7 @@ where
     #[doc(hidden)]
     async fn custom_forwarding(
         &self,
-        _session: &mut Session<DS>,
+        _session: &mut Session,
         _ctx: &mut Self::CTX,
         _custom_message_to_upstream: Option<mpsc::Sender<Bytes>>,
         _custom_message_to_downstream: mpsc::Sender<Bytes>,
@@ -425,7 +418,7 @@ where
     #[doc(hidden)]
     async fn downstream_custom_message_proxy_filter(
         &self,
-        _session: &mut Session<DS>,
+        _session: &mut Session,
         custom_message: Bytes,
         _ctx: &mut Self::CTX,
         _final_hop: bool,
@@ -440,7 +433,7 @@ where
     #[doc(hidden)]
     async fn upstream_custom_message_proxy_filter(
         &self,
-        _session: &mut Session<DS>,
+        _session: &mut Session,
         custom_message: Bytes,
         _ctx: &mut Self::CTX,
         _final_hop: bool,
@@ -455,45 +448,30 @@ where
     ///
     /// This function will be called every time a piece of response body is received. The `body` is
     /// **not the entire response body**.
-    ///
-    /// The async nature of this function allows implementations to await I/O or offload expensive
-    /// work without blocking the task processing the request.
-    async fn upstream_response_body_filter(
+    fn upstream_response_body_filter(
         &self,
-        _session: &mut Session<DS>,
+        _session: &mut Session,
         _body: &mut Option<Bytes>,
         _end_of_stream: bool,
         _ctx: &mut Self::CTX,
-    ) -> Result<Option<Duration>>
-    where
-        Self::CTX: Send + Sync,
-    {
+    ) -> Result<Option<Duration>> {
         Ok(None)
     }
 
     /// Similar to [Self::upstream_response_filter()] but for response trailers
-    ///
-    /// The async nature of this function allows implementations to await I/O or offload expensive
-    /// work without blocking the task processing the request.
-    async fn upstream_response_trailer_filter(
+    fn upstream_response_trailer_filter(
         &self,
-        _session: &mut Session<DS>,
+        _session: &mut Session,
         _upstream_trailers: &mut header::HeaderMap,
         _ctx: &mut Self::CTX,
-    ) -> Result<()>
-    where
-        Self::CTX: Send + Sync,
-    {
+    ) -> Result<()> {
         Ok(())
     }
 
     /// Similar to [Self::response_filter()] but for response body chunks
-    ///
-    /// The async nature of this function allows implementations to await I/O or offload expensive
-    /// work without blocking the task processing the request.
-    async fn response_body_filter(
+    fn response_body_filter(
         &self,
-        _session: &mut Session<DS>,
+        _session: &mut Session,
         _body: &mut Option<Bytes>,
         _end_of_stream: bool,
         _ctx: &mut Self::CTX,
@@ -511,7 +489,7 @@ where
     /// TODO: make this interface more intuitive
     async fn response_trailer_filter(
         &self,
-        _session: &mut Session<DS>,
+        _session: &mut Session,
         _upstream_trailers: &mut header::HeaderMap,
         _ctx: &mut Self::CTX,
     ) -> Result<Option<Bytes>>
@@ -526,7 +504,7 @@ where
     ///
     /// An error log is already emitted if there is any error. This phase is used for collecting
     /// metrics and sending access logs.
-    async fn logging(&self, _session: &mut Session<DS>, _e: Option<&Error>, _ctx: &mut Self::CTX)
+    async fn logging(&self, _session: &mut Session, _e: Option<&Error>, _ctx: &mut Self::CTX)
     where
         Self::CTX: Send + Sync,
     {
@@ -543,7 +521,7 @@ where
     /// The default implementation returns `None` (no context persisted).
     fn persist_connection_context(
         &self,
-        _session: &Session<DS>,
+        _session: &Session,
         _ctx: &Self::CTX,
     ) -> Option<Box<dyn Any + Send + Sync>> {
         None
@@ -559,7 +537,7 @@ where
     /// Use this to transfer state from the previous request into the new request's context.
     fn on_connection_reuse(
         &self,
-        _session: &mut Session<DS>,
+        _session: &mut Session,
         _ctx: &mut Self::CTX,
         _prev_ctx: Box<dyn Any + Send + Sync>,
     ) {
@@ -568,7 +546,7 @@ where
     /// A value of true means that the log message will be suppressed. The default value is false.
     ///
     /// See also: [`Self::suppress_proxy_warn_log`].
-    fn suppress_error_log(&self, _session: &Session<DS>, _ctx: &Self::CTX, _error: &Error) -> bool {
+    fn suppress_error_log(&self, _session: &Session, _ctx: &Self::CTX, _error: &Error) -> bool {
         false
     }
 
@@ -588,7 +566,7 @@ where
     /// Experimental: this API may change or be removed until indicated otherwise.
     fn suppress_proxy_warn_log(
         &self,
-        _session: &Session<DS>,
+        _session: &Session,
         _ctx: &Self::CTX,
         _error: &Error,
         _context: ProxyWarnLogContext,
@@ -609,7 +587,7 @@ where
     fn error_while_proxy(
         &self,
         peer: &HttpPeer,
-        session: &mut Session<DS>,
+        session: &mut Session,
         e: Box<Error>,
         _ctx: &mut Self::CTX,
         client_reused: bool,
@@ -634,7 +612,7 @@ where
     /// available.
     fn fail_to_connect(
         &self,
-        _session: &mut Session<DS>,
+        _session: &mut Session,
         _peer: &HttpPeer,
         _ctx: &mut Self::CTX,
         e: Box<Error>,
@@ -652,7 +630,7 @@ where
     /// selection, and the keepalive configured on the `Session` itself still takes precedent.
     async fn fail_to_proxy(
         &self,
-        session: &mut Session<DS>,
+        session: &mut Session,
         e: &Error,
         _ctx: &mut Self::CTX,
     ) -> FailToProxy
@@ -700,7 +678,7 @@ where
     // 5xx HTTP status will be encoded as ErrorType::HTTPStatus(code)
     fn should_serve_stale(
         &self,
-        _session: &mut Session<DS>,
+        _session: &mut Session,
         _ctx: &mut Self::CTX,
         error: Option<&Error>, // None when it is called during stale while revalidate
     ) -> bool {
@@ -716,7 +694,7 @@ where
     /// This filter allows user to log timing and connection related info.
     async fn connected_to_upstream(
         &self,
-        _session: &mut Session<DS>,
+        _session: &mut Session,
         _reused: bool,
         _peer: &HttpPeer,
         #[cfg(unix)] _fd: std::os::unix::io::RawFd,
@@ -733,7 +711,7 @@ where
     /// This callback is invoked every time request related error log needs to be generated
     ///
     /// Users can define what is important to be written about this request via the returned string.
-    fn request_summary(&self, session: &Session<DS>, _ctx: &Self::CTX) -> String {
+    fn request_summary(&self, session: &Session, _ctx: &Self::CTX) -> String {
         session.as_ref().request_summary()
     }
 
@@ -741,7 +719,7 @@ where
     ///
     /// - `true`: this request will be used to invalidate the cache.
     /// - `false`: this request is a treated as a normal request
-    fn is_purge(&self, _session: &Session<DS>, _ctx: &Self::CTX) -> bool {
+    fn is_purge(&self, _session: &Session, _ctx: &Self::CTX) -> bool {
         false
     }
 
@@ -751,7 +729,7 @@ where
     /// Returning [`PurgeAction::Expire`] asks to keep it and mark it stale instead, so it
     /// revalidates against the origin rather than being refetched in full. Storage that cannot
     /// mark an entry stale falls back to deleting it.
-    fn purge_action(&self, _session: &Session<DS>, _ctx: &Self::CTX) -> PurgeAction {
+    fn purge_action(&self, _session: &Session, _ctx: &Self::CTX) -> PurgeAction {
         PurgeAction::Delete
     }
 
@@ -763,7 +741,7 @@ where
     /// If the filter returns `Err`, the proxy will instead send a 500 response.
     fn purge_response_filter(
         &self,
-        _session: &Session<DS>,
+        _session: &Session,
         _ctx: &mut Self::CTX,
         _purge_status: PurgeStatus,
         _purge_response: &mut std::borrow::Cow<'static, ResponseHeader>,
