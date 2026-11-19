@@ -350,6 +350,12 @@ vectors 使用独立 Rust 参考序列化/HMAC 构造，绝不调用生产 auth/
 verify 执行格式、Clippy（警告为错误）、实际工作区测试及 locked release；空 harness 不算回归。
 默认测试离线，仅使用 loopback；显式慢速/外部测试必须单独运行，不能把 ignored 计为通过。
 
+生产依赖由仓库根目录 `Cargo.lock` 锁定。`vendor/pingora` 是被 root workspace 使用的
+本地补丁源码，其独立 workspace 生成的 `Cargo.lock` 被 Git 忽略，不是交付文件；不要把
+这类本地生成物写入 `SHA256SUMS`。审计仍检查全部保留源码的哈希和文件集合。若独立
+工具在 vendor 目录生成额外文件，应先移出源码目录再审计；缺失文件错误会指出具体路径。
+xtask 回归测试会只复制 Git 跟踪的 vendor 文件，验证干净检出也能通过源码审计。
+
 实验编排、套件定义、进程组超时清理、基线/原始退出码、证据门槛和归档已移到 Rust xtask。
 仅 [tools/analyze.py](../tools/analyze.py) 保留 Python，调用 tshark 并使用独立 cryptography
 验证 JWS、CSR、EAB。result.json 是每次实验唯一机器结论，完整原始日志与私有工件留在源码树外。

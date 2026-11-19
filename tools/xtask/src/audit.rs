@@ -172,9 +172,11 @@ fn digest_directory(directory: &Path) -> Result<String> {
             expected.insert(path.clone()),
             "duplicate vendor manifest path",
         )?;
+        let bytes = fs::read(&path)
+            .map_err(|error| format!("cannot read vendored source {}: {error}", path.display()))?;
         check(
-            super::hex(Sha256::digest(fs::read(path)?)) == hash,
-            "vendored source checksum mismatch",
+            super::hex(Sha256::digest(bytes)) == hash,
+            &format!("vendored source checksum mismatch: {}", path.display()),
         )?;
     }
     let mut actual = BTreeSet::new();
@@ -321,4 +323,46 @@ pub fn vectors(verify: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vendored_sources_survive_a_clean_checkout() -> Result<()> {
+        let checkout = tempfile::tempdir()?;
+        let repository = root();
+        // A warm workspace may contain ignored files named by SHA256SUMS.
+        // Copy only tracked paths to reproduce what CI and source archives get.
+        // Already-exported sources have no Git metadata: audit them directly.
+        if repository.join(".git").exists() {
+            let files = capture(
+                &repository,
+                "git",
+                &[
+                    "ls-files",
+                    "-z",
+                    "--",
+                    "vendor/instant-acme",
+                    "vendor/pingora",
+                ],
+            )?;
+            check(!files.is_empty(), "tracked vendor sources missing")?;
+            for name in files.split('\0').filter(|name| !name.is_empty()) {
+                let destination = checkout.path().join(name);
+                fs::create_dir_all(destination.parent().ok_or("vendor path missing parent")?)?;
+                fs::copy(repository.join(name), destination)?;
+            }
+        }
+        let sources = if repository.join(".git").exists() {
+            checkout.path()
+        } else {
+            &repository
+        };
+        for directory in ["vendor/instant-acme", "vendor/pingora"] {
+            digest_directory(&sources.join(directory))?;
+        }
+        Ok(())
+    }
 }
