@@ -436,3 +436,88 @@ async fn renewal_degradation(panic: bool) {
         .unwrap()
         .unwrap();
 }
+
+/// Regression: a renewal controller that stops while serving must not leave the
+/// process running without renewal. The supervisor reopens a fresh controller
+/// from the durable journal while the valid network keeps serving.
+#[tokio::test]
+async fn acme_control_panic_is_restarted_by_supervisor() {
+    let env = Environment::start("control-restart", Mode::Normal).await;
+    env.state.lock().unwrap().domain = "proxy.example.test".into();
+    let mut fixture = fixture();
+    let config = Arc::get_mut(&mut fixture.config).unwrap();
+    config.acme = env.config().acme;
+    config.state_dir = env.case.path().join("live-state");
+    config.limits.idle_timeout_secs = 30;
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    config.listener.tcp = tcp.local_addr().unwrap();
+    config.listener.udp = std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    drop(tcp);
+    let config = fixture.config.clone();
+    let worker = config.state_dir.join("acme/WORKER");
+    let (stop, rx) = watch::channel(false);
+    let (release_exit, exit) = std::sync::mpsc::channel();
+    release_exit.send(()).unwrap();
+    let mut first = Some(env.panic_provider(exit));
+    let fallback_env = env.provider("none");
+    let mut fallback = Some(fallback_env);
+    let providers = move || {
+        first
+            .take()
+            .or_else(|| fallback.take())
+            .expect("two controllers")
+    };
+    let task = tokio::spawn(crate::runtime::serve_with_provider_factory(
+        config.clone(),
+        providers,
+        env.http(),
+        rx,
+        crate::runtime::Restart {
+            initial: Duration::from_secs(1),
+            max: Duration::from_secs(1),
+            healthy_after: Duration::from_secs(3600),
+        },
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while TcpStream::connect(config.listener.tcp).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let cert = observed_h2(config.listener.tcp, &env.ca_file, &env.case).await;
+    // Force a renewal attempt; the first controller panics in DNS preparation.
+    env.state.lock().unwrap().mode = Mode::Dns("normal");
+    let report = || crate::acme::health::report(&worker).unwrap_or_default();
+    tokio::time::timeout(Duration::from_secs(12), async {
+        while !report().contains("renewal_worker=stopped_or_stale") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first controller stops after the injected panic");
+    tokio::time::timeout(Duration::from_secs(12), async {
+        while !report().contains("renewal_worker=running") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("supervisor restarts the renewal controller");
+    assert!(
+        !task.is_finished(),
+        "network keeps serving across the restart"
+    );
+    assert_eq!(
+        record_handshakes(&config, &env.ca_file, &env.case).await,
+        serial(&cert)
+    );
+    stop.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}

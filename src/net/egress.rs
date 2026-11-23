@@ -698,6 +698,12 @@ mod tests {
             .unwrap();
         assert_eq!(stream.peer_addr().unwrap(), address);
         assert!(stream.nodelay().unwrap());
+        // TCP Fast Open is prohibited: outbound proxy sockets never request it.
+        #[cfg(target_os = "linux")]
+        assert!(
+            !nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::TcpFastOpenConnect)
+                .unwrap()
+        );
         let (accepted, _) = open.accept().await.unwrap();
         drop((stream, accepted, open));
         assert_eq!(

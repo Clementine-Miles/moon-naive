@@ -1,5 +1,5 @@
 [Unit]
-Description=moon-naive H2/H3 proxy and automatic DNS-01 certificate manager
+Description=Moon-naive server (mona H2/H3 proxy, website and DNS-01 certificate manager)
 Wants=network-online.target
 After=network-online.target
 StartLimitIntervalSec=60

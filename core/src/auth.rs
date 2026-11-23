@@ -1,13 +1,29 @@
-//! moon-naive proofs: standard HMAC-SHA256 bound to the TLS exporter and HTTP stream.
-//! No bearer passwords, clock window, nonce cache, or connection-wide login.
+//! mona per-stream authentication for the Rupin profile: standard HMAC-SHA256
+//! bound to the TLS exporter and HTTP stream. No bearer passwords, clock
+//! window, nonce cache, or connection-wide login.
+//!
+//! Naming: the project is Moon-naive, the protocol is mona, and the profile
+//! formerly called "revision 4" is Rupin. The byte strings below are
+//! protocol-visible cryptographic domain separators of the Rupin profile and
+//! intentionally keep their historical spelling (`moon-naive`, `v4`). Renaming
+//! them would be an incompatible wire change, not a cosmetic one.
 use crate::codec::{Mode, Offer};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+/// Human-readable protocol name. Not transmitted.
+pub const PROTOCOL: &str = "mona";
+/// Human-readable protocol profile name. Not transmitted; the profile is
+/// identified on the wire by the exact labels below.
+pub const PROFILE: &str = "Rupin";
+/// Authorization scheme token (ASCII case-insensitive on receipt).
+pub const SCHEME: &str = "moon-naive";
 pub const EXPORTER_LABEL: &str = "EXPORTER-moon-naive-v4";
 const DOMAIN: &[u8] = b"moon-naive/v4/request\0";
+const KEY_DOMAIN: &[u8] = b"moon-naive/v4/key\0";
+const RESPONSE_DOMAIN: &[u8] = b"moon-naive/v4/response/200\0";
 
 /// Only transport adapters can supply the actual TLS exporter and stream ID.
 /// Do not derive either value from untrusted HTTP headers.
@@ -52,7 +68,7 @@ impl Credentials {
                 );
             }
             let mut hash = Sha256::new();
-            hash.update(b"moon-naive/v4/key\0");
+            hash.update(KEY_DOMAIN);
             hash.update(user.as_bytes());
             hash.update(b":");
             hash.update(pass.as_bytes());
@@ -115,12 +131,7 @@ impl Credentials {
             mode.bits(),
             proof(
                 self.keys.get(principal)?,
-                &transcript(
-                    context,
-                    b"moon-naive/v4/response/200\0",
-                    offer.bits(),
-                    mode.bits(),
-                ),
+                &transcript(context, RESPONSE_DOMAIN, offer.bits(), mode.bits()),
             ),
         ))
     }
@@ -140,7 +151,7 @@ impl Credentials {
         }
         let expected = proof(
             self.keys.get(principal)?,
-            &transcript(context, b"moon-naive/v4/response/200\0", offer.bits(), bits),
+            &transcript(context, RESPONSE_DOMAIN, offer.bits(), bits),
         );
         bool::from(incoming.ct_eq(&expected)).then_some(mode)
     }
@@ -159,7 +170,8 @@ impl Credentials {
 fn header(bits: u8, mac: [u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut value = String::with_capacity(58);
-    value.push_str("moon-naive ");
+    value.push_str(SCHEME);
+    value.push(' ');
     value.push(char::from(HEX[usize::from(bits >> 4)]));
     value.push(char::from(HEX[usize::from(bits & 15)]));
     value.push('.');
@@ -172,7 +184,7 @@ fn parse(header: &str) -> Option<(u8, [u8; 32])> {
         return None;
     }
     let (scheme, value) = header.split_once(' ')?;
-    if !scheme.eq_ignore_ascii_case("moon-naive") {
+    if !scheme.eq_ignore_ascii_case(SCHEME) {
         return None;
     }
     let (hex, encoded) = value.split_once('.')?;

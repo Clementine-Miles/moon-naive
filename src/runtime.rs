@@ -169,10 +169,8 @@ pub(crate) async fn wait_stop(stop: &mut watch::Receiver<bool>) {
 }
 /// Issue the first certificate before binding, then keep renewing while serving.
 pub async fn serve(config: Arc<Config>, shutdown: watch::Receiver<bool>) -> Result<()> {
-    serve_with(config, shutdown, |config, stop| {
-        Control::start(config, stop, Mode::Run)
-    })
-    .await
+    let start = |config, stop| Control::start(config, stop, Mode::Run);
+    serve_with(config, shutdown, start, Some(start), Restart::PRODUCTION).await
 }
 /// Embed the lifecycle with an explicit DNS implementation. The CLI only uses
 /// provider_from_config; there is no test/provider-endpoint configuration switch.
@@ -182,22 +180,91 @@ pub async fn serve_with_provider<P: DnsProvider + 'static>(
     http: Http,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    serve_with(config, shutdown, move |config, stop| {
-        Control::spawn(
-            move || Manager::open(&config, provider, http),
-            stop,
-            Mode::Run,
-        )
-    })
+    // A single provider instance cannot be reopened, so renewal is not
+    // restarted here; the network continues while the certificate is valid.
+    serve_with(
+        config,
+        shutdown,
+        move |config, stop| {
+            Control::spawn(
+                move || Manager::open(&config, provider, http),
+                stop,
+                Mode::Run,
+            )
+        },
+        None::<fn(Arc<Config>, watch::Receiver<bool>) -> Result<Control>>,
+        Restart::PRODUCTION,
+    )
     .await
 }
-async fn serve_with<F>(
+/// Like [`serve_with_provider`], but a provider factory lets the supervisor
+/// reopen a stopped renewal controller from the durable journal.
+#[cfg(test)]
+pub(crate) async fn serve_with_provider_factory<P, G>(
+    config: Arc<Config>,
+    mut providers: G,
+    http: Http,
+    shutdown: watch::Receiver<bool>,
+    restart: Restart,
+) -> Result<()>
+where
+    P: DnsProvider + 'static,
+    G: FnMut() -> P + Send + 'static,
+{
+    let first = providers();
+    let first_http = http.clone();
+    serve_with(
+        config,
+        shutdown,
+        move |config, stop| {
+            Control::spawn(
+                move || Manager::open(&config, first, first_http),
+                stop,
+                Mode::Run,
+            )
+        },
+        Some(move |config: Arc<Config>, stop| {
+            let provider = providers();
+            let http = http.clone();
+            Control::spawn(
+                move || Manager::open(&config, provider, http),
+                stop,
+                Mode::Run,
+            )
+        }),
+        restart,
+    )
+    .await
+}
+/// Backoff for restarting a renewal controller that stopped while serving.
+#[derive(Clone, Copy)]
+pub(crate) struct Restart {
+    pub initial: Duration,
+    pub max: Duration,
+    /// A controller that ran at least this long before stopping resets backoff.
+    pub healthy_after: Duration,
+}
+impl Restart {
+    pub(crate) const PRODUCTION: Self = Self {
+        initial: Duration::from_secs(60),
+        max: Duration::from_secs(3600),
+        healthy_after: Duration::from_secs(3600),
+    };
+    fn delay(&self, consecutive_failures: u32) -> Duration {
+        let shift = consecutive_failures.saturating_sub(1).min(16);
+        self.initial.saturating_mul(1 << shift).min(self.max)
+    }
+}
+async fn serve_with<F, R>(
     config: Arc<Config>,
     mut shutdown: watch::Receiver<bool>,
     factory: F,
+    mut restart: Option<R>,
+    policy: Restart,
 ) -> Result<()>
 where
     F: FnOnce(Arc<Config>, watch::Receiver<bool>) -> Result<Control>,
+    R: FnMut(Arc<Config>, watch::Receiver<bool>) -> Result<Control>,
 {
     if *shutdown.borrow() {
         return Ok(());
@@ -208,7 +275,7 @@ where
     );
     let prepared = tokio::select! {biased;_=wait_stop(&mut shutdown)=>return Ok(()),result=Prepared::load(config.clone())=>result?};
     let (stop, receive) = watch::channel(false);
-    let mut control = factory(config, receive.clone())?;
+    let mut control = factory(config.clone(), receive.clone())?;
     let mut ready = control.ready.clone();
     let mut serving = false;
     let result=async {
@@ -228,24 +295,53 @@ where
         serving = true;
         for (name,tcp,udp) in network.listener_addrs()? { eprintln!("event=server_ready listener={name} tcp={tcp:?} udp={udp:?} tls=boringssl quic=quiche"); }
         notify("READY=1\nSTATUS=Serving H2/H3; automatic certificate renewal active")?;
-        let network=network.run(receive);
+        let network=network.run(receive.clone());
         tokio::pin!(network);
-        tokio::select! {biased;
-            _=wait_stop(&mut shutdown)=>{notify("STOPPING=1\nSTATUS=Draining connections")?;let _=stop.send(true);network.await},
-            result=control.wait()=>{
-                // Remote Problem bodies and URLs are not safe operational log fields.
-                eprintln!("event=renewal_stopped reconcile_required=true failed={}", result.is_err());
-                if let Err(error) = notify("STATUS=Network continues with TLS/ECH admission checks; renewal stopped, explicit reconciliation required") {
-                    eprintln!("event=renewal_status_report_failed detail={error}");
-                }
-                // Never resume the failed Manager or replay unknown side effects.
-                // Network admission continues to check inner and ECH expiry.
-                tokio::select! {
-                    _=wait_stop(&mut shutdown)=>{let _=stop.send(true);network.await},
-                    result=&mut network=>result,
-                }
-            },
-            result=&mut network=>{result?;Err("network drivers stopped unexpectedly".into())},
+        let mut failures = 0u32;
+        let mut started = std::time::Instant::now();
+        loop {
+            tokio::select! {biased;
+                _=wait_stop(&mut shutdown)=>{notify("STOPPING=1\nSTATUS=Draining connections")?;let _=stop.send(true);return network.await},
+                result=control.wait(), if !control.finished=>{
+                    if started.elapsed() >= policy.healthy_after { failures = 0; }
+                    failures = failures.saturating_add(1);
+                    // Remote Problem bodies and URLs are not safe operational log fields.
+                    eprintln!("event=renewal_stopped failed={} consecutive_failures={failures} restart={}", result.is_err(), restart.is_some());
+                    let Some(restart) = restart.as_mut() else {
+                        if let Err(error) = notify("STATUS=Network continues with TLS/ECH admission checks; renewal stopped, explicit reconciliation required") {
+                            eprintln!("event=renewal_status_report_failed detail={error}");
+                        }
+                        // Network admission continues to check inner and ECH expiry.
+                        continue;
+                    };
+                    let delay = policy.delay(failures);
+                    eprintln!("event=renewal_restart_scheduled delay_secs={} consecutive_failures={failures}", delay.as_secs());
+                    if let Err(error) = notify(&format!("STATUS=Serving; renewal controller stopped, restart in {}s (failure {failures})", delay.as_secs())) {
+                        eprintln!("event=renewal_status_report_failed detail={error}");
+                    }
+                    tokio::select! {biased;
+                        _=wait_stop(&mut shutdown)=>{let _=stop.send(true);return network.await},
+                        result=&mut network=>{result?;return Err("network drivers stopped unexpectedly".into())},
+                        _=tokio::time::sleep(delay)=>{},
+                    }
+                    // The previous controller thread has been joined, so its
+                    // journal lock is released. Never resume the failed
+                    // Manager in memory: reopen from durable state, exactly as
+                    // a process restart would.
+                    match restart(config.clone(), receive.clone()) {
+                        Ok(next) => {
+                            control = next;
+                            started = std::time::Instant::now();
+                            eprintln!("event=renewal_restarted consecutive_failures={failures}");
+                        }
+                        Err(error) => {
+                            eprintln!("event=renewal_restart_failed detail={error}");
+                            return Err(error);
+                        }
+                    }
+                },
+                result=&mut network=>{result?;return Err("network drivers stopped unexpectedly".into())},
+            }
         }
     }.await;
     let _ = stop.send(true);
@@ -308,6 +404,13 @@ mod tests {
         let config = Config::parse(include_str!("../config.example.toml")).unwrap();
         let (_send, receive) = watch::channel(true);
         serve(Arc::new(config), receive).await.unwrap();
+    }
+    #[test]
+    fn renewal_restart_backoff_doubles_and_is_capped() {
+        let policy = Restart::PRODUCTION;
+        let secs: Vec<_> = (1..=9).map(|n| policy.delay(n).as_secs()).collect();
+        assert_eq!(secs, [60, 120, 240, 480, 960, 1920, 3600, 3600, 3600]);
+        assert_eq!(policy.delay(u32::MAX), policy.max);
     }
     #[test]
     fn readiness_uses_the_systemd_datagram_protocol() {

@@ -281,6 +281,13 @@ pub enum Issuer {
     Google,
 }
 impl Acme {
+    /// The issuer rejects a newAccount request without External Account Binding.
+    pub fn requires_eab_for_registration(&self) -> bool {
+        self.issuer == Issuer::Google
+    }
+    pub fn has_eab(&self) -> bool {
+        self.eab.is_some() || self.eab_credentials_file.is_some()
+    }
     pub fn directory(&self) -> &str {
         self.directory_url
             .as_deref()
@@ -475,9 +482,10 @@ impl Config {
         {
             return Err("Cloudflare requires a 32-character dns_zone_id");
         }
-        if a.issuer == Issuer::Google && a.eab_credentials_file.is_none() && a.eab.is_none() {
-            return Err("Google Trust Services requires acme.eab or eab_credentials_file");
-        }
+        // Google Trust Services requires EAB only for the initial newAccount
+        // request. A persisted account recovers without the original, possibly
+        // single-use, EAB secret, so the requirement is enforced against the
+        // ACME journal when the manager opens, not here.
         if a.dns_provider == "porkbun"
             && a.dns_zone.as_ref().is_none_or(|zone| {
                 let zone = zone.to_ascii_lowercase();
@@ -649,8 +657,11 @@ mod tests {
             assert!(c.validate().is_err());
         }
         c.domain = "proxy.example.dev".into();
+        // Regression: an existing Google account must restart without the
+        // original EAB secret. Initial registration is checked by the manager.
         c.acme.eab = None;
-        assert!(c.validate().is_err());
+        assert!(c.validate().is_ok());
+        assert!(c.acme.requires_eab_for_registration());
         c.acme.eab_credentials_file = Some("relative.toml".into());
         assert!(c.validate().is_err());
     }

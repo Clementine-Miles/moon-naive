@@ -1,0 +1,35 @@
+# Moon-naive client configuration. Keep it private: chmod 600 client.toml.
+# Validate offline with: moon-naive-client check client.toml
+
+# Server host:port. H2 uses TCP and H3 uses UDP on the same port.
+server = "proxy.example.com:443"
+# TLS name for SNI (or the ECH inner name) and certificate verification.
+# Defaults to the host part of `server`; required when `server` is an IP.
+# server_name = "proxy.example.com"
+
+# Local listener for both SOCKS5 and HTTP CONNECT. It has no authentication,
+# so keep it on loopback.
+listen = "127.0.0.1:1080"
+
+# The same user configured on the server. Use a long random password.
+username = "alice"
+password = "replace-with-a-long-random-secret"
+
+# "h2", "h3", or "h3-then-h2". The fallback is taken only when a QUIC
+# connection cannot be established; a server's answer is never retried over
+# another transport, and both transports use identical TLS/ECH/auth policy.
+transport = "h3-then-h2"
+
+# PEM trust anchors. Omit to use the system trust store. Certificate
+# verification cannot be disabled.
+# ca_file = "/etc/moon-naive/ca.pem"
+
+# Base64 ECHConfigList printed by `moon-naive ech dns` on the server. When set,
+# ECH is required: connections the server does not accept with ECH fail.
+# ech_config_list = "AEX+DQBB..."
+
+connect_timeout_secs = 15
+local_handshake_timeout_secs = 10
+max_tunnels = 256
+quic_idle_timeout_secs = 30
+log_level = "info"   # error | info | debug (targets are logged only at debug)
