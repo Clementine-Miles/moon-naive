@@ -30,4 +30,4 @@ Full coverage gaps remain explicit:
 - kernel path QUIC loss/delay/NAT rebinding, migration attempts, CID rotation, congestion/pacing/retransmission benchmarks; three bounded post-handshake client UDP perturbations measured here
 - malformed TLS/QUIC handshake corpus and packet-level CONNECTION_CLOSE comparison
 
-Reproduce using `cargo xtask differential-fetch` and `cargo xtask differential` as documented in [PROJECT.md](../PROJECT.md#独立-https-差异实验). Packet capture was optional and was not executed for this run. No production wire-protocol change was made.
+Reproduce using `cargo xtask differential-fetch` and `cargo xtask differential` as documented in [testing.md](../testing.md#https-differential-experiment). Packet capture was optional and was not executed for this run. No production wire-protocol change was made.

@@ -1,22 +1,66 @@
-# moon-naive
+# Moon-naive
 
-**mona 0.7.0**：面向 Linux x86_64 的 Rust 服务端，使用 Pingora、BoringSSL 和 quiche，
-提供多端口网站反代、认证 H2/H3 CONNECT 与普通 HTTP(S) 正向代理，内置 DNS-01 证书续期与文件 ACL。
-仅支持 [moon-naive 修订 4](docs/PROTOCOL.md)，不兼容官方 NaiveProxy；生产客户端尚未完成。
+Moon-naive is a Rust HTTPS server and client for a single node with a few
+trusted users. The server hosts real websites (reverse proxy over HTTP/1.1,
+HTTP/2 and HTTP/3) and carries authenticated proxy tunnels with the **mona**
+protocol, using its only profile, **Rupin** (formerly "revision 4"). It
+manages its own certificates over ACME DNS-01. The first-party client exposes
+a local SOCKS5 and HTTP CONNECT proxy and tunnels over H2 or H3.
 
-需要 Rust 1.100+、C/C++、make、CMake、libclang、Perl、pkg-config；生产运行无需 Go/Python。
+- Per-stream authentication bound to the TLS 1.3 exporter and stream ID; failed
+  authentication is served as ordinary website traffic and never dials out.
+- BoringSSL (TLS 1.3, ECH), Pingora (H1/H2, website), quiche (QUIC/H3).
+- Automatic certificate issuance and renewal (Google Trust Services or Let's
+  Encrypt; Porkbun or Cloudflare DNS), with a durable recovery journal and
+  supervised renewal.
+- Destination policy on resolved addresses, layered quotas, bounded buffers.
+- Never uses TCP Fast Open.
+
+It is not compatible with upstream NaiveProxy, and it makes no claim of being
+undetectable or unblockable; see [docs/security.md](docs/security.md).
+
+## Quick start
+
+Requires Linux, Rust 1.100, a C/C++ toolchain, CMake, libclang, Perl and
+pkg-config (to build BoringSSL).
 
 ```sh
-cargo build --release --locked -p moon-naive
-./target/release/moon-naive config init /path/to/config.toml
-# 填写真实域名、用户、源站与 DNS/EAB 凭据，阅读并接受 CA 条款；配置权限 0600。
-./target/release/moon-naive check /path/to/config.toml
-./target/release/moon-naive serve /path/to/config.toml
+cargo build --release --locked -p moon-naive -p moon-naive-client
+
+# Server
+./target/release/moon-naive config init /etc/moon-naive/config.toml
+#   edit domain, users, website origin, DNS and (first registration only) EAB credentials,
+#   then set accept_terms = true after reading the CA terms
+./target/release/moon-naive check /etc/moon-naive/config.toml
+./target/release/moon-naive serve /etc/moon-naive/config.toml
+
+# Client
+install -m600 client.example.toml client.toml   # edit server, username, password
+./target/release/moon-naive-client run client.toml
+curl --proxy socks5h://127.0.0.1:1080 https://example.org/
 ```
 
-[项目手册](docs/PROJECT.md) 统一说明配置、组件与认证路由、证书恢复、部署、实验及许可。
-单端口配置见 [config.example.toml](config.example.toml)，双端口见
-[config.dual.example.toml](config.dual.example.toml)，目的地策略见 [acl.example.toml](acl.example.toml)；
-state_dir 必须持久保存。端口共享全局安全额度，保留独立传输策略。
-开发入口：`cargo xtask verify`、`cargo xtask vectors --check`、`cargo xtask lab`。
-[验证与待办](docs/PROJECT.md#维护与验证记录) 区分已执行测试和未验收能力。许可证：[Apache-2.0](LICENSE)。
+## Documentation
+
+| Document | Contents |
+| --- | --- |
+| [docs/architecture.md](docs/architecture.md) | Components, ownership, routing, dependencies |
+| [docs/protocol.md](docs/protocol.md) | Authoritative mona/Rupin wire specification |
+| [docs/configuration.md](docs/configuration.md) | Server configuration, endpoints, ACL, website routing, EAB, ECH |
+| [docs/client.md](docs/client.md) | Client configuration and behavior |
+| [docs/deployment.md](docs/deployment.md) | Installation, files, operations, backup and rollback |
+| [docs/security.md](docs/security.md) | Threat model, controls, known limits |
+| [docs/testing.md](docs/testing.md) | Test suites, laboratories, measurements, latest results |
+| [docs/development.md](docs/development.md) | Layout, naming, dependency policy, non-Rust inventory, release |
+| [docs/audit.md](docs/audit.md) | 2026-11-23 refactor audit: findings and fixes |
+
+## Status and limitations
+
+Linux x86_64 is the supported platform for both binaries. Android and other
+platforms are not supported by the Rust client. QUIC active migration is
+disabled (passive NAT rebinding works up to 7 times per connection). ECH
+configuration lists are given to the client explicitly (no DNS discovery).
+See [docs/audit.md](docs/audit.md#not-done-with-reasons) for validation not
+performed.
+
+License: [Apache-2.0](LICENSE).

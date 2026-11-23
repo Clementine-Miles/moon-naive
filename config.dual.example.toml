@@ -1,6 +1,6 @@
 # Complete two-endpoint deployment. Replace every credential/domain placeholder,
 # accept the CA terms explicitly, and install as a service-owned 0600 file.
-# See docs/PROJECT.md. This shares one certificate manager and one user database.
+# See docs/configuration.md. This shares one certificate manager and one user database.
 domain = "proxy.example.dev"
 state_dir = "/var/lib/moon-naive"
 

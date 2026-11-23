@@ -56,7 +56,7 @@ members = ["core", "client", "tools/xtask"]
 default-members = [".", "client"]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.100"
 license = "Apache-2.0"

@@ -448,3 +448,38 @@ async fn client_ech_is_accepted_on_h2_and_h3_and_never_bypassed() {
     task.await.unwrap().unwrap();
     origin_task.abort();
 }
+
+/// Loopback throughput of the full client→server→origin path. Run with:
+/// cargo test --release --locked -p moon-naive --lib client_throughput -- --ignored --nocapture
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement; run explicitly in release mode"]
+async fn client_throughput_benchmark() {
+    const SIZE: usize = 64 * 1024 * 1024;
+    for transport in ["h2", "h3"] {
+        let mut f = fixture();
+        let config = Arc::get_mut(&mut f.config).unwrap();
+        config.limits.idle_timeout_secs = 60;
+        let (origin, origin_task) = echo_origin().await;
+        let server = network_same_port(&f, origin).await;
+        let address = server.tcp_addr().unwrap();
+        let (stop, shutdown) = watch::channel(false);
+        let task = tokio::spawn(server.run(shutdown));
+        let client = Client::start(&client_config(address, &f.ca, transport, PASSWORD)).await;
+        for run in 0..3 {
+            let (stream, code) = socks(client.address, "example.org", 443).await;
+            assert_eq!(code, 0);
+            let started = std::time::Instant::now();
+            echo_round_trip(stream, SIZE, run).await;
+            let seconds = started.elapsed().as_secs_f64();
+            // Bytes cross the tunnel twice (upload and echoed download).
+            println!(
+                "client_throughput transport={transport} run={run} bytes_each_way={SIZE} seconds={seconds:.3} mbit_per_s_each_way={:.1}",
+                SIZE as f64 * 8.0 / seconds / 1e6
+            );
+        }
+        client.stop().await;
+        stop.send(true).unwrap();
+        task.await.unwrap().unwrap();
+        origin_task.abort();
+    }
+}
