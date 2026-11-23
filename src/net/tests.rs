@@ -1,6 +1,7 @@
 use super::*;
 use tokio::net::TcpStream;
 mod acme_live;
+mod client_e2e;
 mod differential;
 mod evolution;
 mod multi_device;
