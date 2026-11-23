@@ -335,9 +335,9 @@ async fn client_reconnects_after_server_restart() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn client_sockets_never_request_tcp_fast_open() {
+async fn client_sockets_never_request_tfo() {
     // The client opens its H2 TCP socket with plain connect(); prove the
-    // TCP_FASTOPEN_CONNECT option is off on an equivalent tokio socket and
+    // connect-time TFO option is off on an equivalent tokio socket and
     // that the client crate has no project-owned TFO code (static audit).
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let stream = TcpStream::connect(listener.local_addr().unwrap())

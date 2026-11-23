@@ -94,13 +94,12 @@ certificate was blocked, or simply wait for the next attempt.
 
 ## TCP Fast Open
 
-Moon-naive never enables TCP Fast Open: no project-owned code, configuration,
-unit or documentation sets `TCP_FASTOPEN`, `TCP_FASTOPEN_CONNECT` or
-`MSG_FASTOPEN`, or changes `net.ipv4.tcp_fastopen`. `cargo xtask audit-tfo`
-enforces this in CI, and tests assert that outbound sockets do not request
-TFO. The audit cannot see the host: a kernel sysctl that forces server-side
-TFO without a socket option (`net.ipv4.tcp_fastopen` bit `0x400`) is outside
-the program's control. Keep the distribution default and do not set that bit.
+Moon-naive never enables TCP Fast Open (TFO). No project-owned code,
+configuration, unit or documentation sets a TFO socket option or send flag,
+or changes the kernel's TFO sysctl. `cargo xtask audit-tfo` enforces this in
+CI, and tests assert that outbound sockets do not request TFO. The audit cannot
+see the host: a kernel sysctl setting that forces server-side TFO without a
+socket option is outside the program's control. Keep the distribution default.
 The systemd unit's `ProtectKernelTunables=true` stops the service itself from
 changing sysctls.
 
