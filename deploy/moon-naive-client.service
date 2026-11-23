@@ -1,0 +1,24 @@
+# Moon-naive client as a systemd user service:
+#   install -Dm600 client.toml ~/.config/moon-naive/client.toml
+#   install -Dm644 moon-naive-client.service ~/.config/systemd/user/
+#   systemctl --user enable --now moon-naive-client
+[Unit]
+Description=Moon-naive client (local SOCKS5/HTTP CONNECT over mona)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/moon-naive-client run %h/.config/moon-naive/client.toml
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target

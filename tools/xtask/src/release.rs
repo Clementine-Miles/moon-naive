@@ -197,8 +197,25 @@ pub fn dist(binary: &Path, directory: &Path) -> Result<()> {
     copy(&binary, &stage.join("moon-naive"), true)?;
     for (source, destination, executable) in [
         ("README.md", "README.md", false),
-        ("docs/PROJECT.md", "docs/PROJECT.md", false),
-        ("docs/PROTOCOL.md", "docs/PROTOCOL.md", false),
+        ("docs/architecture.md", "docs/architecture.md", false),
+        ("docs/audit.md", "docs/audit.md", false),
+        ("docs/client.md", "docs/client.md", false),
+        ("docs/configuration.md", "docs/configuration.md", false),
+        ("docs/deployment.md", "docs/deployment.md", false),
+        ("docs/development.md", "docs/development.md", false),
+        ("docs/protocol.md", "docs/protocol.md", false),
+        ("docs/security.md", "docs/security.md", false),
+        ("docs/testing.md", "docs/testing.md", false),
+        (
+            "docs/reports/https-differential-2026-11-17.md",
+            "docs/reports/https-differential-2026-11-17.md",
+            false,
+        ),
+        (
+            "docs/reports/https-differential-2026-11-17.json",
+            "docs/reports/https-differential-2026-11-17.json",
+            false,
+        ),
         ("LICENSE", "LICENSE", false),
         (
             "deploy/moon-naive.service",

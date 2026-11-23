@@ -89,6 +89,18 @@ impl<P: DnsProvider> Manager<P> {
         if journal.account.is_none()
             && journal.account_id.is_none()
             && journal.account_key.is_empty()
+            && config.acme.requires_eab_for_registration()
+            && !config.acme.has_eab()
+        {
+            return Err(
+                "initial registration with this issuer requires acme.eab or \
+                 eab_credentials_file; an existing account recovers without it"
+                    .into(),
+            );
+        }
+        if journal.account.is_none()
+            && journal.account_id.is_none()
+            && journal.account_key.is_empty()
             && let Some(path) = config.acme.eab_credentials_file.as_deref()
         {
             super::account::load_credentials(path)?;

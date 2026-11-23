@@ -51,7 +51,7 @@ impl TunnelRequest {
     }
 }
 
-/// Proxy credentials and Naïve negotiation never reach a website or origin.
+/// Proxy credentials and mona negotiation never reach a website or origin.
 pub const PROXY_HEADERS: &[&str] = &[
     // CGI maps this to HTTP_PROXY (httpoxy). It is not a website identity.
     "proxy",

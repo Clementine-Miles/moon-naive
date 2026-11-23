@@ -12,6 +12,7 @@ pub(super) struct AccountClient {
     contact: String,
     eab_file: Option<PathBuf>,
     eab_inline: Option<moon_naive_core::config::EabCredentials>,
+    eab_required: bool,
 }
 impl AccountClient {
     pub fn new(config: &Config, http: Http) -> Self {
@@ -20,6 +21,7 @@ impl AccountClient {
             contact: config.acme.contact.clone(),
             eab_file: config.acme.eab_credentials_file.clone(),
             eab_inline: config.acme.eab.clone(),
+            eab_required: config.acme.requires_eab_for_registration(),
         }
     }
     pub async fn restore_or_create(
@@ -49,7 +51,8 @@ impl AccountClient {
             }
             let der = PrivatePkcs8KeyDer::from(journal.account_key.clone());
             let key = Key::from_pkcs8_der(der.clone_key(), &CRYPTO)?;
-            if self.eab_file.is_some() || self.eab_inline.is_some() {
+            let has_eab = self.eab_file.is_some() || self.eab_inline.is_some();
+            if has_eab || self.eab_required {
                 // EAB credentials can be single-use. Always recover by the
                 // durable account key before attempting a new registration.
                 match builder
@@ -65,6 +68,13 @@ impl AccountClient {
                         if problem.r#type.as_deref()
                             == Some("urn:ietf:params:acme:error:accountDoesNotExist") =>
                     {
+                        if !has_eab {
+                            // A key-only journal whose account was never
+                            // created cannot register without EAB.
+                            return Err("ACME account does not exist and initial \
+                                 registration requires EAB credentials"
+                                .into());
+                        }
                         let credentials = if let Some(value) = &self.eab_inline {
                             value.clone()
                         } else {
@@ -112,6 +122,7 @@ mod tests {
             contact: "operator@example.test".into(),
             eab_file: None,
             eab_inline: None,
+            eab_required: false,
         };
         let mut journal = Journal {
             directory: "https://invalid.invalid/directory".into(),

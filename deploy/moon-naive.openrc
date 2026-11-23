@@ -1,6 +1,6 @@
 #!/sbin/openrc-run
 name="moon-naive"
-description="H2/H3 proxy and automatic DNS-01 certificate manager"
+description="Moon-naive server (mona H2/H3 proxy, website and DNS-01 certificates)"
 command="/usr/local/bin/moon-naive"
 command_args="serve /etc/moon-naive/config.toml"
 command_user="moon-naive:moon-naive"

@@ -1,4 +1,4 @@
-//! Administrator-defined website routing, separate from Naive destination ACLs.
+//! Administrator-defined website routing, separate from proxy destination ACLs.
 use serde::Deserialize;
 use std::{collections::HashSet, path::PathBuf};
 
@@ -266,8 +266,8 @@ mod tests {
     }
     #[test]
     fn website_example_merges_with_strict_main_toml() {
-        let example = include_str!("../../docs/PROJECT.md")
-            .split("## 网站路由示例")
+        let example = include_str!("../../docs/configuration.md")
+            .split("## Website routing example")
             .nth(1)
             .unwrap()
             .split("```toml\n")

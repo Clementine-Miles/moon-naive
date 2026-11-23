@@ -166,3 +166,70 @@ fn secret_reader_checks_opened_file_and_rejects_fifo_without_blocking() {
     .unwrap();
     assert!(read_private(&fifo, 64).is_err());
 }
+
+struct OfflineDns;
+#[async_trait::async_trait]
+impl super::dns::DnsProvider for OfflineDns {
+    fn identity(&self) -> String {
+        "offline-test".into()
+    }
+    async fn present(&mut self, _: &mut super::persist::Lease) -> crate::Result<()> {
+        Err("offline".into())
+    }
+    async fn propagated(&mut self, _: &super::persist::Lease) -> crate::Result<bool> {
+        Err("offline".into())
+    }
+    async fn cleanup(&mut self, _: &super::persist::Lease) -> crate::Result<()> {
+        Ok(())
+    }
+}
+
+/// Regression: EAB is required only for initial registration. A persisted
+/// account (or a durable key awaiting recovery) must reopen without the
+/// original, possibly single-use, EAB secret.
+#[tokio::test]
+async fn existing_account_recovers_without_original_eab() {
+    use moon_naive_core::config::{Config, Issuer};
+    let root = tempfile::tempdir().unwrap();
+    let mut config = Config::parse(include_str!("../../config.example.toml")).unwrap();
+    config.acme.accept_terms = true;
+    config.acme.issuer = Issuer::Google;
+    config.acme.eab = None;
+    config.acme.eab_credentials_file = None;
+    config.state_dir = root.path().join("state");
+    std::fs::create_dir(&config.state_dir).unwrap();
+    std::fs::set_permissions(&config.state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let http = || Http::new(None, Duration::from_secs(1)).unwrap();
+    let open = |config: &Config| super::manager::Manager::open(config, OfflineDns, http());
+
+    let error = open(&config).err().expect("fresh registration needs EAB");
+    assert!(error.to_string().contains("requires acme.eab"), "{error}");
+
+    let domain = config.domain.to_ascii_lowercase();
+    let directory = config.acme.directory().to_owned();
+    let namespace: String = boring::sha::sha256(format!("{directory}\0{domain}").as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    for seeded in ["credentials", "key-only"] {
+        {
+            let state = State::open(&config.state_dir.join("acme"), &namespace).unwrap();
+            let mut journal = Journal {
+                version: 3,
+                domain: domain.clone(),
+                directory: directory.clone(),
+                dns_identity: "offline-test".into(),
+                account_key: vec![1, 2, 3],
+                ..Journal::default()
+            };
+            if seeded == "credentials" {
+                journal.account = Some(serde_json::json!({"id": "https://ca.example/acct/1"}));
+            }
+            state.save(&journal).unwrap();
+        }
+        assert!(
+            open(&config).is_ok(),
+            "{seeded} journal must reopen without EAB"
+        );
+    }
+}

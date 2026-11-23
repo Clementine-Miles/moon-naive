@@ -52,11 +52,11 @@ workspace = true
 [workspace]
 resolver = "2"
 exclude = ["vendor/instant-acme", "vendor/pingora", "vendor/pingora/*"]
-members = ["core", "tools/xtask"]
-default-members = ["."]
+members = ["core", "client", "tools/xtask"]
+default-members = [".", "client"]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.100"
 license = "Apache-2.0"
@@ -64,6 +64,7 @@ publish = false
 
 [workspace.dependencies]
 moon-naive-core = { path = "core" }
+moon-naive-client = { path = "client" }
 serde = { version = "1", features = ["derive"] }
 toml = "1.2.1"
 base64 = "0.23.1"
@@ -101,6 +102,7 @@ doctest = true
 bench = false
 
 [dev-dependencies]
+moon-naive-client.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

@@ -10,7 +10,7 @@ use moon_naive_core::config::Config;
 use std::{fs, io::Read, path::Path, sync::Arc, time::Duration};
 use tokio::sync::watch;
 
-const HELP: &str = "moon-naive serve <config.toml>\nmoon-naive check <config.toml>\nmoon-naive check-config <config.toml>\nmoon-naive check-transport <config.toml>\nmoon-naive status [config.toml]\nmoon-naive acme <once|run|status|cleanup|check-ca> <config.toml>\nmoon-naive acme import-eab <gcloud-export.json> <eab.toml>\nmoon-naive config init <config.toml>\nmoon-naive config migrate <old.toml> <new.toml>\nmoon-naive ech <init|dns|check> <config.toml>\nmoon-naive --version\n\nserve obtains the first DNS-01 certificate, starts HTTPS websites and H2/H3 proxy, and renews automatically.\ncheck validates local setup without CA/DNS requests or listeners.\nconfig and secret files use TOML; see README.md and docs/PROJECT.md.";
+const HELP: &str = "Moon-naive server (mona protocol, Rupin profile)\n\nmoon-naive serve <config.toml>\nmoon-naive check <config.toml>\nmoon-naive check-config <config.toml>\nmoon-naive check-transport <config.toml>\nmoon-naive status [config.toml]\nmoon-naive acme <once|run|status|cleanup|check-ca> <config.toml>\nmoon-naive acme import-eab <gcloud-export.json> <eab.toml>\nmoon-naive config init <config.toml>\nmoon-naive config migrate <old.toml> <new.toml>\nmoon-naive ech <init|dns|check> <config.toml>\nmoon-naive --version\n\nserve obtains the first DNS-01 certificate, starts HTTPS websites and H2/H3 proxy, and renews automatically.\ncheck validates local setup without CA/DNS requests or listeners.\nconfig and secret files use TOML; see README.md and docs/configuration.md.";
 
 fn config(path: &str) -> Result<Arc<Config>> {
     let mut text = String::new();
@@ -56,8 +56,10 @@ pub async fn run(args: &[String]) -> Result<()> {
         }
         [cmd] if cmd == "--version" || cmd == "-V" => {
             println!(
-                "moon-naive {} (boringssl/quiche; {}-linux-{})",
+                "Moon-naive {} ({} protocol, {} profile; boringssl/quiche; {}-linux-{})",
                 env!("CARGO_PKG_VERSION"),
+                moon_naive_core::auth::PROTOCOL,
+                moon_naive_core::auth::PROFILE,
                 std::env::consts::ARCH,
                 if cfg!(target_env = "musl") {
                     "musl"
@@ -69,7 +71,7 @@ pub async fn run(args: &[String]) -> Result<()> {
         }
         [cmd] if cmd == "status" => {
             println!(
-                "version={}\nprotocols=h1-website,h2,h3\ntls=boringssl\nquic=quiche\nautomatic_acme=integrated\nconfiguration=not_loaded\nlisteners=not_checked",
+                "version={}\nprotocol=mona\nprofile=Rupin\nprotocols=h1-website,h2,h3\ntls=boringssl\nquic=quiche\nautomatic_acme=integrated\nconfiguration=not_loaded\nlisteners=not_checked",
                 env!("CARGO_PKG_VERSION")
             );
             println!("{}", net::acceleration_report());
