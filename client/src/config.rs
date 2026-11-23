@@ -266,6 +266,15 @@ mod tests {
         );
     }
     #[test]
+    fn shipped_example_is_valid() {
+        let settings = Config::parse(include_str!("../../client.example.toml"))
+            .unwrap()
+            .settings()
+            .unwrap();
+        assert_eq!(settings.transport, Transport::H3ThenH2);
+        assert!(settings.listen.ip().is_loopback());
+    }
+    #[test]
     fn ech_config_list_structure_is_checked() {
         assert!(validate_ech_config_list(&[0, 4, 0xfe, 0x0d, 0, 0]).is_ok());
         assert!(validate_ech_config_list(&[0, 5, 0xfe, 0x0d, 0, 1]).is_err());
