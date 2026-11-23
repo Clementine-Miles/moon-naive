@@ -270,13 +270,27 @@ fn endpoint_tls(
     h3.set_initial_max_stream_data_bidi_remote(initial);
     h3.set_max_recv_udp_payload_size(1350);
     h3.set_max_send_udp_payload_size(1350);
-    // One server CID: disable migration until additional CID routing is implemented.
+    // The server issues exactly one connection ID and routes by it, so active
+    // (client-initiated) migration stays disabled. Passive NAT rebinding keeps
+    // that DCID and is handled by quiche path validation. In the pinned quiche,
+    // a rebinding without spare peer CIDs leaves the previous path holding the
+    // shared DCID, so it is never evicted, and the path table is capped by the
+    // local active_connection_id_limit. A limit of 2 therefore survives only one
+    // rebinding per connection. This bounded value survives
+    // NAT_REBINDINGS_PER_CONNECTION rebindings; afterwards the connection idles out
+    // and clients reconnect.
     h3.set_disable_active_migration(true);
+    h3.set_active_connection_id_limit(QUIC_PATH_LIMIT);
     Ok(EndpointTls {
         h2: h2.build(),
         h3: Mutex::new(h3),
     })
 }
+/// Per-connection cap on QUIC paths (and on stored peer connection IDs).
+pub(super) const QUIC_PATH_LIMIT: u64 = 8;
+/// Passive NAT rebindings a single H3 connection is guaranteed to survive.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) const NAT_REBINDINGS_PER_CONNECTION: u64 = QUIC_PATH_LIMIT - 1;
 impl Generation {
     pub(super) fn h2_for(&self, index: usize) -> Result<&SslAcceptor> {
         if index == 0 {

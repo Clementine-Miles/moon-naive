@@ -1842,10 +1842,11 @@ async fn h3_nat_rebinding_consumes_path_events_and_preserves_session() {
         }
     });
     let mut client = QClient::new(relay_address, &f.ca).await;
-    for index in 0..12 {
-        // The current single-CID routing supports one rebinding. Repeated
-        // changes need full CID/path retirement support, not a larger path cap.
-        if index == 1 {
+    // Regression: the original limit of 2 stalled the connection on the second
+    // rebinding. Exercise every rebinding the configured path limit guarantees.
+    let rebindings = super::super::tls::NAT_REBINDINGS_PER_CONNECTION as usize;
+    for index in 0..=(2 * rebindings) {
+        if index % 2 == 1 {
             let (done, wait) = tokio::sync::oneshot::channel();
             rotate.send(done).await.unwrap();
             wait.await.unwrap();
