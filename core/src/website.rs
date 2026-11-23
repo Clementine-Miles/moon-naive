@@ -1,4 +1,4 @@
-//! Administrator-defined website routing, separate from Naive destination ACLs.
+//! Administrator-defined website routing, separate from proxy destination ACLs.
 use serde::Deserialize;
 use std::{collections::HashSet, path::PathBuf};
 
