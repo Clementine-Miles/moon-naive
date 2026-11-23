@@ -153,6 +153,7 @@ fn audit_native() -> Result<()> {
 fn verify(target: Option<&str>) -> Result<()> {
     let root = root();
     audit::sources()?;
+    audit::no_tfo()?;
     for mut args in [
         vec![
             "fmt",
@@ -205,11 +206,12 @@ fn main() -> ExitCode {
         [cmd] if cmd == "verify" => verify(None),
         [cmd, target] if cmd == "verify" => verify(Some(target)),
         [cmd] if cmd == "audit-native" => audit_native(),
+        [cmd] if cmd == "audit-tfo" => audit::no_tfo(),
         [cmd, binary] if cmd == "check-elf" => release::check_elf(Path::new(binary)),
         [cmd, binary, output] if cmd == "dist" => release::dist(Path::new(binary), Path::new(output)),
         [cmd, output] if cmd == "source" => release::source(Path::new(output), "HEAD"),
         [cmd, output, revision] if cmd == "source" => release::source(Path::new(output), revision),
-        _ => Err("usage: cargo xtask differential-fetch <directory> | differential --caddy PATH --run NEW_DIR [--tcpdump PATH] [--tshark PATH] | vectors [--check] | lab [--only SUITE] [--run DIR] | verify [target] | audit-native | check-elf <binary> | dist <binary> <output-dir> | source <output-dir> [revision]".into()),
+        _ => Err("usage: cargo xtask differential-fetch <directory> | differential --caddy PATH --run NEW_DIR [--tcpdump PATH] [--tshark PATH] | vectors [--check] | lab [--only SUITE] [--run DIR] | verify [target] | audit-native | audit-tfo | check-elf <binary> | dist <binary> <output-dir> | source <output-dir> [revision]".into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

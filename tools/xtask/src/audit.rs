@@ -366,3 +366,80 @@ mod tests {
         Ok(())
     }
 }
+
+/// Socket-level TCP Fast Open is prohibited in project-owned code, deployment
+/// material and documentation. Tokens are assembled at runtime so this file
+/// does not match itself. Reading the option back (`getsockopt`) to prove it
+/// is disabled is the only permitted use. Vendored Pingora still contains its
+/// opt-in TFO helpers; this audit proves that no project-owned code reaches
+/// them, because enabling them requires one of the tokens below.
+fn tfo_tokens() -> Vec<String> {
+    let fastopen = ["fast", "open"].concat();
+    vec![
+        format!("tcp_{fastopen}"),
+        format!("msg_{fastopen}"),
+        format!("tcp_{}_open", "fast"),
+        format!("tcp{fastopen}"),
+        format!("ipv4.tcp_{fastopen}"),
+    ]
+}
+pub fn tfo_violations(path: &str, text: &str) -> Vec<String> {
+    let tokens = tfo_tokens();
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            let lower = line.to_ascii_lowercase();
+            tokens.iter().any(|token| lower.contains(token.as_str()))
+                && !lower.contains("getsockopt(")
+        })
+        .map(|(number, line)| format!("{path}:{}: {}", number + 1, line.trim()))
+        .collect()
+}
+pub fn no_tfo() -> Result<()> {
+    let files = capture(&root(), "git", &["ls-files", "-z"])?;
+    let mut violations = Vec::new();
+    for path in files.split('\0').filter(|p| !p.is_empty()) {
+        if path.starts_with("vendor/")
+            || path.starts_with("licenses/")
+            || matches!(path, "Cargo.lock" | "SHA256SUMS")
+        {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(root().join(path)) else {
+            continue; // Binary assets or files removed from the work tree.
+        };
+        violations.extend(tfo_violations(path, &text));
+    }
+    check(
+        violations.is_empty(),
+        &format!("TCP Fast Open is prohibited:\n{}", violations.join("\n")),
+    )?;
+    println!("tcp-fast-open audit: no project-owned use");
+    Ok(())
+}
+#[cfg(test)]
+mod tfo_tests {
+    use super::*;
+    #[test]
+    fn tfo_audit_flags_enabling_and_allows_readback() {
+        let open = ["FAST", "OPEN"].concat();
+        let flagged = [
+            format!("setsockopt(fd, IPPROTO_TCP, TCP_{open}, 5)"),
+            format!("send(fd, b, MSG_{open})"),
+            format!("options.tcp_{}_open = true;", "fast"),
+            format!("sysctl -w net.ipv4.tcp_{}=3", open.to_lowercase()),
+            format!("sockopt::Tcp{}Connect", "FastOpen"),
+        ];
+        for line in &flagged {
+            assert_eq!(tfo_violations("x", line).len(), 1, "{line}");
+        }
+        let allowed = format!("getsockopt(&s, sockopt::Tcp{}Connect)", "FastOpen");
+        assert!(tfo_violations("x", &allowed).is_empty());
+        // Rejecting the legacy config key or stripping a header is not TFO.
+        assert!(tfo_violations("x", "for field in [\"fast_open\", \"fastopen\"]").is_empty());
+    }
+    #[test]
+    fn repository_has_no_tfo_use() {
+        no_tfo().unwrap();
+    }
+}
