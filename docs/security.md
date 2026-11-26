@@ -70,7 +70,7 @@ cleanup would need connection-ID routing support that is not implemented.
 - quiche's QPACK encoder cannot set the never-index bit on H3 proof fields; it
   never uses the dynamic table (see [protocol.md](protocol.md)).
 - TCP Fast Open is never used; the host sysctl boundary is described in
-  [deployment.md](deployment.md#tcp-fast-open).
+  [usage.md](usage.md#tcp-fast-open).
 - No side-channel analysis beyond constant-time proof comparison has been done.
 - `unsafe` is forbidden in all project-owned crates (`unsafe_code = "forbid"`)
   except `engine/bridge`, the FFI to the engine. Native code lives in

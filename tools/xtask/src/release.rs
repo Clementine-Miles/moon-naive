@@ -283,7 +283,7 @@ pub fn dist_client(client: &Path, library: &Path, directory: &Path) -> Result<()
         ("README.md", "README.md"),
         ("LICENSE", "LICENSE"),
         ("client.example.toml", "client.example.toml"),
-        ("docs/client.md", "docs/client.md"),
+        ("docs/usage.md", "docs/usage.md"),
         ("docs/security.md", "docs/security.md"),
         ("docs/protocol.md", "docs/protocol.md"),
         ("engine/CHROMIUM_VERSION", "engine/CHROMIUM_VERSION"),
@@ -343,24 +343,10 @@ pub fn dist(binary: &Path, directory: &Path) -> Result<()> {
     for (source, destination, executable) in [
         ("README.md", "README.md", false),
         ("docs/architecture.md", "docs/architecture.md", false),
-        ("docs/audit.md", "docs/audit.md", false),
-        ("docs/client.md", "docs/client.md", false),
-        ("docs/configuration.md", "docs/configuration.md", false),
-        ("docs/deployment.md", "docs/deployment.md", false),
-        ("docs/development.md", "docs/development.md", false),
+        ("docs/usage.md", "docs/usage.md", false),
         ("docs/protocol.md", "docs/protocol.md", false),
         ("docs/security.md", "docs/security.md", false),
-        ("docs/testing.md", "docs/testing.md", false),
-        (
-            "docs/reports/https-differential-2026-11-17.md",
-            "docs/reports/https-differential-2026-11-17.md",
-            false,
-        ),
-        (
-            "docs/reports/https-differential-2026-11-17.json",
-            "docs/reports/https-differential-2026-11-17.json",
-            false,
-        ),
+        ("docs/development.md", "docs/development.md", false),
         ("LICENSE", "LICENSE", false),
         (
             "deploy/moon-naive.service",
@@ -378,7 +364,7 @@ pub fn dist(binary: &Path, directory: &Path) -> Result<()> {
     ] {
         copy(&root().join(source), &stage.join(destination), executable)?;
     }
-    for directory in ["licenses"] {
+    for directory in ["licenses", "docs/reports"] {
         let mut files = Vec::new();
         paths(&root().join(directory), &mut files)?;
         for path in files {

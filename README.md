@@ -50,15 +50,12 @@ curl --proxy socks5h://127.0.0.1:1080 https://example.org/
 
 | Document | Contents |
 | --- | --- |
-| [docs/architecture.md](docs/architecture.md) | Components, ownership, routing, dependencies |
+| [docs/architecture.md](docs/architecture.md) | Components, ownership, routing, the Chromium native engine, dependencies |
+| [docs/usage.md](docs/usage.md) | Build, install, server configuration (endpoints, ACL, website, EAB, ECH), operations, backup, client |
 | [docs/protocol.md](docs/protocol.md) | Authoritative mona/Rupin wire specification |
-| [docs/configuration.md](docs/configuration.md) | Server configuration, endpoints, ACL, website routing, EAB, ECH |
-| [docs/client.md](docs/client.md) | Client configuration and behavior |
-| [docs/deployment.md](docs/deployment.md) | Installation, files, operations, backup and rollback |
 | [docs/security.md](docs/security.md) | Threat model, controls, known limits |
-| [docs/testing.md](docs/testing.md) | Test suites, laboratories, measurements, latest results |
-| [docs/development.md](docs/development.md) | Layout, naming, dependency policy, non-Rust inventory, release |
-| [docs/audit.md](docs/audit.md) | 2026-11-23 refactor audit: findings and fixes |
+| [docs/development.md](docs/development.md) | Layout, dependency policy, engine build, testing, measurements, release |
+| [docs/reports/](docs/reports/) | Dated evidence: HTTPS differential, refactor audits, engineering reports |
 
 ## Status and limitations
 
@@ -66,7 +63,7 @@ Linux x86_64 is the supported platform for both binaries (the client as a
 glibc executable with the engine library). Other platforms are not built. QUIC active migration is
 disabled (passive NAT rebinding works up to 7 times per connection). ECH
 configuration lists are given to the client explicitly (no DNS discovery).
-See [docs/audit.md](docs/audit.md#not-done-with-reasons) for validation not
-performed.
+See [the 2026-11-23 audit](docs/reports/refactor-audit-2026-11-23.md#not-done-with-reasons)
+for validation not performed.
 
 License: [Apache-2.0](LICENSE).

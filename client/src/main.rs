@@ -9,7 +9,7 @@ moon-naive-client check <client.toml>   validate the configuration offline
 moon-naive-client --version
 
 The configuration holds the proxy password and must be private (mode 0600).
-See docs/client.md.";
+See docs/usage.md.";
 
 fn load(path: &str) -> Result<moon_naive_client::Settings, String> {
     use std::io::Read;
