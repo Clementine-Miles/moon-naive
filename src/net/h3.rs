@@ -5,7 +5,7 @@ use super::site::forbidden_trailer;
 use super::{
     Active, App, Bytes, CHUNK, Head, Plan, Reply, Result,
     tls::{Generation, Slot},
-    tunnel::{Activity, TunnelDecoder, TunnelDownload},
+    tunnel::Activity,
 };
 use bytes::BytesMut;
 use moon_naive_core::policy::{Budget, Permit};
@@ -364,50 +364,68 @@ struct BridgeLimits {
 async fn bridge_charged(
     target: super::egress::Stream,
     framed: Option<moon_naive_core::codec::Mode>,
-    mut incoming: mpsc::Receiver<Bytes>,
+    incoming: mpsc::Receiver<Bytes>,
     outgoing: mpsc::Sender<Bytes>,
     limits: BridgeLimits,
     wake: Arc<Notify>,
     activity: Activity,
 ) -> Result<()> {
     let BridgeLimits { idle, buffers } = limits;
-    use tokio::io::AsyncWriteExt;
-    let (mut read, mut write) = tokio::io::split(target);
-    let notify = wake.clone();
-    let upload = async {
-        let mut decoder = TunnelDecoder::new(framed);
-        while let Some(data) = incoming.recv().await {
-            notify.notify_one();
-            decoder.write_to(&mut write, &data, &activity).await?;
-        }
-        decoder.finish()?;
-        write.shutdown().await?;
-        activity.touch();
-        Ok::<_, crate::Error>(())
-    };
-    let download = async {
-        let mut download = TunnelDownload::new(framed)?;
-        while let Some(data) = download.read_next(&mut read).await? {
-            activity.touch();
-            let data = if let Some(pool) = &buffers {
-                pool.charge(data).await?
-            } else {
-                data
-            };
-            outgoing.send(data).await?;
-            wake.notify_one();
-        }
-        drop(outgoing);
-        wake.notify_one();
-        Ok::<_, crate::Error>(())
-    };
-    activity
-        .run(idle, async {
-            tokio::try_join!(upload, download)?;
-            Ok(())
-        })
-        .await?;
-    Ok(())
+    super::tunnel::relay(
+        target,
+        framed,
+        idle,
+        &activity,
+        H3Data {
+            incoming,
+            wake: wake.clone(),
+        },
+        H3Sink {
+            outgoing: Some(outgoing),
+            buffers,
+            wake,
+        },
+    )
+    .await
+}
+/// Request DATA handed over by the QUIC driver (charged there).
+struct H3Data {
+    incoming: mpsc::Receiver<Bytes>,
+    wake: Arc<Notify>,
+}
+impl super::tunnel::ClientData for H3Data {
+    async fn next(&mut self) -> Result<Option<Bytes>> {
+        let data = self.incoming.recv().await;
+        // The driver may now hand over more (its channel has room again).
+        self.wake.notify_one();
+        Ok(data)
+    }
+}
+struct H3Sink {
+    outgoing: Option<mpsc::Sender<Bytes>>,
+    buffers: Option<Arc<super::resources::BufferPool>>,
+    wake: Arc<Notify>,
+}
+impl super::tunnel::ClientSink for H3Sink {
+    async fn send(&mut self, bytes: Bytes) -> Result<()> {
+        let bytes = match &self.buffers {
+            Some(pool) => pool.charge(bytes).await?,
+            None => bytes,
+        };
+        self.outgoing
+            .as_ref()
+            .ok_or("H3 response already finished")?
+            .send(bytes)
+            .await?;
+        self.wake.notify_one();
+        Ok(())
+    }
+    async fn finish(&mut self) -> Result<()> {
+        // Closing the channel is the FIN signal to the driver.
+        self.outgoing = None;
+        self.wake.notify_one();
+        Ok(())
+    }
 }
 
 pub(super) async fn serve(
