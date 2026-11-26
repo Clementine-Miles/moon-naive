@@ -1,5 +1,6 @@
 mod audit;
 mod differential;
+mod engine;
 mod lab;
 mod release;
 use std::{
@@ -199,6 +200,12 @@ fn main() -> ExitCode {
     let args: Vec<_> = env::args().skip(1).collect();
     let result = match args.as_slice() {
         [cmd, args @ ..] if cmd == "lab" => lab::run(args),
+        [cmd, args @ ..] if cmd == "engine" => engine::run(args),
+        [cmd, args @ ..] if cmd == "interop" => engine::interop(args),
+        [cmd, library] if cmd == "check-engine" => release::check_engine(Path::new(library)),
+        [cmd, client, library, output] if cmd == "dist-client" => {
+            release::dist_client(Path::new(client), Path::new(library), Path::new(output))
+        }
         [cmd, args @ ..] if cmd == "differential" => differential::run(args),
         [cmd, directory] if cmd == "differential-fetch" => differential::fetch(Path::new(directory)),
         [cmd] if cmd == "vectors" => audit::vectors(false),
@@ -211,7 +218,7 @@ fn main() -> ExitCode {
         [cmd, binary, output] if cmd == "dist" => release::dist(Path::new(binary), Path::new(output)),
         [cmd, output] if cmd == "source" => release::source(Path::new(output), "HEAD"),
         [cmd, output, revision] if cmd == "source" => release::source(Path::new(output), revision),
-        _ => Err("usage: cargo xtask differential-fetch <directory> | differential --caddy PATH --run NEW_DIR [--tcpdump PATH] [--tshark PATH] | vectors [--check] | lab [--only SUITE] [--run DIR] | verify [target] | audit-native | audit-tfo | check-elf <binary> | dist <binary> <output-dir> | source <output-dir> [revision]".into()),
+        _ => Err("usage: cargo xtask differential-fetch <directory> | differential --caddy PATH --run NEW_DIR [--tcpdump PATH] [--tshark PATH] | vectors [--check] | lab [--only SUITE] [--run DIR] | verify [target] | audit-native | audit-tfo | check-elf <binary> | dist <binary> <output-dir> | engine fetch|toolchain|build|check|export <work-dir> | interop [--engine LIB] [--release] [--bench] | check-engine <lib> | dist-client <client> <lib> <output-dir> | source <output-dir> [revision]".into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

@@ -311,7 +311,8 @@ fn write_header(session: &mut HttpSession, reply: &Reply, end: bool) -> Result<(
         if name.eq_ignore_ascii_case("proxy-authentication-info") {
             value.set_sensitive(true);
         }
-        header.insert_header(
+        // A reply is an ordered field list, as on H3: never merge entries.
+        header.append_header(
             http::header::HeaderName::from_bytes(name.as_bytes())?,
             value,
         )?;

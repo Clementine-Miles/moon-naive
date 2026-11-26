@@ -1,0 +1,1080 @@
+diff --git a/src/net/BUILD.gn b/src/net/BUILD.gn
+index 9a3d318f09b42486196eaf010e2a0b6d6d948593..88b268bae6917a4b834cd23ce97d15d38bf53897 100644
+--- a/src/net/BUILD.gn
++++ b/src/net/BUILD.gn
+@@ -246,6 +246,7 @@ component("net") {
+     "base/proxy_chain.cc",
+     "base/proxy_chain.h",
+     "base/proxy_delegate.cc",
++    "base/moon_tunnel_authenticator.h",
+     "base/proxy_delegate.h",
+     "base/proxy_server.cc",
+     "base/proxy_server.h",
+@@ -2106,3 +2107,24 @@ executable("naive") {
+     deps += [ "//base/allocator:early_zone_registration_apple" ]
+   }
+ }
++
++# Moon-naive Chromium Native Engine: a self-contained shared library exposing
++# only the C ABI in tools/moon_engine/moon_engine.h.
++shared_library("moon_engine") {
++  sources = [
++    "tools/moon_engine/moon_engine.cc",
++    "tools/moon_engine/moon_engine.h",
++  ]
++  defines = [ "MOON_ENGINE_IMPLEMENTATION" ]
++  deps = [
++    ":net",
++    "//base",
++    "//url",
++  ]
++  inputs = [ "tools/moon_engine/moon_engine.map" ]
++  ldflags = [
++    "-Wl,--version-script=" +
++        rebase_path("tools/moon_engine/moon_engine.map", root_build_dir),
++    "-Wl,-z,defs",
++  ]
++}
+diff --git a/src/net/base/proxy_delegate.cc b/src/net/base/proxy_delegate.cc
+index 515426fe1e645a20a42bbf2ffe8aa4c8a91f6126..75d56d0ae5827d5f2f6e5d048c169ac171ae7f68 100644
+--- a/src/net/base/proxy_delegate.cc
++++ b/src/net/base/proxy_delegate.cc
+@@ -17,4 +17,8 @@ std::optional<bool> ProxyDelegate::CanFalloverToNextProxyOverride(
+   return std::nullopt;
+ }
+ 
++MoonTunnelAuthenticator* ProxyDelegate::GetMoonTunnelAuthenticator() {
++  return nullptr;
++}
++
+ }  // namespace net
+diff --git a/src/net/base/proxy_delegate.h b/src/net/base/proxy_delegate.h
+index c2b3d50af9941d7bf2d23e184e1a6b2e89a04cc9..896376d7545edb8ef158c68159b321d569d9aeb2 100644
+--- a/src/net/base/proxy_delegate.h
++++ b/src/net/base/proxy_delegate.h
+@@ -27,6 +27,7 @@ class HttpRequestHeaders;
+ class HttpResponseHeaders;
+ class ProxyInfo;
+ class ProxyResolutionService;
++class MoonTunnelAuthenticator;
+ 
+ // Delegate for setting up a connection.
+ class NET_EXPORT ProxyDelegate {
+@@ -131,6 +132,13 @@ class NET_EXPORT ProxyDelegate {
+       size_t proxy_index,
+       size_t preamble_index,
+       scoped_refptr<HttpResponseHeaders> response_headers) {}
++
++  // Moon-naive: channel-bound CONNECT authentication for HTTP/2 and HTTP/3
++  // proxy tunnels. When non-null, proxy sockets refuse HTTP/1.1 tunnels,
++  // preambles and Fast Open, call the authenticator with the actual stream
++  // binding before sending the CONNECT HEADERS, and keep half-close and
++  // stream-reset semantics intact (see net/base/moon_tunnel_authenticator.h).
++  virtual MoonTunnelAuthenticator* GetMoonTunnelAuthenticator();
+ };
+ 
+ }  // namespace net
+diff --git a/src/net/http/http_proxy_client_socket.cc b/src/net/http/http_proxy_client_socket.cc
+index 2b864b051ffa34c984414d6cf4f7b06a4a7dd095..65d762aac49dcb18109730503bec407df1a0f16c 100644
+--- a/src/net/http/http_proxy_client_socket.cc
++++ b/src/net/http/http_proxy_client_socket.cc
+@@ -93,6 +93,11 @@ int HttpProxyClientSocket::Connect(CompletionOnceCallback callback) {
+   DCHECK(socket_);
+   DCHECK(user_callback_.is_null());
+ 
++  // Moon-naive: channel-bound tunnels exist only over HTTP/2 and HTTP/3.
++  if (proxy_delegate_ && proxy_delegate_->GetMoonTunnelAuthenticator()) {
++    return ERR_ALPN_NEGOTIATION_FAILED;
++  }
++
+   if (next_state_ == STATE_DONE)
+     return OK;
+ 
+diff --git a/src/net/http/http_proxy_connect_job.cc b/src/net/http/http_proxy_connect_job.cc
+index c545740375cbf877f75b64dba71b1e917c3b8197..cde106477030bc9b574ad95eb6c0f6118cb22433 100644
+--- a/src/net/http/http_proxy_connect_job.cc
++++ b/src/net/http/http_proxy_connect_job.cc
+@@ -28,6 +28,7 @@
+ #include "net/base/http_user_agent_settings.h"
+ #include "net/base/net_errors.h"
+ #include "net/base/proxy_chain.h"
++#include "net/base/proxy_delegate.h"
+ #include "net/base/session_usage.h"
+ #include "net/base/task/task_runner.h"
+ #include "net/dns/public/secure_dns_policy.h"
+@@ -802,8 +803,13 @@ int HttpProxyConnectJob::DoQuicProxyCreateStream(int result) {
+   quic_session_ = quic_session_request_->ReleaseSessionHandle();
+   quic_session_request_.reset();
+ 
++  // Moon-naive tunnels never send their CONNECT before the handshake is
++  // confirmed, so the exporter binds a completed 1-RTT handshake.
++  ProxyDelegate* proxy_delegate = common_connect_job_params()->proxy_delegate;
++  const bool requires_confirmation =
++      proxy_delegate && proxy_delegate->GetMoonTunnelAuthenticator();
+   return quic_session_->RequestStream(
+-      false,
++      requires_confirmation,
+       base::BindOnce(&HttpProxyConnectJob::OnIOComplete,
+                      base::Unretained(this)),
+       params_->traffic_annotation());
+diff --git a/src/net/quic/quic_chromium_client_session.cc b/src/net/quic/quic_chromium_client_session.cc
+index b2ae405353e8415841ca2f87f76f8813c105c798..b5abefcfc3aef2c1b5296231067f7a7d41929c8c 100644
+--- a/src/net/quic/quic_chromium_client_session.cc
++++ b/src/net/quic/quic_chromium_client_session.cc
+@@ -504,6 +504,19 @@ EchMode GetEchModeForHost(SSLConfigService* ssl_config_service,
+   return ssl_config_service->GetEchMode(host);
+ }
+ 
++std::vector<uint8_t> GetEchConfigListForHost(
++    SSLConfigService* ssl_config_service,
++    std::string_view host,
++    const std::vector<uint8_t>& from_dns) {
++  CHECK(ssl_config_service);
++  if (ssl_config_service->GetEchMode(host) == EchMode::kDisabled) {
++    return from_dns;
++  }
++  std::vector<uint8_t> local =
++      ssl_config_service->GetEchConfigListOverride(host);
++  return local.empty() ? from_dns : local;
++}
++
+ }  // namespace
+ 
+ // static
+@@ -570,6 +583,27 @@ bool QuicChromiumClientSession::Handle::OneRttKeysAvailable() const {
+   return was_handshake_confirmed_;
+ }
+ 
++int QuicChromiumClientSession::Handle::ExportKeyingMaterial(
++    std::string_view label,
++    base::span<uint8_t> out) const {
++  if (!session_ || !session_->crypto_stream_) {
++    return ERR_CONNECTION_CLOSED;
++  }
++  // Every QUIC version this build supports is IETF QUIC with TLS 1.3.
++  if (!session_->OneRttKeysAvailable()) {
++    return ERR_SSL_PROTOCOL_ERROR;
++  }
++  // In TLS 1.3 an absent and an empty exporter context are identical.
++  std::string result;
++  if (!session_->crypto_stream_->ExportKeyingMaterial(label, /*context=*/"",
++                                                      out.size(), &result) ||
++      result.size() != out.size()) {
++    return ERR_SSL_PROTOCOL_ERROR;
++  }
++  out.copy_from(base::as_byte_span(result));
++  return OK;
++}
++
+ const LoadTimingInfo::ConnectTiming&
+ QuicChromiumClientSession::Handle::GetConnectTiming() {
+   if (!session_) {
+@@ -1118,7 +1152,9 @@ QuicChromiumClientSession::QuicChromiumClientSession(
+           net_log_)),
+       http3_logger_(std::make_unique<QuicHttp3Logger>(net_log_)),
+       path_validation_writer_delegate_(this, task_runner_),
+-      ech_config_list_(metadata.ech_config_list),
++      ech_config_list_(GetEchConfigListForHost(ssl_config_service,
++                                               session_key_.host(),
++                                               metadata.ech_config_list)),
+       ech_mode_(GetEchModeForHost(ssl_config_service, session_key_.host())),
+       trust_anchor_ids_(metadata.trust_anchor_ids),
+       allow_server_preferred_address_(allow_server_preferred_address),
+diff --git a/src/net/quic/quic_chromium_client_session.h b/src/net/quic/quic_chromium_client_session.h
+index 64fd6db1308740753b633e14d367e0fa10ae7262..55aad4acf778a57b7f13072650250f71240d4555 100644
+--- a/src/net/quic/quic_chromium_client_session.h
++++ b/src/net/quic/quic_chromium_client_session.h
+@@ -20,6 +20,7 @@
+ #include <vector>
+ 
+ #include "base/containers/flat_map.h"
++#include "base/containers/span.h"
+ #include "base/feature_list.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/raw_ptr_exclusion.h"
+@@ -248,6 +249,11 @@ class NET_EXPORT_PRIVATE QuicChromiumClientSession
+     // Returns true if the handshake has been confirmed.
+     bool OneRttKeysAvailable() const;
+ 
++    // Moon-naive: TLS 1.3 exporter (RFC 8446 section 7.5) of this QUIC
++    // connection with an empty context, available once 1-RTT keys are.
++    int ExportKeyingMaterial(std::string_view label,
++                             base::span<uint8_t> out) const;
++
+     // Starts a request to create a stream.  If OK is returned, then
+     // |stream_| will be updated with the newly created stream.  If
+     // ERR_IO_PENDING is returned, then when the request is eventuallly
+diff --git a/src/net/quic/quic_proxy_client_socket.cc b/src/net/quic/quic_proxy_client_socket.cc
+index 0f1d501caaa48d45641baf4a7f8e50518097f0d4..36dfe79e2bae577d314097b94e71ead9a08734a9 100644
+--- a/src/net/quic/quic_proxy_client_socket.cc
++++ b/src/net/quic/quic_proxy_client_socket.cc
+@@ -24,6 +24,8 @@
+ #include "net/log/net_log_source_type.h"
+ #include "net/quic/quic_http_utils.h"
+ #include "net/spdy/spdy_http_utils.h"
++#include "net/base/moon_tunnel_authenticator.h"
++#include "net/ssl/ssl_info.h"
+ #include "net/traffic_annotation/network_traffic_annotation.h"
+ 
+ namespace net {
+@@ -51,7 +53,10 @@ QuicProxyClientSocket::QuicProxyClientSocket(
+ 
+   request_.method = "CONNECT";
+   request_.url = GURL("https://" + endpoint.ToString());
+-  if (endpoint.host() == "preamble") {
++  if (proxy_delegate_) {
++    moon_auth_ = proxy_delegate_->GetMoonTunnelAuthenticator();
++  }
++  if (!moon_auth_ && endpoint.host() == "preamble") {
+     preamble_index_ = endpoint.port();
+     CHECK(!proxy_chain.is_direct());
+     CHECK_EQ(proxy_chain_index, proxy_chain.length() - 1);
+@@ -182,7 +187,9 @@ int QuicProxyClientSocket::Read(IOBuffer* buf,
+   if (next_state_ == STATE_DISCONNECTED)
+     return ERR_SOCKET_NOT_CONNECTED;
+ 
+-  if (!stream_->IsOpen()) {
++  // In Moon mode ReadBody() distinguishes a finished read side (0) from a
++  // reset or connection error (negative).
++  if (!moon_auth_ && !stream_->IsOpen()) {
+     return 0;
+   }
+ 
+@@ -205,8 +212,13 @@ int QuicProxyClientSocket::Read(IOBuffer* buf,
+ }
+ 
+ void QuicProxyClientSocket::OnReadComplete(int rv) {
+-  if (!stream_->IsOpen())
++  if (moon_auth_) {
++    if (rv < 0 && !stream_->IsOpen() && stream_->IsDoneReading()) {
++      rv = 0;
++    }
++  } else if (!stream_->IsOpen()) {
+     rv = 0;
++  }
+ 
+   if (!read_callback_.is_null()) {
+     DCHECK(read_buf_);
+@@ -229,6 +241,8 @@ int QuicProxyClientSocket::Write(
+ 
+   if (next_state_ != STATE_CONNECT_COMPLETE)
+     return ERR_SOCKET_NOT_CONNECTED;
++  if (moon_write_closed_)
++    return ERR_CONNECTION_CLOSED;
+ 
+   net_log_.AddByteTransferEvent(NetLogEventType::SOCKET_BYTES_SENT, buf_len,
+                                 buf->data());
+@@ -248,6 +262,24 @@ int QuicProxyClientSocket::Write(
+   return rv;
+ }
+ 
++int QuicProxyClientSocket::CloseWrite(CompletionOnceCallback callback) {
++  if (!moon_auth_) {
++    return ERR_NOT_IMPLEMENTED;
++  }
++  if (next_state_ != STATE_CONNECT_COMPLETE) {
++    return ERR_SOCKET_NOT_CONNECTED;
++  }
++  if (write_callback_) {
++    return ERR_UNEXPECTED;
++  }
++  if (moon_write_closed_) {
++    return OK;
++  }
++  moon_write_closed_ = true;
++  return stream_->WriteStreamData(std::string_view(), /*fin=*/true,
++                                  std::move(callback));
++}
++
+ void QuicProxyClientSocket::OnWriteComplete(int rv) {
+   if (!write_callback_.is_null()) {
+     if (rv == OK)
+@@ -374,8 +406,8 @@ int QuicProxyClientSocket::DoCalculateHeaders() {
+   authorization_headers_.Clear();
+   proxy_delegate_headers_.Clear();
+ 
+-  // Add Proxy-Authentication header if necessary.
+-  if (auth_->HaveAuth()) {
++  // Add Proxy-Authentication header if necessary (never for Moon tunnels).
++  if (!moon_auth_ && auth_->HaveAuth()) {
+     auth_->AddAuthorizationHeader(&authorization_headers_);
+   }
+ 
+@@ -409,6 +441,14 @@ int QuicProxyClientSocket::DoCalculateHeadersComplete(int result) {
+     return result;
+   }
+   next_state_ = STATE_SEND_REQUEST;
++  if (moon_auth_) {
++    if (proxy_delegate_headers_.HasHeader("fastopen") ||
++        proxy_delegate_headers_.HasHeader("proxy-authorization")) {
++      return ERR_INVALID_ARGUMENT;
++    }
++    request_.extra_headers.MergeFrom(proxy_delegate_headers_);
++    return result;
++  }
+   if (proxy_delegate_headers_.HasHeader("fastopen")) {
+     proxy_delegate_headers_.RemoveHeader("fastopen");
+     // TODO(klzgrad): look into why Fast Open does not work.
+@@ -463,6 +503,33 @@ int QuicProxyClientSocket::DoSendRequest() {
+   CreateSpdyHeadersFromHttpRequest(request_, std::nullopt,
+                                    request_.extra_headers, &headers);
+ 
++  if (moon_auth_) {
++    // The request stream already exists, so its ID is final; HEADERS are
++    // written only after authorization succeeds.
++    if (proxy_chain_.length() != 1 || preamble_index_.has_value() ||
++        use_fastopen_ || !session_->OneRttKeysAvailable()) {
++      return ERR_TUNNEL_CONNECTION_FAILED;
++    }
++    SSLInfo ssl_info;
++    if (!session_->GetSSLInfo(&ssl_info)) {
++      return ERR_TUNNEL_CONNECTION_FAILED;
++    }
++    MoonTunnelBinding binding;
++    binding.stream_id = stream_->id();
++    binding.ech_accepted = ssl_info.encrypted_client_hello;
++    binding.http_version = 3;
++    int rv = session_->ExportKeyingMaterial(moon_auth_->ExporterLabel(),
++                                            binding.exporter);
++    if (rv != OK) {
++      return rv;
++    }
++    rv = moon_auth_->AuthorizeTunnel(binding, headers);
++    if (rv != OK) {
++      return rv;
++    }
++    return stream_->WriteHeaders(std::move(headers), false, nullptr);
++  }
++
+   if (preamble_index_.has_value()) {
+     return stream_->WriteHeaders(std::move(headers), true, nullptr);
+   }
+@@ -550,6 +617,13 @@ int QuicProxyClientSocket::DoProcessResponseHeadersComplete(int result) {
+ }
+ 
+ int QuicProxyClientSocket::DoProcessResponseCode() {
++  if (moon_auth_) {
++    if (response_.headers->response_code() != 200) {
++      return ERR_TUNNEL_CONNECTION_FAILED;
++    }
++    next_state_ = STATE_CONNECT_COMPLETE;
++    return OK;
++  }
+   if (preamble_index_.has_value()) {
+     // Ignores any response failures during preamble
+     next_state_ = STATE_CONNECT_COMPLETE;
+diff --git a/src/net/quic/quic_proxy_client_socket.h b/src/net/quic/quic_proxy_client_socket.h
+index ec5b5c09cfd1d33bcf92a573e7d1f8001138a697..147a19aec215759e7c6c271f9951f9c6e72e2363 100644
+--- a/src/net/quic/quic_proxy_client_socket.h
++++ b/src/net/quic/quic_proxy_client_socket.h
+@@ -23,6 +23,7 @@
+ namespace net {
+ 
+ class HttpAuthController;
++class MoonTunnelAuthenticator;
+ class ProxyDelegate;
+ 
+ // QuicProxyClientSocket tunnels a stream socket over an underlying
+@@ -76,6 +77,9 @@ class NET_EXPORT_PRIVATE QuicProxyClientSocket : public ProxyClientSocket {
+             int buf_len,
+             CompletionOnceCallback callback,
+             const NetworkTrafficAnnotationTag& traffic_annotation) override;
++  // Sends FIN (write half-close). Only supported for Moon tunnels; must not
++  // be called while a Write() is pending.
++  int CloseWrite(CompletionOnceCallback callback) override;
+   int SetReceiveBufferSize(int32_t size) override;
+   int SetSendBufferSize(int32_t size) override;
+   int GetPeerAddress(IPEndPoint* address) const override;
+@@ -168,6 +172,11 @@ class NET_EXPORT_PRIVATE QuicProxyClientSocket : public ProxyClientSocket {
+   std::optional<bool> read_headers_pending_;
+   std::optional<size_t> preamble_index_;
+ 
++  // Moon tunnel mode (see SpdyProxyClientSocket): channel-bound CONNECT, FIN
++  // is a half-close in each direction and a reset is never reported as EOF.
++  raw_ptr<MoonTunnelAuthenticator> moon_auth_ = nullptr;
++  bool moon_write_closed_ = false;
++
+   const NetLogWithSource net_log_;
+ 
+   // The default weak pointer factory.
+diff --git a/src/net/socket/ssl_client_socket.cc b/src/net/socket/ssl_client_socket.cc
+index 2b6cb80c2edf33409bcce257c847b7af94b1356f..1a61f9a4050f41be4ecbd1f53bf1181b29531694 100644
+--- a/src/net/socket/ssl_client_socket.cc
++++ b/src/net/socket/ssl_client_socket.cc
+@@ -256,6 +256,14 @@ bool SSLClientContext::IsEchEnabled(std::string_view hostname) const {
+   return GetEchMode(hostname) != EchMode::kDisabled;
+ }
+ 
++std::vector<uint8_t> SSLClientContext::GetEchConfigListOverride(
++    std::string_view hostname) const {
++  if (ssl_config_service_ && IsEchEnabled(hostname)) {
++    return ssl_config_service_->GetEchConfigListOverride(hostname);
++  }
++  return {};
++}
++
+ std::unique_ptr<SSLClientSocket> SSLClientContext::CreateSSLClientSocket(
+     std::unique_ptr<StreamSocket> stream_socket,
+     const HostPortPair& host_and_port,
+diff --git a/src/net/socket/ssl_client_socket.h b/src/net/socket/ssl_client_socket.h
+index 4046a961c9ccfe9dc21bbdd275ee9d0e7f4f8979..4036decdae6914c99550ac1df6d7cc5835707b29 100644
+--- a/src/net/socket/ssl_client_socket.h
++++ b/src/net/socket/ssl_client_socket.h
+@@ -188,6 +188,10 @@ class NET_EXPORT SSLClientContext : public SSLConfigService::Observer,
+   // EchMode::kDisabled).
+   bool IsEchEnabled(std::string_view hostname) const;
+ 
++  // Moon-naive: see SSLConfigService::GetEchConfigListOverride().
++  std::vector<uint8_t> GetEchConfigListOverride(
++      std::string_view hostname) const;
++
+   // Creates a new SSLClientSocket which can then be used to establish an SSL
+   // connection to |host_and_port| over the already-connected |stream_socket|.
+   std::unique_ptr<SSLClientSocket> CreateSSLClientSocket(
+diff --git a/src/net/socket/ssl_connect_job.cc b/src/net/socket/ssl_connect_job.cc
+index 3776d69fffd9160191825b9553cc47f77f2f4edd..ca6306b749f4b92f07228927f51161590adabde9 100644
+--- a/src/net/socket/ssl_connect_job.cc
++++ b/src/net/socket/ssl_connect_job.cc
+@@ -404,8 +404,13 @@ int SSLConnectJob::DoSSLConnect() {
+   }
+ 
+   if (IsEchEnabled(ssl_client_context(), params_->host_and_port())) {
++    std::vector<uint8_t> ech_override =
++        ssl_client_context()->GetEchConfigListOverride(
++            params_->host_and_port().host());
+     if (ech_retry_configs_) {
+       ssl_config.ech_config_list = *ech_retry_configs_;
++    } else if (!ech_override.empty()) {
++      ssl_config.ech_config_list = std::move(ech_override);
+     } else if (endpoint_result_) {
+       ssl_config.ech_config_list = endpoint_result_->metadata.ech_config_list;
+     } else if (service_endpoint_result_) {
+@@ -496,6 +501,9 @@ int SSLConnectJob::DoSSLConnectComplete(int result) {
+   // DNS. This allows the metrics to measure the same set of servers in both
+   // control and experiment group.
+   const bool is_ech_capable =
++      !ssl_client_context()
++           ->GetEchConfigListOverride(params_->host_and_port().host())
++           .empty() ||
+       (endpoint_result_ &&
+        !endpoint_result_->metadata.ech_config_list.empty()) ||
+       (service_endpoint_result_ &&
+diff --git a/src/net/socket/ssl_socket.h b/src/net/socket/ssl_socket.h
+index 4cfab60d430053b10c5457d41f314ff237532425..cd8eeb3acd6ac60ee60e41ea419fd98ebbf6fa95 100644
+--- a/src/net/socket/ssl_socket.h
++++ b/src/net/socket/ssl_socket.h
+@@ -33,10 +33,9 @@ class NET_EXPORT SSLSocket : public StreamSocket {
+   //
+   // Once we drop support for TLS < 1.3 (some day...) the context argument here
+   // can cease being optional.
+-  virtual int ExportKeyingMaterial(
+-      std::string_view label,
+-      std::optional<base::span<const uint8_t>> context,
+-      base::span<uint8_t> out) = 0;
++  int ExportKeyingMaterial(std::string_view label,
++                           std::optional<base::span<const uint8_t>> context,
++                           base::span<uint8_t> out) override = 0;
+ };
+ 
+ }  // namespace net
+diff --git a/src/net/socket/stream_socket.cc b/src/net/socket/stream_socket.cc
+index 087fda75d1a1fdb3c2f95a875d98cc95fa006f48..1b4c0a78066a411da0646bdb650061b0619054ac 100644
+--- a/src/net/socket/stream_socket.cc
++++ b/src/net/socket/stream_socket.cc
+@@ -29,4 +29,15 @@ int StreamSocket::ConfirmHandshake(CompletionOnceCallback callback) {
+   return OK;
+ }
+ 
++int StreamSocket::ExportKeyingMaterial(
++    std::string_view label,
++    std::optional<base::span<const uint8_t>> context,
++    base::span<uint8_t> out) {
++  return ERR_NOT_IMPLEMENTED;
++}
++
++int StreamSocket::CloseWrite(CompletionOnceCallback callback) {
++  return ERR_NOT_IMPLEMENTED;
++}
++
+ }  // namespace net
+diff --git a/src/net/socket/stream_socket.h b/src/net/socket/stream_socket.h
+index d1c3d4536c9b8271cfd189f01b45df9ea361ef18..31e7857c1404db9eba60ba2d7ea7c9a682651196 100644
+--- a/src/net/socket/stream_socket.h
++++ b/src/net/socket/stream_socket.h
+@@ -10,6 +10,7 @@
+ #include <optional>
+ #include <string_view>
+ 
++#include "base/containers/span.h"
+ #include "base/functional/bind.h"
+ #include "base/notreached.h"
+ #include "net/base/net_errors.h"
+@@ -32,6 +33,18 @@ class NET_EXPORT StreamSocket : public Socket {
+ 
+   ~StreamSocket() override = default;
+ 
++  // Exports keying material from the TLS connection carrying this socket, or
++  // returns ERR_NOT_IMPLEMENTED (Moon-naive; implemented by SSLSocket).
++  virtual int ExportKeyingMaterial(
++      std::string_view label,
++      std::optional<base::span<const uint8_t>> context,
++      base::span<uint8_t> out);
++
++  // Half-closes the write direction after previously written data (TCP FIN
++  // or END_STREAM equivalent). Returns OK, ERR_IO_PENDING (then `callback`
++  // runs) or an error. Only Moon-naive proxy tunnel sockets implement it.
++  virtual int CloseWrite(CompletionOnceCallback callback);
++
+   // Sets a callback to be invoked before establishing a connection. This allows
+   // setting options, like receive and send buffer size, when they will take
+   // effect. The callback should return net::OK on success, and an error on
+diff --git a/src/net/spdy/spdy_proxy_client_socket.cc b/src/net/spdy/spdy_proxy_client_socket.cc
+index d6e3b9bd9f47ffa2b732848a297ee63586011502..b204fcea4a4848aed6ce96e0f7a91c03a50f4b1f 100644
+--- a/src/net/spdy/spdy_proxy_client_socket.cc
++++ b/src/net/spdy/spdy_proxy_client_socket.cc
+@@ -33,6 +33,9 @@
+ #include "net/log/net_log_source_type.h"
+ #include "net/spdy/spdy_http_utils.h"
+ #include "net/traffic_annotation/network_traffic_annotation.h"
++#include "net/base/moon_tunnel_authenticator.h"
++#include "net/ssl/ssl_connection_status_flags.h"
++#include "net/ssl/ssl_info.h"
+ #include "url/gurl.h"
+ 
+ namespace net {
+@@ -58,7 +61,10 @@ SpdyProxyClientSocket::SpdyProxyClientSocket(
+       source_dependency_(source_net_log.source()) {
+   request_.method = "CONNECT";
+   request_.url = GURL("https://" + endpoint.ToString());
+-  if (endpoint.host() == "preamble") {
++  if (proxy_delegate_) {
++    moon_auth_ = proxy_delegate_->GetMoonTunnelAuthenticator();
++  }
++  if (!moon_auth_ && endpoint.host() == "preamble") {
+     preamble_index_ = endpoint.port();
+     CHECK(!proxy_chain.is_direct());
+     CHECK_EQ(proxy_chain_index, proxy_chain.length() - 1);
+@@ -224,6 +230,12 @@ int SpdyProxyClientSocket::ReadIfReady(IOBuffer* buf,
+     return ERR_SOCKET_NOT_CONNECTED;
+ 
+   if (next_state_ == STATE_CLOSED && read_buffer_queue_.IsEmpty()) {
++    if (moon_auth_ && !moon_peer_eof_ && moon_close_status_ != OK) {
++      return moon_close_status_;
++    }
++    return 0;
++  }
++  if (moon_peer_eof_ && read_buffer_queue_.IsEmpty()) {
+     return 0;
+   }
+ 
+@@ -260,6 +272,10 @@ int SpdyProxyClientSocket::Write(
+     CompletionOnceCallback callback,
+     const NetworkTrafficAnnotationTag& traffic_annotation) {
+   DCHECK(write_callback_.is_null());
++  if (moon_auth_ && next_state_ == STATE_CLOSED) {
++    return moon_close_status_ != OK ? moon_close_status_
++                                    : ERR_CONNECTION_CLOSED;
++  }
+   if (next_state_ != STATE_OPEN)
+     return ERR_SOCKET_NOT_CONNECTED;
+   if (end_stream_state_ == EndStreamState::kEndStreamSent)
+@@ -433,8 +449,10 @@ int SpdyProxyClientSocket::DoCalculateHeaders() {
+   authorization_headers_.Clear();
+   proxy_delegate_headers_.Clear();
+ 
+-  // Add Proxy-Authentication header if necessary.
+-  if (auth_->HaveAuth()) {
++  // Add Proxy-Authentication header if necessary. Moon tunnels never send
++  // HTTP authentication schemes; credentials are added in
++  // PrepareRequestHeaders() from the transport binding.
++  if (!moon_auth_ && auth_->HaveAuth()) {
+     auth_->AddAuthorizationHeader(&authorization_headers_);
+   }
+ 
+@@ -468,6 +486,16 @@ int SpdyProxyClientSocket::DoCalculateHeadersComplete(int result) {
+     return result;
+   }
+   next_state_ = STATE_SEND_REQUEST;
++  if (moon_auth_) {
++    // Moon tunnels must not send payload before the confirmation is
++    // verified, and never carry delegate-supplied proxy credentials.
++    if (proxy_delegate_headers_.HasHeader("fastopen") ||
++        proxy_delegate_headers_.HasHeader("proxy-authorization")) {
++      return ERR_INVALID_ARGUMENT;
++    }
++    request_.extra_headers.MergeFrom(proxy_delegate_headers_);
++    return result;
++  }
+   if (proxy_delegate_headers_.HasHeader("fastopen")) {
+     proxy_delegate_headers_.RemoveHeader("fastopen");
+     use_fastopen_ = true;
+@@ -528,6 +556,9 @@ int SpdyProxyClientSocket::DoSendRequest() {
+ int SpdyProxyClientSocket::DoSendRequestComplete(int result) {
+   if (result < 0)
+     return result;
++  if (moon_auth_ && !moon_authorized_) {
++    return ERR_TUNNEL_CONNECTION_FAILED;
++  }
+ 
+   if (use_fastopen_) {
+     read_headers_pending_ = true;
+@@ -589,6 +620,15 @@ int SpdyProxyClientSocket::DoProcessResponseHeadersComplete(int result) {
+ }
+ 
+ int SpdyProxyClientSocket::DoProcessResponseCode() {
++  if (moon_auth_) {
++    // Only 200 opens a Moon tunnel; the delegate has already verified the
++    // confirmation. There is no HTTP authentication challenge handling.
++    if (response_.headers->response_code() != 200) {
++      return ERR_TUNNEL_CONNECTION_FAILED;
++    }
++    next_state_ = STATE_OPEN;
++    return OK;
++  }
+   if (preamble_index_.has_value()) {
+     // Ignores any response failures during preamble
+     next_state_ = STATE_OPEN;
+@@ -653,7 +693,11 @@ void SpdyProxyClientSocket::OnDataReceived(std::unique_ptr<SpdyBuffer> buffer) {
+     net_log_.AddByteTransferEvent(NetLogEventType::SOCKET_BYTES_RECEIVED, 0,
+                                   nullptr);
+ 
+-    if (end_stream_state_ == EndStreamState::kNone) {
++    if (moon_auth_) {
++      // Read half-close only. The local side closes its write direction
++      // explicitly with CloseWrite().
++      moon_peer_eof_ = true;
++    } else if (end_stream_state_ == EndStreamState::kNone) {
+       // The peer sent END_STREAM. Schedule a DATA frame with END_STREAM.
+       end_stream_state_ = EndStreamState::kEndStreamReceived;
+       base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+@@ -713,6 +757,9 @@ void SpdyProxyClientSocket::OnClose(int status)  {
+ 
+   bool connecting = next_state_ != STATE_DISCONNECTED &&
+       next_state_ < STATE_OPEN;
++  if (moon_auth_ && next_state_ == STATE_OPEN) {
++    moon_close_status_ = status;
++  }
+   if (next_state_ == STATE_OPEN)
+     next_state_ = STATE_CLOSED;
+   else
+@@ -727,13 +774,21 @@ void SpdyProxyClientSocket::OnClose(int status)  {
+   if (connecting) {
+     DCHECK(!read_callback_.is_null());
+     std::move(read_callback_).Run(status);
++  } else if (!read_callback_.is_null() && moon_auth_ && !moon_peer_eof_ &&
++             status != OK && read_buffer_queue_.IsEmpty()) {
++    // A reset before the peer's END_STREAM is not a clean EOF.
++    user_buffer_ = nullptr;
++    user_buffer_len_ = 0;
++    std::move(read_callback_).Run(status);
+   } else if (!read_callback_.is_null()) {
+     // If we have a read_callback_, the we need to make sure we call it back.
+     OnDataReceived(std::unique_ptr<SpdyBuffer>());
+   }
+   // This may have been deleted by read_callback_, so check first.
+-  if (weak_ptr.get() && !write_callback.is_null())
+-    std::move(write_callback).Run(ERR_CONNECTION_CLOSED);
++  if (weak_ptr.get() && !write_callback.is_null()) {
++    std::move(write_callback)
++        .Run(moon_auth_ && status != OK ? status : ERR_CONNECTION_CLOSED);
++  }
+ }
+ 
+ bool SpdyProxyClientSocket::CanGreaseFrameType() const {
+@@ -744,6 +799,64 @@ NetLogSource SpdyProxyClientSocket::source_dependency() const {
+   return source_dependency_;
+ }
+ 
++int SpdyProxyClientSocket::PrepareRequestHeaders(
++    SpdySession& session,
++    spdy::SpdyStreamId stream_id,
++    quiche::HttpHeaderBlock& headers) {
++  if (!moon_auth_) {
++    return OK;
++  }
++  CHECK(!moon_authorized_);
++  // Channel binding requires the proxy connection itself to be TLS 1.3 and a
++  // single-hop chain (an inner hop would not see this connection's exporter).
++  if (proxy_chain_.length() != 1 || preamble_index_.has_value() ||
++      use_fastopen_) {
++    return ERR_TUNNEL_CONNECTION_FAILED;
++  }
++  SSLInfo ssl_info;
++  if (!session.GetSSLInfo(&ssl_info) ||
++      SSLConnectionStatusToVersion(ssl_info.connection_status) !=
++          SSL_CONNECTION_VERSION_TLS1_3) {
++    return ERR_SSL_VERSION_OR_CIPHER_MISMATCH;
++  }
++  MoonTunnelBinding binding;
++  binding.stream_id = stream_id;
++  binding.ech_accepted = ssl_info.encrypted_client_hello;
++  binding.http_version = 2;
++  int rv = session.ExportKeyingMaterial(moon_auth_->ExporterLabel(),
++                                        binding.exporter);
++  if (rv != OK) {
++    return rv;
++  }
++  rv = moon_auth_->AuthorizeTunnel(binding, headers);
++  if (rv == OK) {
++    moon_authorized_ = true;
++  }
++  return rv;
++}
++
++int SpdyProxyClientSocket::CloseWrite(CompletionOnceCallback callback) {
++  if (!moon_auth_) {
++    return ERR_NOT_IMPLEMENTED;
++  }
++  if (next_state_ == STATE_CLOSED) {
++    return moon_close_status_ != OK ? moon_close_status_ : OK;
++  }
++  if (next_state_ != STATE_OPEN || !spdy_stream_) {
++    return ERR_SOCKET_NOT_CONNECTED;
++  }
++  if (write_callback_) {
++    return ERR_UNEXPECTED;
++  }
++  if (end_stream_state_ == EndStreamState::kEndStreamSent) {
++    return OK;
++  }
++  auto buffer = base::MakeRefCounted<IOBufferWithSize>(/*buffer_size=*/0);
++  end_stream_state_ = EndStreamState::kEndStreamSent;
++  spdy_stream_->SendData(buffer.get(), /*length=*/0, NO_MORE_DATA_TO_SEND);
++  return OK;
++}
++
+ void SpdyProxyClientSocket::MaybeSendEndStream() {
+   DCHECK_NE(end_stream_state_, EndStreamState::kNone);
+   if (end_stream_state_ == EndStreamState::kEndStreamSent)
+diff --git a/src/net/spdy/spdy_proxy_client_socket.h b/src/net/spdy/spdy_proxy_client_socket.h
+index a7bcc79a53426cfa7d945a7576761a8c4c752962..8f65b4e35595f2891c7cff689b728340109d6f18 100644
+--- a/src/net/spdy/spdy_proxy_client_socket.h
++++ b/src/net/spdy/spdy_proxy_client_socket.h
+@@ -37,6 +37,7 @@
+ namespace net {
+ 
+ class IOBuffer;
++class MoonTunnelAuthenticator;
+ class ProxyDelegate;
+ class SpdyStream;
+ 
+@@ -93,12 +94,18 @@ class NET_EXPORT_PRIVATE SpdyProxyClientSocket : public ProxyClientSocket,
+             int buf_len,
+             CompletionOnceCallback callback,
+             const NetworkTrafficAnnotationTag& traffic_annotation) override;
++  // Sends END_STREAM (write half-close). Only supported for Moon tunnels;
++  // must not be called while a Write() is pending.
++  int CloseWrite(CompletionOnceCallback callback) override;
+   int SetReceiveBufferSize(int32_t size) override;
+   int SetSendBufferSize(int32_t size) override;
+   int GetPeerAddress(IPEndPoint* address) const override;
+   int GetLocalAddress(IPEndPoint* address) const override;
+ 
+   // SpdyStream::Delegate implementation.
++  int PrepareRequestHeaders(SpdySession& session,
++                            spdy::SpdyStreamId stream_id,
++                            quiche::HttpHeaderBlock& headers) override;
+   void OnHeadersSent() override;
+   void OnEarlyHintsReceived(const quiche::HttpHeaderBlock& headers) override;
+   void OnHeadersReceived(
+@@ -218,6 +225,16 @@ class NET_EXPORT_PRIVATE SpdyProxyClientSocket : public ProxyClientSocket,
+   };
+   EndStreamState end_stream_state_ = EndStreamState::kNone;
+ 
++  // Moon tunnel mode: set when the ProxyDelegate supplies an authenticator.
++  // In this mode the CONNECT request is authenticated with the actual
++  // transport binding, END_STREAM from the peer is a read half-close only (no
++  // automatic END_STREAM is sent back), and a stream reset is reported to the
++  // reader as an error instead of EOF.
++  raw_ptr<MoonTunnelAuthenticator> moon_auth_ = nullptr;
++  bool moon_authorized_ = false;
++  bool moon_peer_eof_ = false;
++  int moon_close_status_ = OK;
++
+   base::WeakPtrFactory<SpdyProxyClientSocket> weak_factory_{this};
+ };
+ 
+diff --git a/src/net/spdy/spdy_session.cc b/src/net/spdy/spdy_session.cc
+index 4d5bf038124115acaedfe01c267cedb43c09b666..1450d1b66dab4e40ee9acadbf685f742591065b2 100644
+--- a/src/net/spdy/spdy_session.cc
++++ b/src/net/spdy/spdy_session.cc
+@@ -1319,6 +1319,12 @@ bool SpdySession::GetSSLInfo(SSLInfo* ssl_info) const {
+   return socket_->GetSSLInfo(ssl_info);
+ }
+ 
++int SpdySession::ExportKeyingMaterial(std::string_view label,
++                                      base::span<uint8_t> out) const {
++  return socket_->ExportKeyingMaterial(label, base::span<const uint8_t>(),
++                                       out);
++}
++
+ std::optional<ResolutionDetails> SpdySession::GetResolutionDetails() const {
+   if (stream_socket_handle_) {
+     return stream_socket_handle_->resolution_details();
+@@ -2195,6 +2201,16 @@ int SpdySession::DoWrite() {
+         MakeUnavailable(ERR_HTTP2_PROTOCOL_ERROR);
+         StartGoingAway(kLastStreamId, ERR_HTTP2_PROTOCOL_ERROR);
+       }
++
++      // Moon-naive: the stream ID is now final and the HEADERS frame is not
++      // encoded yet. A delegate may bind credentials to the actual ID; on
++      // failure the stream closes without its HEADERS ever being sent (the
++      // skipped ID is implicitly closed, RFC 9113 section 5.1.1).
++      const int prepared = stream->PrepareRequestHeaders();
++      if (prepared != OK) {
++        CloseActiveStream(stream->stream_id(), prepared);
++        return OK;
++      }
+     }
+ 
+     in_flight_write_ = producer->ProduceBuffer();
+diff --git a/src/net/spdy/spdy_session.h b/src/net/spdy/spdy_session.h
+index 9c7be0f42f112d09114eb7682603d0946a17e314..2bc55d09b99d5910fb4863a47475cac3dd745a64 100644
+--- a/src/net/spdy/spdy_session.h
++++ b/src/net/spdy/spdy_session.h
+@@ -500,6 +500,9 @@ class NET_EXPORT SpdySession
+   // MultiplexedSession methods:
+   int GetRemoteEndpoint(IPEndPoint* endpoint) override;
+   bool GetSSLInfo(SSLInfo* ssl_info) const override;
++  // Moon-naive: TLS exporter of this session's connection (empty context).
++  int ExportKeyingMaterial(std::string_view label,
++                           base::span<uint8_t> out) const;
+   std::string_view GetAcceptChViaAlps(
+       const url::SchemeHostPort& scheme_host_port) const override;
+ 
+diff --git a/src/net/spdy/spdy_stream.cc b/src/net/spdy/spdy_stream.cc
+index d4836dfa995c055f19822c5a6ffd1d0b66fcfeda..af4327d5262a5d24fc571492b00fa47900deacb4 100644
+--- a/src/net/spdy/spdy_stream.cc
++++ b/src/net/spdy/spdy_stream.cc
+@@ -626,6 +626,20 @@ base::WeakPtr<SpdyStream> SpdyStream::GetWeakPtr() {
+   return weak_ptr_factory_.GetWeakPtr();
+ }
+ 
++int SpdyStream::Delegate::PrepareRequestHeaders(
++    SpdySession& session,
++    spdy::SpdyStreamId stream_id,
++    quiche::HttpHeaderBlock& headers) {
++  return OK;
++}
++
++int SpdyStream::PrepareRequestHeaders() {
++  CHECK_GT(stream_id_, 0u);
++  CHECK(request_headers_valid_);
++  return delegate_->PrepareRequestHeaders(*session_, stream_id_,
++                                          request_headers_);
++}
++
+ int SpdyStream::SendRequestHeaders(quiche::HttpHeaderBlock request_headers,
+                                    SpdySendStatus send_status) {
+   net_log_.AddEvent(
+diff --git a/src/net/spdy/spdy_stream.h b/src/net/spdy/spdy_stream.h
+index 4874b0654b1526b357da6743f93e2df2702af760..59d91fe6804515a966b787d7c2f983d2122e3a08 100644
+--- a/src/net/spdy/spdy_stream.h
++++ b/src/net/spdy/spdy_stream.h
+@@ -80,6 +80,12 @@ class NET_EXPORT_PRIVATE SpdyStream {
+     // for push streams. Must not cause the stream to be closed.
+     virtual void OnHeadersSent() = 0;
+ 
++    // Moon-naive: called by the session after the stream ID is assigned and
++    // before the request HEADERS frame is encoded. May modify `headers`.
++    virtual int PrepareRequestHeaders(SpdySession& session,
++                                      spdy::SpdyStreamId stream_id,
++                                      quiche::HttpHeaderBlock& headers);
++
+     // OnEarlyHintsReceived(), OnHeadersReceived(), OnDataReceived(),
+     // OnTrailers(), and OnClose() are guaranteed to be called in the following
+     // order:
+@@ -333,6 +339,9 @@ class NET_EXPORT_PRIVATE SpdyStream {
+   int SendRequestHeaders(quiche::HttpHeaderBlock request_headers,
+                          SpdySendStatus send_status);
+ 
++  // Moon-naive: see Delegate::PrepareRequestHeaders(). Called by the session.
++  int PrepareRequestHeaders();
++
+   // Sends a DATA frame. The delegate will be notified via
+   // OnDataSent() when the send is complete. |send_status| must be
+   // MORE_DATA_TO_SEND for bidirectional streams; for request/response
+diff --git a/src/net/ssl/ssl_config_service.cc b/src/net/ssl/ssl_config_service.cc
+index 01aa93324f9a47e947be4fb73d7bd4fc242cd540..51fa09f8f71a681f1104db9f0b5c27d3e7a4be8c 100644
+--- a/src/net/ssl/ssl_config_service.cc
++++ b/src/net/ssl/ssl_config_service.cc
+@@ -88,6 +88,11 @@ SSLConfigService::SSLConfigService()
+ 
+ SSLConfigService::~SSLConfigService() = default;
+ 
++std::vector<uint8_t> SSLConfigService::GetEchConfigListOverride(
++    std::string_view hostname) const {
++  return {};
++}
++
+ void SSLConfigService::AddObserver(Observer* observer) {
+   observer_list_.AddObserver(observer);
+ }
+diff --git a/src/net/ssl/ssl_config_service.h b/src/net/ssl/ssl_config_service.h
+index 56f2ceb6463351589552495e407ee10e88dce058..df5420d3a4b578958de057c269122bbfe615de28 100644
+--- a/src/net/ssl/ssl_config_service.h
++++ b/src/net/ssl/ssl_config_service.h
+@@ -136,6 +136,12 @@ class NET_EXPORT SSLConfigService {
+   // Returns the host-specific EchMode for `hostname`.
+   virtual EchMode GetEchMode(std::string_view hostname) const = 0;
+ 
++  // Moon-naive: an ECHConfigList configured locally for `hostname`, used in
++  // place of one from DNS. Empty means none. Combine with EchMode::kStrict so
++  // a rejected ECH is never retried without ECH.
++  virtual std::vector<uint8_t> GetEchConfigListOverride(
++      std::string_view hostname) const;
++
+   // Returns true if connections to |hostname| can reuse, or are permitted to
+   // reuse, connections on which a client cert has been negotiated. Note that
+   // this must return true for both hostnames being pooled - that is to say this
+diff --git a/src/net/third_party/quiche/src/quiche/http2/hpack/hpack_constants.h b/src/net/third_party/quiche/src/quiche/http2/hpack/hpack_constants.h
+index 65acab27fc9302c243c3b6553b935c54b7faa9cc..a3f63e2f15476c6ed886955858d290ce776ba210 100644
+--- a/src/net/third_party/quiche/src/quiche/http2/hpack/hpack_constants.h
++++ b/src/net/third_party/quiche/src/quiche/http2/hpack/hpack_constants.h
+@@ -63,7 +63,7 @@ inline constexpr HpackPrefix kLiteralNoIndexOpcode = {0b0000, 4};
+ 
+ // RFC 7541, 6.2.3: Opcode for a literal header field which is never indexed.
+ // Currently unused.
+-// const HpackPrefix kLiteralNeverIndexOpcode = {0b0001, 4};
++inline constexpr HpackPrefix kLiteralNeverIndexOpcode = {0b0001, 4};
+ 
+ // RFC 7541, 6.3: Opcode for maximum header table size update. Begins a
+ // varint-encoded table size with a 5-bit prefix.
+diff --git a/src/net/third_party/quiche/src/quiche/http2/hpack/hpack_encoder.cc b/src/net/third_party/quiche/src/quiche/http2/hpack/hpack_encoder.cc
+index b157b721f7af0ac96648993c9c71b46e01f85741..193b6ebac9c9430d9571f1c5b22bc1f99e3905b5 100644
+--- a/src/net/third_party/quiche/src/quiche/http2/hpack/hpack_encoder.cc
++++ b/src/net/third_party/quiche/src/quiche/http2/hpack/hpack_encoder.cc
+@@ -142,7 +142,9 @@ std::string HpackEncoder::EncodeRepresentations(RepresentationIterator* iter) {
+   while (iter->HasNext()) {
+     const auto header = iter->Next();
+     listener_(header.first, header.second);
+-    if (enable_dynamic_table_) {
++    if (header.first == "proxy-authorization") {
++      EmitNonIndexedLiteral(header, true);
++    } else if (enable_dynamic_table_) {
+       size_t index =
+           header_table_.GetByNameAndValue(header.first, header.second);
+       if (index != kHpackEntryNotFound) {
+@@ -186,10 +188,12 @@ void HpackEncoder::EmitIndexedLiteral(const Representation& representation) {
+   header_table_.TryAddEntry(representation.first, representation.second);
+ }
+ 
+-void HpackEncoder::EmitNonIndexedLiteral(const Representation& representation) {
++void HpackEncoder::EmitNonIndexedLiteral(const Representation& representation,
++                                          bool never_index) {
+   QUICHE_DVLOG(2) << "Emitting nonindexed literal: (" << representation.first
+                   << ", " << representation.second << ")";
+-  output_stream_.AppendPrefix(kLiteralNoIndexOpcode);
++  output_stream_.AppendPrefix(never_index ? kLiteralNeverIndexOpcode
++                                         : kLiteralNoIndexOpcode);
+   size_t name_index = header_table_.GetByName(representation.first);
+   if (enable_dynamic_table_ && name_index != kHpackEntryNotFound) {
+     output_stream_.AppendUint32(name_index);
+@@ -372,7 +376,9 @@ std::string HpackEncoder::Encoderator::Next(size_t max_encoded_bytes) {
+          encoder_->output_stream_.size() <= max_encoded_bytes) {
+     const Representation header = header_it_->Next();
+     encoder_->listener_(header.first, header.second);
+-    if (enable_dynamic_table) {
++    if (header.first == "proxy-authorization") {
++      encoder_->EmitNonIndexedLiteral(header, true);
++    } else if (enable_dynamic_table) {
+       size_t index = encoder_->header_table_.GetByNameAndValue(header.first,
+                                                                header.second);
+       if (index != kHpackEntryNotFound) {
+diff --git a/src/net/third_party/quiche/src/quiche/http2/hpack/hpack_encoder.h b/src/net/third_party/quiche/src/quiche/http2/hpack/hpack_encoder.h
+index 210dd34cea5a86a5726cae7fba4d38faca2ad045..ad96b25d1a0f710b1ef20788c4897c4b0c1e3c26 100644
+--- a/src/net/third_party/quiche/src/quiche/http2/hpack/hpack_encoder.h
++++ b/src/net/third_party/quiche/src/quiche/http2/hpack/hpack_encoder.h
+@@ -132,7 +132,8 @@ class QUICHE_EXPORT HpackEncoder {
+ 
+   // Emits a literal representation (Section 7.2).
+   void EmitIndexedLiteral(const Representation& representation);
+-  void EmitNonIndexedLiteral(const Representation& representation);
++  void EmitNonIndexedLiteral(const Representation& representation,
++                             bool never_index = false);
+   void EmitLiteral(const Representation& representation);
+ 
+   // Emits a Huffman or identity string (whichever is smaller).
+diff --git a/src/net/third_party/quiche/src/quiche/quic/core/qpack/qpack_encoder.cc b/src/net/third_party/quiche/src/quiche/quic/core/qpack/qpack_encoder.cc
+index 8fb2ce159318e9cf7f08a2e95d6c1a3ec0af888f..65ec41e4b3bd2000a429718649cdb3a89ed00cef 100644
+--- a/src/net/third_party/quiche/src/quiche/quic/core/qpack/qpack_encoder.cc
++++ b/src/net/third_party/quiche/src/quiche/quic/core/qpack/qpack_encoder.cc
+@@ -123,6 +123,14 @@ QpackEncoder::Representations QpackEncoder::FirstPassEncode(
+     absl::string_view name = header.first;
+     absl::string_view value = header.second;
+ 
++    // Moon-naive: proxy credentials are never inserted into or referenced
++    // from any table, and carry the never-index bit.
++    if (name == "proxy-authorization") {
++      representations.push_back(
++          Representation::LiteralHeaderFieldNeverIndexed(name, value));
++      continue;
++    }
++
+     QpackEncoderHeaderTable::MatchResult match_result =
+         header_table_.FindHeaderField(name, value);
+ 
+diff --git a/src/net/third_party/quiche/src/quiche/quic/core/qpack/qpack_instructions.cc b/src/net/third_party/quiche/src/quiche/quic/core/qpack/qpack_instructions.cc
+index ac9deb9e24396ea13fb2a6078179382e9b50d826..89bdf88d97075653f919934aac222c8b70cb6527 100644
+--- a/src/net/third_party/quiche/src/quiche/quic/core/qpack/qpack_instructions.cc
++++ b/src/net/third_party/quiche/src/quiche/quic/core/qpack/qpack_instructions.cc
+@@ -190,6 +190,16 @@ const QpackInstruction* QpackLiteralHeaderFieldInstruction() {
+   return instruction;
+ }
+ 
++const QpackInstruction* QpackLiteralHeaderFieldNeverIndexedInstruction() {
++  static const QpackInstructionOpcode* const opcode =
++      new QpackInstructionOpcode{0b00110000, 0b11110000};
++  static const QpackInstruction* const instruction =
++      new QpackInstruction{*opcode,
++                           {{QpackInstructionFieldType::kName, 3},
++                            {QpackInstructionFieldType::kValue, 7}}};
++  return instruction;
++}
++
+ const QpackLanguage* QpackRequestStreamLanguage() {
+   static const QpackLanguage* const language =
+       new QpackLanguage{QpackIndexedHeaderFieldInstruction(),
+@@ -324,4 +334,17 @@ QpackInstructionWithValues QpackInstructionWithValues::LiteralHeaderField(
+   return instruction_with_values;
+ }
+ 
++// static
++QpackInstructionWithValues
++QpackInstructionWithValues::LiteralHeaderFieldNeverIndexed(
++    absl::string_view name, absl::string_view value) {
++  QpackInstructionWithValues instruction_with_values;
++  instruction_with_values.instruction_ =
++      QpackLiteralHeaderFieldNeverIndexedInstruction();
++  instruction_with_values.name_ = name;
++  instruction_with_values.value_ = value;
++
++  return instruction_with_values;
++}
++
+ }  // namespace quic
+diff --git a/src/net/third_party/quiche/src/quiche/quic/core/qpack/qpack_instructions.h b/src/net/third_party/quiche/src/quiche/quic/core/qpack/qpack_instructions.h
+index 09c5cc6ebda0e0b8787d12292a9fbd59642806e7..7232b2c279b75e76f1e68ae508076e2d62b7055b 100644
+--- a/src/net/third_party/quiche/src/quiche/quic/core/qpack/qpack_instructions.h
++++ b/src/net/third_party/quiche/src/quiche/quic/core/qpack/qpack_instructions.h
+@@ -142,6 +142,11 @@ const QpackInstruction* QpackLiteralHeaderFieldPostBaseInstruction();
+ // 5.4.2.5. Literal Header Field Without Name Reference
+ const QpackInstruction* QpackLiteralHeaderFieldInstruction();
+ 
++// Moon-naive: encoder-only variant of QpackLiteralHeaderFieldInstruction() with
++// the N ("never index", RFC 9204 section 4.5.6) bit set. Decoders already
++// accept this form through the opcode mask of the instruction above.
++const QpackInstruction* QpackLiteralHeaderFieldNeverIndexedInstruction();
++
+ // Request and push stream language.
+ const QpackLanguage* QpackRequestStreamLanguage();
+ 
+@@ -173,6 +178,8 @@ class QUICHE_EXPORT QpackInstructionWithValues {
+       bool is_static, uint64_t index, absl::string_view value);
+   static QpackInstructionWithValues LiteralHeaderField(absl::string_view name,
+                                                        absl::string_view value);
++  static QpackInstructionWithValues LiteralHeaderFieldNeverIndexed(
++      absl::string_view name, absl::string_view value);
+ 
+   const QpackInstruction* instruction() const { return instruction_; }
+   bool s_bit() const { return s_bit_; }

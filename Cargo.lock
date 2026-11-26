@@ -1514,16 +1514,12 @@ name = "moon-naive-client"
 version = "0.8.0"
 dependencies = [
  "base64 0.23.1",
- "boring",
- "bytes",
- "h2",
- "http",
+ "getrandom 0.3.4",
  "moon-naive-core",
+ "moon-naive-engine",
  "nix",
- "quiche",
  "serde",
  "tokio",
- "tokio-boring",
  "toml",
 ]
 
@@ -1538,6 +1534,14 @@ dependencies = [
  "sha2",
  "subtle",
  "toml",
+]
+
+[[package]]
+name = "moon-naive-engine"
+version = "0.8.0"
+dependencies = [
+ "libloading",
+ "tokio",
 ]
 
 [[package]]

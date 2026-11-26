@@ -52,7 +52,7 @@ workspace = true
 [workspace]
 resolver = "2"
 exclude = ["vendor/instant-acme", "vendor/pingora", "vendor/pingora/*"]
-members = ["core", "client", "tools/xtask"]
+members = ["core", "client", "engine/bridge", "tools/xtask"]
 default-members = [".", "client"]
 
 [workspace.package]
@@ -65,6 +65,7 @@ publish = false
 [workspace.dependencies]
 moon-naive-core = { path = "core" }
 moon-naive-client = { path = "client" }
+moon-naive-engine = { path = "engine/bridge" }
 serde = { version = "1", features = ["derive"] }
 toml = "1.2.1"
 base64 = "0.23.1"

@@ -39,10 +39,16 @@ user ↔ the administrator who controls configuration directories.
 
 ## Client-side controls
 
-The client enforces TLS 1.3, certificate and hostname verification, mandatory
-ECH when configured (no silent fallback), confirmation of the server's 200
-response before sending payload, and an unauthenticated listener that warns
-when not bound to loopback. Its configuration file must be private.
+The client's connections are made by the Chromium native engine: Chromium's
+certificate verifier (Chrome Root Store plus optional anchors), TLS 1.3,
+mandatory ECH when configured (no proof is signed on a non-ECH connection),
+and confirmation of the server's 200 response before any payload. Proofs are
+bound to the exporter and the stream ID that Chromium actually allocated, and
+`proxy-authorization` is never indexed by HPACK/QPACK. The unauthenticated
+local listener only accepts loopback addresses. Its configuration file must
+be private. The engine library is trusted code loaded into the client
+process: install it from a release archive or a build you made, and keep it
+as private as the client binary.
 
 ## QUIC paths and connection IDs
 
@@ -66,5 +72,10 @@ cleanup would need connection-ID routing support that is not implemented.
 - TCP Fast Open is never used; the host sysctl boundary is described in
   [deployment.md](deployment.md#tcp-fast-open).
 - No side-channel analysis beyond constant-time proof comparison has been done.
-- `unsafe` is forbidden in all project-owned crates (`unsafe_code = "forbid"`).
-  Native code lives in BoringSSL (C/C++) and in vendored and third-party crates.
+- `unsafe` is forbidden in all project-owned crates (`unsafe_code = "forbid"`)
+  except `engine/bridge`, the FFI to the engine. Native code lives in
+  BoringSSL (C/C++), in the Chromium engine (C++), and in vendored and
+  third-party crates.
+- The client uses Chromium's network stack, but no claim is made that its
+  traffic is indistinguishable from Chrome's; no fingerprint comparison has
+  been done.

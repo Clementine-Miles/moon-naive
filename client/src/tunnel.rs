@@ -1,6 +1,5 @@
 //! Transport-independent tunnel pieces: authentication context, the open
 //! result, and Rupin record framing with randomized padding.
-use bytes::Bytes;
 use moon_naive_core::{
     auth::{Binding, Context, Credentials},
     codec::{Decoder, Encoder, MAX_PAYLOAD, Mode, Offer},
@@ -24,6 +23,11 @@ pub enum OpenError {
     /// A 200 response without a valid mona confirmation. Never treated as an
     /// established tunnel.
     Confirmation,
+    /// The client refused to sign: the connection did not meet the binding
+    /// requirements (for example, ECH was configured but not accepted).
+    Refused,
+    /// The target authority is not acceptable.
+    Invalid,
     Timeout,
 }
 impl fmt::Display for OpenError {
@@ -32,6 +36,8 @@ impl fmt::Display for OpenError {
             Self::Connection(reason) => write!(f, "connection failed: {reason}"),
             Self::Status(status) => write!(f, "server refused the tunnel (HTTP {status})"),
             Self::Confirmation => f.write_str("server confirmation missing or invalid"),
+            Self::Refused => f.write_str("connection did not meet ECH/TLS requirements"),
+            Self::Invalid => f.write_str("invalid target"),
             Self::Timeout => f.write_str("tunnel setup timed out"),
         }
     }
@@ -85,17 +91,17 @@ impl Framer {
             encoder: Encoder::new(mode),
         }
     }
-    pub fn frame(&mut self, payload: &[u8]) -> Result<Bytes, &'static str> {
+    pub fn frame(&mut self, payload: &[u8]) -> Result<Vec<u8>, &'static str> {
         debug_assert!(!payload.is_empty() && payload.len() <= MAX_PAYLOAD);
         let limit = self.encoder.padding_limit(payload.len());
         let padding = if limit == 0 {
             0
         } else {
             let mut byte = [0u8; 1];
-            boring::rand::rand_bytes(&mut byte).map_err(|_| "random source unavailable")?;
+            getrandom::fill(&mut byte).map_err(|_| "random source unavailable")?;
             byte[0] % (limit + 1)
         };
-        self.encoder.encode(payload, padding).map(Bytes::from)
+        self.encoder.encode(payload, padding)
     }
 }
 /// Largest local read that maps to exactly one record.
