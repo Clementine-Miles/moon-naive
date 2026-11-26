@@ -1,4 +1,6 @@
 //! Shared Pingora website engine. H2 enters directly; H3 uses a bounded memory bridge.
+#[cfg(test)]
+mod bench;
 mod bridge;
 mod transform;
 mod upstream;
