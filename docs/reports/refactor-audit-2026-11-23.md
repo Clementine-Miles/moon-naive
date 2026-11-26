@@ -64,8 +64,25 @@ container kernel returns `EAFNOSUPPORT` for IPv6 sockets. They are unchanged.
 - No server data-path optimization was attempted: there was no profile
   evidence of a bottleneck for the small deployment, so no server performance
   improvement is claimed. Client throughput is recorded in
-  [testing.md](testing.md#measurements).
+  [development.md](../development.md#measurements).
 - Full QUIC CID rotation and path cleanup (beyond the bounded limit) would
   require multi-CID routing; active migration stays disabled.
 - ECH key rotation is operator-driven (`ech init/check/dns` plus DNS TTL
   overlap) rather than an automated state machine.
+
+## Test results of the refactor
+
+Environment: Rust 1.100.0, Linux x86_64 container without IPv6 support.
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` | pass |
+| `cargo xtask vectors --check` | pass (byte-identical after renaming) |
+| `cargo xtask audit-tfo`, `cargo xtask audit-native` | pass |
+| `cargo test --workspace` | All pass except 3 IPv6 bind tests that fail with `EAFNOSUPPORT` because the container has no IPv6. These also fail on the unmodified baseline and are not modified or skipped |
+| Release build of both binaries | pass |
+| Client e2e suite (9 tests incl. ECH) | pass |
+
+Not run in this session: Pebble and capture laboratories (need Go-built
+Pebble, tcpdump/tshark and namespaces), the Caddy differential, public CA
+issuance, kernel `netem` impairment, fuzzing campaigns.

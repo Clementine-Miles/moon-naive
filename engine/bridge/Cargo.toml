@@ -1,0 +1,23 @@
+[package]
+name = "moon-naive-engine"
+description = "Safe Rust bridge to the Moon-naive Chromium Native Engine (libmoon_engine)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+test = true
+doctest = false
+bench = false
+
+[dependencies]
+libloading = "0.8.9"
+tokio = { workspace = true }
+
+# The only crate in the workspace allowed to contain `unsafe`: it is the FFI
+# boundary to the C ABI in engine/src/net/tools/moon_engine/moon_engine.h.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"

@@ -1,7 +1,7 @@
 use super::{
     App, Bytes, CHUNK, Head, Plan, Reply, Result,
     tls::Slot,
-    tunnel::{Activity, TunnelDecoder, TunnelDownload},
+    tunnel::{self, Activity},
 };
 use h2::Reason;
 use pingora_core::protocols::{
@@ -10,7 +10,7 @@ use pingora_core::protocols::{
     l4::stream::Stream as L4,
 };
 use std::sync::Arc;
-use tokio::{io::AsyncWriteExt, net::TcpStream, sync::watch};
+use tokio::{net::TcpStream, sync::watch};
 
 pub(super) async fn serve(
     socket: TcpStream,
@@ -180,45 +180,57 @@ async fn process(
             let mut writer = session
                 .take_response_body_writer()
                 .ok_or("H2 response stream unavailable")?;
-            let (mut read, mut write) = tokio::io::split(target);
             let activity = Activity::new();
-            let upload = async {
-                let mut decoder = TunnelDecoder::new(framed);
-                while let Some(data) = session.read_body_bytes().await? {
-                    if !data.is_empty() {
-                        activity.touch();
-                    }
-                    let data = app.resources.buffers.charge(data).await?;
-                    decoder.write_to(&mut write, &data, &activity).await?;
-                }
-                if session.take_request_trailers().is_some() {
-                    return Err("CONNECT trailers unsupported".into());
-                }
-                decoder.finish()?;
-                write.shutdown().await?;
-                activity.touch();
-                Ok::<_, crate::Error>(())
-            };
-            let download = async {
-                let mut download = TunnelDownload::new(framed)?;
-                while let Some(bytes) = download.read_next(&mut read).await? {
-                    activity.touch();
-                    let bytes = app.resources.buffers.charge(bytes).await?;
-                    send_body(&mut writer, bytes, false, &activity).await?;
-                }
-                send_body(&mut writer, Bytes::new(), true, &activity).await?;
-                Ok::<_, crate::Error>(())
-            };
-            activity
-                .run(app.idle, async {
-                    tokio::try_join!(upload, download)?;
-                    Ok(())
-                })
-                .await?;
+            tunnel::relay(
+                target,
+                framed,
+                app.idle,
+                &activity,
+                H2Data {
+                    session: &mut session,
+                    app,
+                },
+                H2Sink {
+                    writer: &mut writer,
+                    app,
+                    activity: &activity,
+                },
+            )
+            .await?;
             drop(_permit);
         }
     }
     Ok(())
+}
+
+struct H2Data<'a> {
+    session: &'a mut HttpSession,
+    app: &'a App,
+}
+impl tunnel::ClientData for H2Data<'_> {
+    async fn next(&mut self) -> Result<Option<Bytes>> {
+        match self.session.read_body_bytes().await? {
+            Some(data) => Ok(Some(self.app.resources.buffers.charge(data).await?)),
+            None if self.session.take_request_trailers().is_some() => {
+                Err("CONNECT trailers unsupported".into())
+            }
+            None => Ok(None),
+        }
+    }
+}
+struct H2Sink<'a> {
+    writer: &'a mut h2::SendStream<Bytes>,
+    app: &'a App,
+    activity: &'a Activity,
+}
+impl tunnel::ClientSink for H2Sink<'_> {
+    async fn send(&mut self, bytes: Bytes) -> Result<()> {
+        let bytes = self.app.resources.buffers.charge(bytes).await?;
+        send_body(self.writer, bytes, false, self.activity).await
+    }
+    async fn finish(&mut self) -> Result<()> {
+        send_body(self.writer, Bytes::new(), true, self.activity).await
+    }
 }
 
 async fn admit_until_closed(
@@ -311,7 +323,8 @@ fn write_header(session: &mut HttpSession, reply: &Reply, end: bool) -> Result<(
         if name.eq_ignore_ascii_case("proxy-authentication-info") {
             value.set_sensitive(true);
         }
-        header.insert_header(
+        // A reply is an ordered field list, as on H3: never merge entries.
+        header.append_header(
             http::header::HeaderName::from_bytes(name.as_bytes())?,
             value,
         )?;

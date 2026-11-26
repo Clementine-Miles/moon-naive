@@ -32,10 +32,16 @@ pub struct Config {
     pub password: String,
     #[serde(default)]
     pub transport: Transport,
-    /// PEM trust anchors. Defaults to the system trust store. Certificate
-    /// verification cannot be disabled.
+    /// Additional PEM trust anchors, trusted in addition to the Chrome Root
+    /// Store that the engine uses. Certificate verification cannot be
+    /// disabled.
     #[serde(default)]
     pub ca_file: Option<PathBuf>,
+    /// Path of the Chromium native engine (`libmoon_engine.so`). Defaults to
+    /// `$MOON_NAIVE_ENGINE`, then the executable's directory, then
+    /// `<executable dir>/../lib/moon-naive/`.
+    #[serde(default)]
+    pub engine_library: Option<PathBuf>,
     /// Base64 ECHConfigList (as printed by `moon-naive ech dns`). When set,
     /// ECH is mandatory: a connection the server does not accept with ECH
     /// fails instead of falling back to a cleartext server name.
@@ -64,6 +70,7 @@ impl fmt::Debug for Config {
             .field("password", &"<redacted>")
             .field("transport", &self.transport)
             .field("ca_file", &self.ca_file)
+            .field("engine_library", &self.engine_library)
             .field("ech", &self.ech_config_list.is_some())
             .finish_non_exhaustive()
     }
@@ -96,6 +103,7 @@ pub struct Settings {
     pub credentials: moon_naive_core::auth::Credentials,
     pub transport: Transport,
     pub ca_file: Option<PathBuf>,
+    pub engine_library: Option<PathBuf>,
     pub ech_config_list: Option<Vec<u8>>,
     pub connect_timeout: Duration,
     pub local_handshake_timeout: Duration,
@@ -144,6 +152,10 @@ impl Config {
                 Err(format!("{name} must be within {range:?} seconds"))
             }
         };
+        // The local proxy has no authentication: loopback only.
+        if !self.listen.ip().is_loopback() {
+            return Err("listen must be a loopback address (127.0.0.0/8 or ::1)".into());
+        }
         if !(1..=4096).contains(&self.max_tunnels) {
             return Err("max_tunnels must be within 1..=4096".into());
         }
@@ -161,6 +173,7 @@ impl Config {
             credentials,
             transport: self.transport,
             ca_file: self.ca_file.clone(),
+            engine_library: self.engine_library.clone(),
             ech_config_list,
             connect_timeout: bounded(self.connect_timeout_secs, 1..=120, "connect_timeout_secs")?,
             local_handshake_timeout: bounded(
@@ -259,6 +272,15 @@ mod tests {
         let named = format!("{ip}server_name = 'proxy.example.com'\n");
         assert_eq!(Config::parse(&named).unwrap().settings().unwrap().port, 443);
         assert!(Config::parse(&format!("{MINIMAL}insecure = true\n")).is_err());
+        for listen in ["0.0.0.0:1080", "[::]:1080", "192.0.2.1:1080"] {
+            let text = format!("{MINIMAL}listen = '{listen}'\n");
+            assert!(
+                Config::parse(&text).unwrap().settings().is_err(),
+                "{listen}"
+            );
+        }
+        let v6 = format!("{MINIMAL}listen = '[::1]:1080'\n");
+        assert!(Config::parse(&v6).unwrap().settings().is_ok());
         let fast = format!("{MINIMAL}transport = 'h3-then-h2'\n");
         assert_eq!(
             Config::parse(&fast).unwrap().settings().unwrap().transport,

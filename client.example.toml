@@ -8,7 +8,7 @@ server = "proxy.example.com:443"
 # server_name = "proxy.example.com"
 
 # Local listener for both SOCKS5 and HTTP CONNECT. It has no authentication,
-# so keep it on loopback.
+# so only loopback addresses (127.0.0.0/8 or [::1]) are accepted.
 listen = "127.0.0.1:1080"
 
 # The same user configured on the server. Use a long random password.
@@ -17,12 +17,17 @@ password = "replace-with-a-long-random-secret"
 
 # "h2", "h3", or "h3-then-h2". The fallback is taken only when a QUIC
 # connection cannot be established; a server's answer is never retried over
-# another transport, and both transports use identical TLS/ECH/auth policy.
+# another transport. Both transports are Chromium's, with identical
+# certificate, ECH and authentication policy.
 transport = "h3-then-h2"
 
-# PEM trust anchors. Omit to use the system trust store. Certificate
-# verification cannot be disabled.
+# Additional PEM trust anchors (for a private CA), used together with the
+# Chrome Root Store. Certificate verification cannot be disabled.
 # ca_file = "/etc/moon-naive/ca.pem"
+
+# The Chromium native engine. Default lookup: MOON_NAIVE_ENGINE, next to the
+# client executable, then ../lib/moon-naive/ (the release archive layout).
+# engine_library = "/usr/local/lib/moon-naive/libmoon_engine.so"
 
 # Base64 ECHConfigList printed by `moon-naive ech dns` on the server. When set,
 # ECH is required: connections the server does not accept with ECH fail.

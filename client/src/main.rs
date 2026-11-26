@@ -9,7 +9,7 @@ moon-naive-client check <client.toml>   validate the configuration offline
 moon-naive-client --version
 
 The configuration holds the proxy password and must be private (mode 0600).
-See docs/client.md.";
+See docs/usage.md.";
 
 fn load(path: &str) -> Result<moon_naive_client::Settings, String> {
     use std::io::Read;
@@ -39,7 +39,7 @@ fn main() -> ExitCode {
     let result = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["--version" | "-V"] => {
             println!(
-                "Moon-naive client {} ({} protocol, {} profile; boringssl/quiche)",
+                "Moon-naive client {} ({} protocol, {} profile; Chromium native engine)",
                 env!("CARGO_PKG_VERSION"),
                 moon_naive_core::auth::PROTOCOL,
                 moon_naive_core::auth::PROFILE

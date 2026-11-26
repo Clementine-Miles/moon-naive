@@ -1,9 +1,17 @@
-//! First-party client against the actual server: real TLS 1.3 / QUIC, real
-//! exporters and stream IDs, real local SOCKS5 and HTTP CONNECT sockets.
-//! The only test hook is the server's dial override (`test_target`), which
-//! sends authenticated CONNECTs for public names to a loopback echo origin.
+//! Interop: the first-party client, carried by the Chromium native engine
+//! (`libmoon_engine`), against the actual server. Real Chromium TLS 1.3 / QUIC
+//! on the client, real Pingora/quiche on the server, real exporters and stream
+//! IDs, real local SOCKS5 and HTTP CONNECT sockets.
+//!
+//! These tests need the engine library and are ignored by default. Run them
+//! with `cargo xtask interop` (which builds or locates the library and sets
+//! `MOON_NAIVE_ENGINE`).
+//!
+//! Server test hooks: the dial override (`test_target`), which sends
+//! authenticated CONNECTs for public names to a loopback origin, and the
+//! confirmation fault injection (`test_confirmation`).
 use super::*;
-use moon_naive_client::{Config as ClientConfig, Transport};
+use moon_naive_client::Config as ClientConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const PASSWORD: &str = "long-loopback-test-password";
@@ -190,15 +198,18 @@ async fn proxies_over(transport: &str) {
 }
 
 #[tokio::test]
+#[ignore = "interop: needs libmoon_engine; run with cargo xtask interop"]
 async fn client_proxies_socks5_and_http_connect_over_h2() {
     proxies_over("h2").await;
 }
 #[tokio::test]
+#[ignore = "interop: needs libmoon_engine; run with cargo xtask interop"]
 async fn client_proxies_socks5_and_http_connect_over_h3() {
     proxies_over("h3").await;
 }
 
 #[tokio::test]
+#[ignore = "interop: needs libmoon_engine; run with cargo xtask interop"]
 async fn client_with_wrong_password_never_causes_a_dial() {
     let f = fixture();
     let (origin, origin_task) = echo_origin().await;
@@ -228,6 +239,7 @@ async fn client_with_wrong_password_never_causes_a_dial() {
 }
 
 #[tokio::test]
+#[ignore = "interop: needs libmoon_engine; run with cargo xtask interop"]
 async fn client_rejects_untrusted_server_certificate() {
     let f = fixture();
     let (origin, origin_task) = echo_origin().await;
@@ -255,6 +267,7 @@ async fn client_rejects_untrusted_server_certificate() {
 }
 
 #[tokio::test]
+#[ignore = "interop: needs libmoon_engine; run with cargo xtask interop"]
 async fn h3_then_h2_falls_back_when_udp_is_unreachable() {
     let f = fixture();
     let (origin, origin_task) = echo_origin().await;
@@ -287,6 +300,7 @@ async fn h3_then_h2_falls_back_when_udp_is_unreachable() {
 }
 
 #[tokio::test]
+#[ignore = "interop: needs libmoon_engine; run with cargo xtask interop"]
 async fn client_reconnects_after_server_restart() {
     let f = fixture();
     let (origin, origin_task) = echo_origin().await;
@@ -333,21 +347,37 @@ async fn client_reconnects_after_server_restart() {
     origin_task.abort();
 }
 
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn client_sockets_never_request_tfo() {
-    // The client opens its H2 TCP socket with plain connect(); prove the
-    // connect-time TFO option is off on an equivalent tokio socket and
-    // that the client crate has no project-owned TFO code (static audit).
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let stream = TcpStream::connect(listener.local_addr().unwrap())
-        .await
-        .unwrap();
-    assert!(
-        !nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::TcpFastOpenConnect)
-            .unwrap()
-    );
-    let _ = Transport::H2;
+#[test]
+fn client_has_no_transport_or_tfo_code_of_its_own() {
+    // All proxy sockets are opened by Chromium's TCPClientSocket/UDP stack,
+    // which never enables TCP Fast Open. Static audit: the client crate has
+    // no HTTP/2, QUIC or TLS implementation and no socket options of its own.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("client");
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    for crate_name in ["quiche", "h2 ", "boring", "rustls", "tokio-boring"] {
+        assert!(
+            !manifest.contains(&format!("\n{crate_name}")),
+            "client depends on {crate_name}"
+        );
+    }
+    for entry in std::fs::read_dir(root.join("src")).unwrap() {
+        let path = entry.unwrap().path();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let open = ["FAST", "OPEN"].concat();
+        for forbidden in [
+            format!("TCP_{open}"),
+            format!("Tcp{}Open", "Fast"),
+            format!("set_tcp_{}open", "fast"),
+            "quiche::".to_owned(),
+            "h2::".to_owned(),
+        ] {
+            assert!(
+                !text.contains(&forbidden),
+                "{}: {forbidden}",
+                path.display()
+            );
+        }
+    }
 }
 
 /// Configure server ECH like `ech_accepts_inner_name_and_preserves_plain_h2`
@@ -406,6 +436,7 @@ fn ech_material(name: &[u8]) -> (Vec<u8>, Vec<u8>, [u8; 32]) {
 }
 
 #[tokio::test]
+#[ignore = "interop: needs libmoon_engine; run with cargo xtask interop"]
 async fn client_ech_is_accepted_on_h2_and_h3_and_never_bypassed() {
     let mut f = fixture();
     let ech = enable_ech(&mut f);
@@ -428,8 +459,12 @@ async fn client_ech_is_accepted_on_h2_and_h3_and_never_bypassed() {
     }
     let dials = stats.dials.load(Ordering::Relaxed);
     assert_eq!(dials, 2);
-    // A configuration for a key the server does not hold: the handshake must
-    // fail rather than silently continue with the cleartext inner name.
+    // A configuration for a key the server does not hold. The server rejects
+    // ECH and returns its retry configs inside the handshake authenticated by
+    // the public name's certificate; Chromium (strict ECH) retries once with
+    // them. A tunnel may therefore open, but only on a connection that
+    // accepted ECH: the client refuses to sign a CONNECT on any connection
+    // without accepted ECH, so the inner name is never sent in cleartext.
     use base64::{Engine, engine::general_purpose::STANDARD};
     let (_, stale, _) = ech_material(b"public.example.test");
     for transport in ["h2", "h3"] {
@@ -439,10 +474,18 @@ async fn client_ech_is_accepted_on_h2_and_h3_and_never_bypassed() {
             STANDARD.encode(&stale)
         );
         let client = Client::start(&text).await;
-        let (_stream, code) = socks(client.address, "example.org", 443).await;
-        assert_ne!(code, 0, "{transport} must not bypass a required ECH");
+        let (stream, code) = socks(client.address, "example.org", 443).await;
+        if transport == "h2" {
+            assert_eq!(code, 0, "h2 recovers through ECH retry configs");
+            echo_round_trip(stream, 1000, 8).await;
+        } else {
+            // Chromium's QUIC client does not retry with ECH retry configs at
+            // this revision: H3 fails closed instead.
+            assert_ne!(code, 0, "h3 must not bypass a required ECH");
+        }
         client.stop().await;
     }
+    let dials = dials + 1;
     assert_eq!(stats.dials.load(Ordering::Relaxed), dials);
     stop.send(true).unwrap();
     task.await.unwrap().unwrap();
@@ -450,9 +493,9 @@ async fn client_ech_is_accepted_on_h2_and_h3_and_never_bypassed() {
 }
 
 /// Loopback throughput of the full client→server→origin path. Run with:
-/// cargo test --release --locked -p moon-naive --lib client_throughput -- --ignored --nocapture
+/// cargo xtask interop --release --bench
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "measurement; run explicitly in release mode"]
+#[ignore = "measurement; run explicitly in release mode with the engine"]
 async fn client_throughput_benchmark() {
     const SIZE: usize = 64 * 1024 * 1024;
     for transport in ["h2", "h3"] {
@@ -482,4 +525,161 @@ async fn client_throughput_benchmark() {
         task.await.unwrap().unwrap();
         origin_task.abort();
     }
+}
+
+/// Origin that counts every byte it receives and echoes nothing.
+async fn counting_origin() -> (
+    std::net::SocketAddr,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = received.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let counter = counter.clone();
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 4096];
+                while let Ok(n) = socket.read(&mut buffer).await {
+                    if n == 0 {
+                        break;
+                    }
+                    counter.fetch_add(n, Ordering::SeqCst);
+                }
+            });
+        }
+    });
+    (address, received, task)
+}
+
+/// Invalid confirmations (missing, duplicated, wrong MAC) never establish a
+/// tunnel and never let payload reach the target; the same client then
+/// recovers on the same pooled connection once confirmations are valid.
+async fn invalid_confirmation_then_recovery(transport: &str) {
+    let f = fixture();
+    let (origin, received, origin_task) = counting_origin().await;
+    let server = network_same_port(&f, origin).await;
+    let address = server.tcp_addr().unwrap();
+    let fault = server.app.egress.test_confirmation.clone();
+    let stats = server.stats.clone();
+    let (stop, shutdown) = watch::channel(false);
+    let task = tokio::spawn(server.run(shutdown));
+    let client = Client::start(&client_config(address, &f.ca, transport, PASSWORD)).await;
+    for injected in [
+        egress::TEST_CONFIRMATION_MISSING,
+        egress::TEST_CONFIRMATION_DUPLICATE,
+        egress::TEST_CONFIRMATION_CORRUPT,
+    ] {
+        fault.store(injected, Ordering::SeqCst);
+        let (mut stream, code) = socks(client.address, "example.org", 443).await;
+        assert_ne!(code, 0, "{transport}: fault {injected} must not open");
+        // Anything the application sends now must never reach the target.
+        let _ = stream.write_all(b"must-not-arrive").await;
+        drop(stream);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        received.load(Ordering::SeqCst),
+        0,
+        "{transport}: payload leaked"
+    );
+    assert_eq!(stats.dials.load(Ordering::Relaxed), 3);
+    fault.store(egress::TEST_CONFIRMATION_VALID, Ordering::SeqCst);
+    let (mut stream, code) = socks(client.address, "example.org", 443).await;
+    assert_eq!(code, 0, "{transport}: recovery");
+    stream.write_all(b"0123456789").await.unwrap();
+    stream.shutdown().await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while received.load(Ordering::SeqCst) < 10 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{transport}: payload after recovery"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(received.load(Ordering::SeqCst), 10);
+    let connections = if transport == "h3" {
+        stats.h3_connections.load(Ordering::Relaxed)
+    } else {
+        stats.h2_connections.load(Ordering::Relaxed)
+    };
+    assert_eq!(
+        connections, 1,
+        "{transport}: a stream failure keeps the connection"
+    );
+    client.stop().await;
+    stop.send(true).unwrap();
+    task.await.unwrap().unwrap();
+    origin_task.abort();
+}
+
+#[tokio::test]
+#[ignore = "interop: needs libmoon_engine; run with cargo xtask interop"]
+async fn invalid_confirmations_never_open_and_h2_recovers() {
+    invalid_confirmation_then_recovery("h2").await;
+}
+#[tokio::test]
+#[ignore = "interop: needs libmoon_engine; run with cargo xtask interop"]
+async fn invalid_confirmations_never_open_and_h3_recovers() {
+    invalid_confirmation_then_recovery("h3").await;
+}
+
+/// The target half-closes first: it greets, shuts down its writer, then keeps
+/// reading. The client must deliver the greeting plus EOF and still carry its
+/// own upload afterwards, then half-close in turn.
+async fn half_close_both_directions(transport: &str) {
+    let f = fixture();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = listener.local_addr().unwrap();
+    let (report, uploaded) = tokio::sync::oneshot::channel();
+    let origin_task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        socket.write_all(b"greeting").await.unwrap();
+        socket.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        socket.read_to_end(&mut received).await.unwrap();
+        let _ = report.send(received);
+    });
+    let server = network_same_port(&f, origin).await;
+    let address = server.tcp_addr().unwrap();
+    let (stop, shutdown) = watch::channel(false);
+    let task = tokio::spawn(server.run(shutdown));
+    let client = Client::start(&client_config(address, &f.ca, transport, PASSWORD)).await;
+    let (mut stream, code) = socks(client.address, "example.org", 443).await;
+    assert_eq!(code, 0);
+    let mut greeting = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut greeting))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(greeting, b"greeting", "{transport}: download then EOF");
+    // The read side is finished; the upload side still works.
+    let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    stream.write_all(&payload).await.unwrap();
+    stream.shutdown().await.unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(20), uploaded)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(received == payload, "{transport}: upload after peer EOF");
+    client.stop().await;
+    stop.send(true).unwrap();
+    task.await.unwrap().unwrap();
+    origin_task.await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "interop: needs libmoon_engine; run with cargo xtask interop"]
+async fn half_close_is_independent_per_direction_over_h2() {
+    half_close_both_directions("h2").await;
+}
+#[tokio::test]
+#[ignore = "interop: needs libmoon_engine; run with cargo xtask interop"]
+async fn half_close_is_independent_per_direction_over_h3() {
+    half_close_both_directions("h3").await;
 }

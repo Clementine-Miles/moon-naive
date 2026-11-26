@@ -191,13 +191,18 @@ first-party client against the actual server over H2 and H3.
 ## First-party client behavior
 
 `moon-naive-client` offers `0x07` (initial 8, initial 16 and sparse); the
-server's preference selects the mode. It obtains the exporter after the TLS 1.3
-handshake on the actual connection, signs each CONNECT with the actual stream
-ID (H2 IDs are allocated sequentially under a lock and checked against the
-assigned ID; H3 request IDs likewise), verifies status 200 plus exactly one
-valid `proxy-authentication-info` before sending any payload, and pads each
-record uniformly within the codec's permitted limit. Certificate verification
-is always enabled, and when an ECHConfigList is configured the connection is
-refused unless the server accepts ECH. The `h3-then-h2` policy falls back to
+server's preference selects the mode. Its connections are made by the
+Chromium native engine (Chromium's HTTP/2 and QUIC stacks, patched in
+`engine/chromium.patch`). The engine reads the exporter of the actual proxy
+connection after the TLS 1.3 handshake and, once the CONNECT stream's ID has
+been allocated (HTTP/2 in `SpdySession` just before HEADERS are written;
+HTTP/3 from the request stream, so stream 0 is valid), calls the client to
+sign the request with that exporter, that stream ID and the exact
+`:authority`. The client verifies status 200 plus exactly one valid
+`proxy-authentication-info` before any payload is sent or delivered; a
+missing, duplicate or corrupt confirmation closes the stream. Records are
+padded uniformly within the codec's permitted limit. Certificate verification
+is always enabled, and when an ECHConfigList is configured no request is
+signed unless the server accepted ECH. The `h3-then-h2` policy falls back to
 H2 only when a QUIC connection cannot be established; server answers are never
 retried on another transport, and established tunnel bytes are never retried.

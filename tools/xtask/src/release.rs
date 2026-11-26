@@ -178,6 +178,151 @@ pub fn check_elf(binary: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The engine library exports exactly the C ABI and needs only glibc.
+pub fn check_engine(library: &Path) -> Result<()> {
+    const EXPORTS: [&str; 8] = [
+        "moon_engine_abi_version",
+        "moon_engine_create",
+        "moon_engine_destroy",
+        "moon_tunnel_close",
+        "moon_tunnel_open",
+        "moon_tunnel_read",
+        "moon_tunnel_shutdown_write",
+        "moon_tunnel_write",
+    ];
+    const SYSTEM: [&str; 7] = [
+        "libc.so.6",
+        "libm.so.6",
+        "libdl.so.2",
+        "libpthread.so.0",
+        "librt.so.1",
+        "libgcc_s.so.1",
+        "ld-linux-x86-64.so.2",
+    ];
+    let bytes = fs::read(library)?;
+    let elf = goblin::elf::Elf::parse(&bytes)?;
+    check(
+        elf.is_64
+            && elf.little_endian
+            && elf.header.e_machine == goblin::elf::header::EM_X86_64
+            && elf.header.e_type == goblin::elf::header::ET_DYN
+            && elf.interpreter.is_none(),
+        "engine must be a Linux x86_64 shared library",
+    )?;
+    let mut exported = BTreeSet::new();
+    for symbol in elf.dynsyms.iter() {
+        let global = matches!(
+            symbol.st_bind(),
+            goblin::elf::sym::STB_GLOBAL | goblin::elf::sym::STB_WEAK
+        );
+        if global && symbol.st_shndx != 0 {
+            let name = elf.dynstrtab.get_at(symbol.st_name).unwrap_or("");
+            if !name.is_empty() {
+                exported.insert(name.to_owned());
+            }
+        }
+    }
+    let expected: BTreeSet<String> = EXPORTS.iter().map(|s| (*s).to_owned()).collect();
+    check(
+        exported == expected,
+        &format!("engine must export exactly the moon_* ABI, found {exported:?}"),
+    )?;
+    for needed in &elf.libraries {
+        check(
+            SYSTEM.contains(needed),
+            &format!("engine depends on a non-system library: {needed}"),
+        )?;
+    }
+    println!(
+        "{}: x86_64 shared library; exports={}; needs={:?}; sha256={}",
+        library.display(),
+        exported.len(),
+        elf.libraries,
+        checksum(library)?
+    );
+    Ok(())
+}
+
+/// Client release: the glibc client executable plus the engine it loads from
+/// `../lib/moon-naive/`. A static musl executable cannot load the engine.
+pub fn dist_client(client: &Path, library: &Path, directory: &Path) -> Result<()> {
+    const CLIENT_TARGET: &str = "x86_64-unknown-linux-gnu";
+    let client = fs::canonicalize(client)?;
+    let library = fs::canonicalize(library)?;
+    check_engine(&library)?;
+    let elf_bytes = fs::read(&client)?;
+    let elf = goblin::elf::Elf::parse(&elf_bytes)?;
+    check(
+        elf.is_64
+            && elf.header.e_machine == goblin::elf::header::EM_X86_64
+            && elf.interpreter.is_some(),
+        "client must be a dynamically linked x86_64 glibc executable",
+    )?;
+    let version = capture(
+        &root(),
+        client.to_str().ok_or("client UTF-8")?,
+        &["--version"],
+    )?;
+    check(
+        version.contains(env!("CARGO_PKG_VERSION")),
+        "client version differs from release",
+    )?;
+    let output = output(directory)?;
+    let stage = output.join(format!(
+        "moon-naive-client-{}-{CLIENT_TARGET}",
+        env!("CARGO_PKG_VERSION")
+    ));
+    fs::create_dir(&stage)?;
+    copy(&client, &stage.join("bin/moon-naive-client"), true)?;
+    copy(
+        &library,
+        &stage.join("lib/moon-naive/libmoon_engine.so"),
+        false,
+    )?;
+    for (source, destination) in [
+        ("README.md", "README.md"),
+        ("LICENSE", "LICENSE"),
+        ("client.example.toml", "client.example.toml"),
+        ("docs/usage.md", "docs/usage.md"),
+        ("docs/security.md", "docs/security.md"),
+        ("docs/protocol.md", "docs/protocol.md"),
+        ("engine/CHROMIUM_VERSION", "engine/CHROMIUM_VERSION"),
+        ("engine/UPSTREAM_REVISION", "engine/UPSTREAM_REVISION"),
+        ("engine/args.gn", "engine/args.gn"),
+        ("engine/chromium.patch", "engine/chromium.patch"),
+        ("engine/LICENSE.chromium", "licenses/Chromium-LICENSE.txt"),
+    ] {
+        copy(&root().join(source), &stage.join(destination), false)?;
+    }
+    for path in [
+        "licenses/Rust-COPYRIGHT.txt",
+        "licenses/Rust-LICENSE-MIT.txt",
+    ] {
+        copy(&root().join(path), &stage.join(path), false)?;
+    }
+    notices(&stage, "moon-naive-client", CLIENT_TARGET)?;
+    let read = |path: &str| -> Result<String> {
+        Ok(fs::read_to_string(root().join(path))?.trim().to_owned())
+    };
+    fs::write(
+        stage.join("BUILD-INFO.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "target": CLIENT_TARGET,
+            "client_sha256": checksum(&client)?,
+            "engine_sha256": checksum(&library)?,
+            "engine_abi": 1,
+            "chromium_version": read("engine/CHROMIUM_VERSION")?,
+            "upstream_revision": read("engine/UPSTREAM_REVISION")?,
+            "chromium_patch_sha256": checksum(&root().join("engine/chromium.patch"))?,
+            "cargo_lock_sha256": checksum(&root().join("Cargo.lock"))?,
+            "transport": "Chromium native engine (HTTP/2 and HTTP/3)",
+            "traffic_indistinguishability": "not claimed",
+        }))?,
+    )?;
+    archive(&stage, &output)
+}
+
 pub fn dist(binary: &Path, directory: &Path) -> Result<()> {
     audit_native()?;
     let binary = fs::canonicalize(binary)?;
@@ -198,24 +343,10 @@ pub fn dist(binary: &Path, directory: &Path) -> Result<()> {
     for (source, destination, executable) in [
         ("README.md", "README.md", false),
         ("docs/architecture.md", "docs/architecture.md", false),
-        ("docs/audit.md", "docs/audit.md", false),
-        ("docs/client.md", "docs/client.md", false),
-        ("docs/configuration.md", "docs/configuration.md", false),
-        ("docs/deployment.md", "docs/deployment.md", false),
-        ("docs/development.md", "docs/development.md", false),
+        ("docs/usage.md", "docs/usage.md", false),
         ("docs/protocol.md", "docs/protocol.md", false),
         ("docs/security.md", "docs/security.md", false),
-        ("docs/testing.md", "docs/testing.md", false),
-        (
-            "docs/reports/https-differential-2026-11-17.md",
-            "docs/reports/https-differential-2026-11-17.md",
-            false,
-        ),
-        (
-            "docs/reports/https-differential-2026-11-17.json",
-            "docs/reports/https-differential-2026-11-17.json",
-            false,
-        ),
+        ("docs/development.md", "docs/development.md", false),
         ("LICENSE", "LICENSE", false),
         (
             "deploy/moon-naive.service",
@@ -233,7 +364,7 @@ pub fn dist(binary: &Path, directory: &Path) -> Result<()> {
     ] {
         copy(&root().join(source), &stage.join(destination), executable)?;
     }
-    for directory in ["licenses"] {
+    for directory in ["licenses", "docs/reports"] {
         let mut files = Vec::new();
         paths(&root().join(directory), &mut files)?;
         for path in files {
@@ -246,7 +377,7 @@ pub fn dist(binary: &Path, directory: &Path) -> Result<()> {
             )?;
         }
     }
-    notices(&stage)?;
+    notices(&stage, "moon-naive", TARGET)?;
     let sources = audit::SOURCES
         .iter()
         .map(|(name, url, revision)| serde_json::json!({"name":name,"url":url,"revision":revision}))
@@ -285,17 +416,17 @@ fn license_paths(directory: &Path, depth: usize, output: &mut BTreeSet<PathBuf>)
     }
     Ok(())
 }
-fn notices(stage: &Path) -> Result<()> {
+fn notices(stage: &Path, package: &str, target: &str) -> Result<()> {
     let graph = capture(
         &root(),
         "cargo",
         &[
             "tree",
             "-p",
-            "moon-naive",
+            package,
             "--locked",
             "--target",
-            TARGET,
+            target,
             "--edges",
             "normal,build",
             "--prefix",
@@ -314,10 +445,20 @@ fn notices(stage: &Path) -> Result<()> {
             ))
         })
         .collect::<HashSet<_>>();
-    let metadata = audit::metadata(Some(TARGET))?;
+    let metadata = audit::metadata(Some(target))?;
     let mut inventory = Vec::new();
-    let mut text = String::from(
-        "moon-naive third-party software inventory\nThe selected normal/build dependency graph and available upstream license files follow.\nRust, musl and GCC runtime license texts are also provided in licenses/.\n\n",
+    let runtime = if target.ends_with("musl") {
+        "Rust, musl and GCC runtime"
+    } else {
+        "Rust runtime"
+    };
+    let engine = if package == "moon-naive-client" {
+        "The bundled Chromium engine's license is licenses/Chromium-LICENSE.txt.\n"
+    } else {
+        ""
+    };
+    let mut text = format!(
+        "{package} third-party software inventory\nThe selected normal/build dependency graph and available upstream license files follow.\n{runtime} license texts are also provided in licenses/.\n{engine}\n"
     );
     for package in metadata["packages"].as_array().ok_or("cargo packages")? {
         let name = package["name"].as_str().ok_or("package name")?;

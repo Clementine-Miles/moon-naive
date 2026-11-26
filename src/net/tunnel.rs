@@ -325,6 +325,63 @@ impl TunnelDecoder {
         Ok(())
     }
 }
+/// The client side of an established tunnel stream, as each frontend sees it.
+/// H2 reads and writes its Pingora session directly; the single-owner H3
+/// driver hands bytes over bounded channels.
+pub(super) trait ClientData {
+    /// Next request DATA chunk (record bytes when framed); `None` at FIN.
+    fn next(&mut self) -> impl Future<Output = Result<Option<Bytes>>> + Send;
+}
+pub(super) trait ClientSink {
+    /// Send response DATA (already framed); waits for transport credit.
+    fn send(&mut self, bytes: Bytes) -> impl Future<Output = Result<()>> + Send;
+    /// End the response stream (FIN / END_STREAM).
+    fn finish(&mut self) -> impl Future<Output = Result<()>> + Send;
+}
+
+/// The duplex relay shared by H2 and H3 CONNECT tunnels: decode client
+/// records into the target, frame target bytes back, propagate half-close in
+/// each direction, and expire after `idle` without progress either way.
+pub(super) async fn relay(
+    target: impl AsyncRead + AsyncWrite + Send,
+    framed: Option<Mode>,
+    idle: Duration,
+    activity: &Activity,
+    mut client: impl ClientData,
+    mut sink: impl ClientSink,
+) -> Result<()> {
+    let (mut read, mut write) = tokio::io::split(target);
+    let upload = async {
+        let mut decoder = TunnelDecoder::new(framed);
+        while let Some(data) = client.next().await? {
+            if !data.is_empty() {
+                activity.touch();
+            }
+            decoder.write_to(&mut write, &data, activity).await?;
+        }
+        decoder.finish()?;
+        write.shutdown().await?;
+        activity.touch();
+        Ok::<_, crate::Error>(())
+    };
+    let download = async {
+        let mut download = TunnelDownload::new(framed)?;
+        while let Some(bytes) = download.read_next(&mut read).await? {
+            activity.touch();
+            sink.send(bytes).await?;
+        }
+        sink.finish().await?;
+        activity.touch();
+        Ok::<_, crate::Error>(())
+    };
+    activity
+        .run(idle, async {
+            tokio::try_join!(upload, download)?;
+            Ok(())
+        })
+        .await
+}
+
 #[cfg(test)]
 mod framing_tests {
     use super::*;

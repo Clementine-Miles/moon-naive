@@ -5,11 +5,15 @@ trusted users. The server hosts real websites (reverse proxy over HTTP/1.1,
 HTTP/2 and HTTP/3) and carries authenticated proxy tunnels with the **mona**
 protocol, using its only profile, **Rupin** (formerly "revision 4"). It
 manages its own certificates over ACME DNS-01. The first-party client exposes
-a local SOCKS5 and HTTP CONNECT proxy and tunnels over H2 or H3.
+a local SOCKS5 and HTTP CONNECT proxy and tunnels over H2 or H3 through the
+**Chromium native engine**: a Rust application layer driving Chromium's own
+network stack (TLS, HTTP/2, QUIC/HTTP/3, socket pools) behind a narrow C ABI.
 
 - Per-stream authentication bound to the TLS 1.3 exporter and stream ID; failed
   authentication is served as ordinary website traffic and never dials out.
-- BoringSSL (TLS 1.3, ECH), Pingora (H1/H2, website), quiche (QUIC/H3).
+- Server: BoringSSL (TLS 1.3, ECH), Pingora (H1/H2, website), quiche (QUIC/H3).
+- Client: Chromium's `net/` stack built as `libmoon_engine.so` from a pinned
+  revision plus a small patch; the client has no TLS/H2/QUIC code of its own.
 - Automatic certificate issuance and renewal (Google Trust Services or Let's
   Encrypt; Porkbun or Cloudflare DNS), with a durable recovery journal and
   supervised renewal.
@@ -22,7 +26,9 @@ undetectable or unblockable; see [docs/security.md](docs/security.md).
 ## Quick start
 
 Requires Linux, Rust 1.100, a C/C++ toolchain, CMake, libclang, Perl and
-pkg-config (to build BoringSSL).
+pkg-config (to build BoringSSL). The client also needs the engine library,
+from a client release archive or built with `cargo xtask engine` (Python 3,
+Ninja, curl; see [docs/development.md](docs/development.md#chromium-native-engine)).
 
 ```sh
 cargo build --release --locked -p moon-naive -p moon-naive-client
@@ -36,7 +42,7 @@ cargo build --release --locked -p moon-naive -p moon-naive-client
 
 # Client
 install -m600 client.example.toml client.toml   # edit server, username, password
-./target/release/moon-naive-client run client.toml
+MOON_NAIVE_ENGINE=/path/to/libmoon_engine.so ./target/release/moon-naive-client run client.toml
 curl --proxy socks5h://127.0.0.1:1080 https://example.org/
 ```
 
@@ -44,23 +50,22 @@ curl --proxy socks5h://127.0.0.1:1080 https://example.org/
 
 | Document | Contents |
 | --- | --- |
-| [docs/architecture.md](docs/architecture.md) | Components, ownership, routing, dependencies |
+| [docs/architecture.md](docs/architecture.md) | Components, ownership, routing, the Chromium native engine, dependencies |
+| [docs/usage.md](docs/usage.md) | Build, install, server configuration (endpoints, ACL, website, EAB, ECH), operations, backup, client |
 | [docs/protocol.md](docs/protocol.md) | Authoritative mona/Rupin wire specification |
-| [docs/configuration.md](docs/configuration.md) | Server configuration, endpoints, ACL, website routing, EAB, ECH |
-| [docs/client.md](docs/client.md) | Client configuration and behavior |
-| [docs/deployment.md](docs/deployment.md) | Installation, files, operations, backup and rollback |
 | [docs/security.md](docs/security.md) | Threat model, controls, known limits |
-| [docs/testing.md](docs/testing.md) | Test suites, laboratories, measurements, latest results |
-| [docs/development.md](docs/development.md) | Layout, naming, dependency policy, non-Rust inventory, release |
-| [docs/audit.md](docs/audit.md) | 2026-11-23 refactor audit: findings and fixes |
+| [docs/development.md](docs/development.md) | Layout, dependency policy, engine build, testing, measurements, release |
+| [docs/reports/](docs/reports/) | Dated evidence: HTTPS differential, refactor audits, engineering reports |
 
 ## Status and limitations
 
-Linux x86_64 is the supported platform for both binaries. Android and other
-platforms are not supported by the Rust client. QUIC active migration is
-disabled (passive NAT rebinding works up to 7 times per connection). ECH
-configuration lists are given to the client explicitly (no DNS discovery).
-See [docs/audit.md](docs/audit.md#not-done-with-reasons) for validation not
-performed.
+Linux x86_64 is the supported platform for both binaries (the client as a
+glibc executable with the engine library). Other platforms are not built. QUIC
+active migration is disabled (passive NAT rebinding works up to 7 times per
+connection). ECH configuration lists are given to the client explicitly (no
+DNS discovery). Validation not performed is listed in
+[the 2026-11-23 audit](docs/reports/refactor-audit-2026-11-23.md#not-done-with-reasons)
+and [the 2026-11-26 engine report](docs/reports/chromium-engine-2026-11-26.md)
+(in Chinese).
 
 License: [Apache-2.0](LICENSE).

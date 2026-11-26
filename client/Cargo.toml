@@ -1,6 +1,6 @@
 [package]
 name = "moon-naive-client"
-description = "First-party Moon-naive client: local SOCKS5/HTTP CONNECT over mona (Rupin) H2/H3 tunnels"
+description = "First-party Moon-naive client: local SOCKS5/HTTP CONNECT over mona (Rupin) tunnels carried by the Chromium native engine"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -25,15 +25,11 @@ serde.workspace = true
 toml.workspace = true
 base64.workspace = true
 tokio.workspace = true
-boring = "=5.5.0"
-tokio-boring = "=5.5.0"
-quiche = { git = "https://github.com/cloudflare/quiche.git", rev = "7ccccc7b7f4bd4ec6bc70219fdbe491024f5cb0b", default-features = false, features = ["boringssl-boring-crate"] }
-h2 = "0.4"
-http = "1"
-bytes = "1"
+moon-naive-engine.workspace = true
+getrandom = "0.3.4"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-nix = { version = "0.31.3", default-features = false, features = ["net"] }
+nix = { workspace = true, features = ["net"] }
 
 [lints]
 workspace = true

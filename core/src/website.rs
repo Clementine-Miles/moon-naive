@@ -266,7 +266,7 @@ mod tests {
     }
     #[test]
     fn website_example_merges_with_strict_main_toml() {
-        let example = include_str!("../../docs/configuration.md")
+        let example = include_str!("../../docs/usage.md")
             .split("## Website routing example")
             .nth(1)
             .unwrap()

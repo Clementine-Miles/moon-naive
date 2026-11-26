@@ -74,6 +74,39 @@ pub(super) struct Egress {
     pub test_target: Option<SocketAddr>,
     #[cfg(test)]
     pub test_delay: Option<Duration>,
+    /// Test-only fault injection for the tunnel confirmation (see
+    /// `TEST_CONFIRMATION_*`), switchable while the server runs.
+    #[cfg(test)]
+    pub test_confirmation: Arc<std::sync::atomic::AtomicU8>,
+}
+#[cfg(test)]
+pub(super) const TEST_CONFIRMATION_VALID: u8 = 0;
+#[cfg(test)]
+pub(super) const TEST_CONFIRMATION_MISSING: u8 = 1;
+#[cfg(test)]
+pub(super) const TEST_CONFIRMATION_DUPLICATE: u8 = 2;
+#[cfg(test)]
+pub(super) const TEST_CONFIRMATION_CORRUPT: u8 = 3;
+#[cfg(test)]
+impl Egress {
+    /// Apply the injected confirmation fault to a valid field value.
+    pub(super) fn test_confirmation_values(&self, value: String) -> Vec<String> {
+        match self
+            .test_confirmation
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            TEST_CONFIRMATION_MISSING => Vec::new(),
+            TEST_CONFIRMATION_DUPLICATE => vec![value.clone(), value],
+            TEST_CONFIRMATION_CORRUPT => {
+                // Change one MAC character; the syntax stays valid.
+                let mut bytes = value.into_bytes();
+                let index = bytes.len() - 2;
+                bytes[index] = if bytes[index] == b'A' { b'B' } else { b'A' };
+                vec![String::from_utf8(bytes).expect("ASCII")]
+            }
+            _ => vec![value],
+        }
+    }
 }
 impl Egress {
     pub fn new(config: &Config, stats: Arc<Stats>) -> super::Result<Self> {
@@ -113,6 +146,8 @@ impl Egress {
             test_target: None,
             #[cfg(test)]
             test_delay: None,
+            #[cfg(test)]
+            test_confirmation: Default::default(),
         })
     }
     /// Listener-specific connect deadline; immutable ACL and next-hop state remain shared.

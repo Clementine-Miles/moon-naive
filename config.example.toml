@@ -1,6 +1,6 @@
 # Moon-naive single-endpoint server configuration (schema 2; schema 1 files
 # still load). Two-endpoint example: config.dual.example.toml. Destination ACL
-# example: acl.example.toml. Full reference: docs/configuration.md.
+# example: acl.example.toml. Full reference: docs/usage.md.
 #
 #   moon-naive config init /etc/moon-naive/config.toml   # private 0600, never overwrites
 #   moon-naive check /etc/moon-naive/config.toml          # offline preflight
