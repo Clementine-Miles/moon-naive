@@ -14,7 +14,7 @@ name = "moon-naive"
 path = "src/main.rs"
 
 [dependencies]
-nix = { version = "0.31.3", default-features = false, features = ["net"] }
+nix = { workspace = true, features = ["net"] }
 moon-naive-core.workspace = true
 pingora-core = { git = "https://github.com/cloudflare/pingora.git", rev = "f86ffda5d3ae5c3baf5125682138b33b26c01b08", default-features = false, features = ["boringssl"] }
 pingora-http = { git = "https://github.com/cloudflare/pingora.git", rev = "f86ffda5d3ae5c3baf5125682138b33b26c01b08" }
@@ -27,12 +27,12 @@ tokio-boring = "=5.5.0"
 tokio.workspace = true
 hyper = { version = "1", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-http = "1"
+http.workspace = true
 http-body-util = "0.1"
 bytes = "1"
 memchr = "2.8.3"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json.workspace = true
 toml = "1.2.1"
 base64 = "0.23.1"
 rustls-pki-types = "1"
@@ -70,6 +70,10 @@ serde = { version = "1", features = ["derive"] }
 toml = "1.2.1"
 base64 = "0.23.1"
 sha2 = "0.11.1"
+hmac = "0.13.0"
+http = "1"
+serde_json = "1"
+nix = { version = "0.31.3", default-features = false }
 subtle = "2.6"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "fs", "time", "signal", "sync"] }
 
