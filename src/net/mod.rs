@@ -488,17 +488,24 @@ impl App {
                         path: head.path.as_deref(),
                         protocol: head.protocol.as_deref(),
                     };
-                    reply.headers.push((
-                        "proxy-authentication-info".into(),
-                        self.credentials
-                            .confirmation_with(
-                                tunnel.principal(),
-                                &context,
-                                tunnel.offer(),
-                                self.config.traffic.select(tunnel.offer()),
-                            )
-                            .ok_or("invalid authenticated principal")?,
-                    ));
+                    let confirmation = self
+                        .credentials
+                        .confirmation_with(
+                            tunnel.principal(),
+                            &context,
+                            tunnel.offer(),
+                            self.config.traffic.select(tunnel.offer()),
+                        )
+                        .ok_or("invalid authenticated principal")?;
+                    #[cfg(test)]
+                    let confirmations = self.egress.test_confirmation_values(confirmation);
+                    #[cfg(not(test))]
+                    let confirmations = [confirmation];
+                    for value in confirmations {
+                        reply
+                            .headers
+                            .push(("proxy-authentication-info".into(), value));
+                    }
                     reply
                 },
                 _permit: permit,

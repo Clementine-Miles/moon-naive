@@ -10,7 +10,9 @@ control-plane service, sidecar or inter-process RPC.
 | --- | --- | --- |
 | `moon-naive` | `src/` | Server binary and library: listeners, TLS/QUIC, website, tunnels, ACME |
 | `moon-naive-core` | `core/` | Pure logic: configuration, ACL, per-stream authentication, record codec, ingress classification, destination policy. No I/O |
-| `moon-naive-client` | `client/` | Client binary and library: local SOCKS5/HTTP CONNECT, H2/H3 transports, ECH |
+| `moon-naive-client` | `client/` | Client binary and library: local SOCKS5/HTTP CONNECT, mona proofs and records, transport policy |
+| `moon-naive-engine` | `engine/bridge/` | Safe Rust wrapper over the C ABI of `libmoon_engine.so` (the only crate with `unsafe`) |
+| Chromium native engine | `engine/` | Chromium's network stack as a shared library: TLS, H2, QUIC/H3, socket pools, cert verification |
 | `xtask` | `tools/xtask/` | Verification, vector and source audits, TFO audit, laboratory orchestration, packaging |
 
 ## Server components and ownership
@@ -80,15 +82,20 @@ flowchart TD
 | Module | Responsibility |
 | --- | --- |
 | `client/src/local.rs` | SOCKS5 (CONNECT, no auth) and HTTP CONNECT on one listener |
-| `client/src/lib.rs` | Accept loop, tunnel limit, transport selection and H3→H2 fallback |
-| `client/src/h2.rs` | One pooled TLS 1.3 connection; serialized stream opening so each proof binds the assigned stream ID |
-| `client/src/h3.rs` | One QUIC connection owned by a driver task; bounded per-stream channels give backpressure into QUIC flow control |
-| `client/src/tls.rs` | Shared TLS policy: TLS 1.3 only, verified certificates, mandatory ECH when configured |
+| `client/src/lib.rs` | Accept loop, tunnel limit, H3→H2 policy, the engine's authenticator (signs with the actual binding, verifies confirmations, refuses non-ECH when ECH is required), record relay with half-close |
 | `client/src/tunnel.rs` | Proof creation, confirmation check, record framing with randomized padding |
+| `engine/bridge/src/lib.rs` | Loads and version-checks the engine, maps callbacks to async reads/writes, catches panics at the boundary |
+| `engine/src/net/tools/moon_engine/` | The engine: one `URLRequestContext`/`HttpNetworkSession` on its own IO thread; one `HttpProxyConnectJob` per tunnel through Chromium's shared H2/QUIC session pools |
 
-Both pools reconnect on demand after a connection closes. The QUIC connection
-idles out after `quic_idle_timeout_secs` and is re-established on the next
-request.
+```
+local app ─SOCKS5/HTTP CONNECT─▶ client (Rust) ──C ABI──▶ libmoon_engine (Chromium net/) ──H2/H3──▶ server
+                                   ▲  authorize(binding, authority) / verify(values)  │
+                                   └──────────── callbacks on the engine thread ──────┘
+```
+
+Chromium's pools reconnect on demand after a connection closes. The QUIC
+connection idles out after `quic_idle_timeout_secs` and is re-established on
+the next request.
 
 ## Dependencies
 
@@ -96,7 +103,8 @@ request.
 | --- | --- | --- |
 | Pingora | `f86ffda5` (vendored patches in `vendor/pingora`) | HTTP/1.1, HTTP/2, website proxy |
 | quiche | `7ccccc7b` | QUIC and HTTP/3, BoringSSL via the `boring` crate |
-| BoringSSL | `boring`/`boring-sys` 5.5.0 | TLS 1.3, ECH, exporters; C/C++ by design |
+| BoringSSL | `boring`/`boring-sys` 5.5.0 | Server TLS 1.3, ECH, exporters; C/C++ by design |
+| Chromium (NaiveProxy tree) | `engine/UPSTREAM_REVISION`, Chromium `engine/CHROMIUM_VERSION` | Client data plane (`libmoon_engine.so`), with `engine/chromium.patch` |
 | instant-acme | `1909bed8` (vendored patches in `vendor/instant-acme`) | ACME protocol |
 
 Exact revisions are in `Cargo.toml` and `Cargo.lock`. The patch rationale is in

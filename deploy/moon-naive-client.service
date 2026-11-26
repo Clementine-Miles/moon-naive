@@ -1,4 +1,6 @@
 # Moon-naive client as a systemd user service:
+#   install -Dm755 bin/moon-naive-client /usr/local/bin/moon-naive-client
+#   install -Dm644 lib/moon-naive/libmoon_engine.so /usr/local/lib/moon-naive/libmoon_engine.so
 #   install -Dm600 client.toml ~/.config/moon-naive/client.toml
 #   install -Dm644 moon-naive-client.service ~/.config/systemd/user/
 #   systemctl --user enable --now moon-naive-client
