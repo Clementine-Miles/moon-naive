@@ -275,7 +275,11 @@ fn verify(work: &Path) -> Result<()> {
     check_head(work)?;
     let patch = engine_dir().join("chromium.patch");
     let expected = fs::read_to_string(&patch)?;
-    let actual = output(work, "git", &["diff", "--full-index", "--no-color", "--no-ext-diff"])?;
+    let actual = output(
+        work,
+        "git",
+        &["diff", "--full-index", "--no-color", "--no-ext-diff"],
+    )?;
     check(
         actual == expected,
         "work tree differs from engine/chromium.patch (run `cargo xtask engine export` if intended)",
@@ -295,7 +299,11 @@ fn verify(work: &Path) -> Result<()> {
 
 fn export(work: &Path) -> Result<()> {
     check_head(work)?;
-    let diff = output(work, "git", &["diff", "--full-index", "--no-color", "--no-ext-diff"])?;
+    let diff = output(
+        work,
+        "git",
+        &["diff", "--full-index", "--no-color", "--no-ext-diff"],
+    )?;
     check(!diff.is_empty(), "no changes to export")?;
     fs::write(engine_dir().join("chromium.patch"), &diff)?;
     let untracked = output(
