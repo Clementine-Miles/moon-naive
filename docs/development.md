@@ -213,22 +213,50 @@ descriptive and do not prove indistinguishability.
 ### Measurements
 
 ```sh
-cargo test --release --locked -p moon-naive --lib client_throughput -- --ignored --nocapture
+cargo xtask interop --engine <libmoon_engine.so> --release --bench
+cargo test --release --locked -p moon-naive --lib site::bench -- --ignored --nocapture --test-threads=1
 cargo test --release --locked -p moon-naive --lib benchmark_h3_receive_windows -- --ignored --nocapture --test-threads=1
 ```
 
-Client end-to-end loopback throughput, measured 2026-11-23 (release build,
-4 vCPU cloud container, client, server and echo origin in one process,
-64 MiB echoed each way, 3 runs):
+All numbers below are loopback numbers for one environment (release build,
+4 vCPU cloud container, every party in one process), not Internet or
+production throughput.
+
+Client end-to-end throughput with the Chromium engine, measured 2026-11-26
+(client, server and echo origin in one process, 64 MiB echoed each way,
+3 invocations × 3 runs):
 
 | Transport | Each-way throughput |
 | --- | --- |
-| H2 | 1479–1637 Mbit/s |
-| H3 | 380–417 Mbit/s |
+| H2 | 910–1142 Mbit/s |
+| H3 | 294–368 Mbit/s |
 
-These are loopback numbers for one environment, not Internet or production
-throughput. H3 is CPU-bound in userspace QUIC (quiche with 1350-byte
-datagrams, no GSO), which is expected.
+The previous Rust client measured 1479–1637 Mbit/s (H2) and 380–417 Mbit/s
+(H3) on 2026-11-23 in the same kind of container. The engine path is slower on
+loopback: every chunk crosses the C ABI and a thread hop between Chromium's
+network thread and Tokio, with one read and one write in flight per tunnel.
+H3 on both sides is CPU-bound in userspace QUIC, which is expected.
+
+H3→H2 website bridge, measured 2026-11-26 (`site::bench`, best of 3). An HTTP/3
+website request reaches Pingora through an in-memory HTTP/2 hop
+(`src/net/site/bridge.rs`). `origin` is an HTTP/1.1 keep-alive client straight
+to the origin, `h2_hop` is the in-memory hop alone serving from memory, and
+`bridge` is the whole website path for an HTTP/3 request without QUIC:
+
+| Path | 1 KiB, 1 client | 1 KiB, 32 clients | 32 MiB, 1 client | 16 MiB, 8 clients |
+| --- | --- | --- | --- | --- |
+| origin | 30 µs CPU/request | 39 µs | 0.62 ms CPU/MiB | 0.51 ms |
+| h2_hop | 35 µs | 38 µs | 0.82 ms | 1.15 ms |
+| bridge | 345 µs | 273 µs | 2.62 ms | 2.03 ms |
+
+The hop that a direct HTTP/3 Pingora session (`ServerSession::Custom`) would
+remove costs about a tenth of the bridge's CPU for small responses and a third
+to somewhat more than half for large ones; the rest is Pingora's proxy path,
+the upstream pool and the origin, which a direct session would still pay. Even
+with the hop, the bridge moves 5–13 Gbit/s, far above what QUIC itself sustains
+here (the H3 client numbers above), so the hop is not the bottleneck of an
+HTTP/3 website request. The bridge is therefore kept; replacing it is not
+justified by these numbers.
 
 ### Network impairment
 
@@ -242,4 +270,5 @@ been run: it requires privileged network namespaces that were not available.
 
 Dated results are kept in [reports/](reports/): the
 [2026-11-23 refactor audit](reports/refactor-audit-2026-11-23.md) and the
-engineering reports that follow it.
+[2026-11-26 Chromium engine report](reports/chromium-engine-2026-11-26.md)
+(in Chinese).

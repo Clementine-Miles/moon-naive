@@ -60,10 +60,12 @@ curl --proxy socks5h://127.0.0.1:1080 https://example.org/
 ## Status and limitations
 
 Linux x86_64 is the supported platform for both binaries (the client as a
-glibc executable with the engine library). Other platforms are not built. QUIC active migration is
-disabled (passive NAT rebinding works up to 7 times per connection). ECH
-configuration lists are given to the client explicitly (no DNS discovery).
-See [the 2026-11-23 audit](docs/reports/refactor-audit-2026-11-23.md#not-done-with-reasons)
-for validation not performed.
+glibc executable with the engine library). Other platforms are not built. QUIC
+active migration is disabled (passive NAT rebinding works up to 7 times per
+connection). ECH configuration lists are given to the client explicitly (no
+DNS discovery). Validation not performed is listed in
+[the 2026-11-23 audit](docs/reports/refactor-audit-2026-11-23.md#not-done-with-reasons)
+and [the 2026-11-26 engine report](docs/reports/chromium-engine-2026-11-26.md)
+(in Chinese).
 
 License: [Apache-2.0](LICENSE).
